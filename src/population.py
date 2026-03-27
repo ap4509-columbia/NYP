@@ -109,7 +109,10 @@ def sample_patient(
     insurance = _weighted_choice(_INSURANCE_DIST)
 
     smoker     = random.random() < _SMOKER_RATE
-    pack_years = round(random.uniform(5, 40), 1) if smoker else 0.0
+    # ~30% of ever-smokers are former smokers; sample years since quitting (0–30 yrs)
+    is_former  = (not smoker) and (random.random() < 0.30)
+    pack_years = round(random.uniform(5, 40), 1) if (smoker or is_former) else 0.0
+    years_since_quit = round(random.uniform(0, 30), 1) if is_former else 0.0
 
     bmi = round(random.gauss(27.5, 5.0), 1)
     bmi = max(15.0, min(60.0, bmi))
@@ -134,6 +137,7 @@ def sample_patient(
         insurance          = insurance,
         smoker             = smoker,
         pack_years         = pack_years,
+        years_since_quit   = years_since_quit,
         bmi                = bmi,
         has_cervix         = has_cervix,
         hpv_positive       = hpv_positive,

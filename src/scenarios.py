@@ -2,26 +2,21 @@
 # scenarios.py
 # Scenario definitions and co-scheduling logic for improvement analysis.
 # =============================================================================
-# The central question: how much does co-scheduling (bundling multiple
-# cancer screenings into fewer patient encounters) improve throughput,
-# reduce loss-to-follow-up, and increase detected cancers?
+# The central question: how much does co-scheduling (bundling cervical and
+# lung screenings into fewer patient encounters) improve throughput, reduce
+# loss-to-follow-up, and increase detected cancers?
 #
 # Two workflow models:
 #
 #   FRAGMENTED (current state)
 #     Each provider covers only their relevant cancer types.
-#     A patient needing cervical + breast + colorectal must make 3 separate
-#     appointments across 3 specialties. Each encounter carries independent
-#     LTFU risk. Scheduling friction compounds across visits.
+#     A patient needing both cervical and lung screening must make separate
+#     appointments. Each encounter carries independent LTFU risk.
 #
 #   COORDINATED (future state / co-scheduling)
 #     On first contact, all due eligible screenings are identified together.
-#     A single coordinated encounter (or tightly scheduled bundle) handles
-#     all of them. One LTFU draw per encounter — not per screening.
-#     Scheduling friction occurs once.
-#
-# Intermediate scenarios allow partial coordination (e.g., GYN-led programs
-# bundling cervical + breast only) or high-access models with reduced barriers.
+#     A single coordinated encounter handles all of them.
+#     One LTFU draw per encounter — not per screening.
 # =============================================================================
 
 import random
@@ -36,7 +31,7 @@ from screening import (
     run_screening_step,
     handle_unscreened,
 )
-from followup import run_cervical_followup, run_stub_followup
+from followup import run_cervical_followup, run_lung_followup
 from metrics import initialize_metrics, record_screening, record_exit
 
 
@@ -45,9 +40,9 @@ from metrics import initialize_metrics, record_screening, record_exit
 # Patients must make separate visits for cancers outside their provider's scope.
 
 PROVIDER_CANCER_MAP = {
-    "pcp":          ["cervical", "breast"],   # PCP can refer for both
-    "gynecologist": ["cervical", "breast"],
-    "specialist":   ["cervical", "breast"],
+    "pcp":          ["cervical", "lung"],
+    "gynecologist": ["cervical"],
+    "specialist":   ["cervical", "lung"],
     "er":           [],   # no preventive screenings in ER
 }
 
@@ -82,16 +77,16 @@ SCENARIOS: Dict[str, dict] = {
     "gyn_coordinated": {
         "label":                "GYN-Led Coordination",
         "description":          (
-            "Gynecologist visits bundle cervical + breast screenings. "
-            "PCP and specialist visits remain fragmented. "
+            "Gynecologist visits are expanded to also identify lung-eligible patients "
+            "and place LDCT referrals. PCP visits remain fragmented. "
             "Reflects a realistic near-term improvement with minimal infrastructure change."
         ),
         "cancer_map":           {
             **PROVIDER_CANCER_MAP,
-            "gynecologist": ["cervical", "breast"],   # already together
+            "gynecologist": ["cervical", "lung"],
         },
-        "co_schedule":          ["cervical", "breast"],   # these two bundled
-        "ltfu_multiplier":      0.80,    # modest reduction in LTFU from fewer appts
+        "co_schedule":          ["cervical", "lung"],
+        "ltfu_multiplier":      0.80,
         "scheduling_delay_days": 21,
         "capacity_multiplier":  1.1,
     },
@@ -247,16 +242,16 @@ def _screen_and_followup(
     p: Patient, cancer: str, current_day: int, metrics: dict, scenario: dict
 ) -> None:
     """Run one screening + follow-up for a specific cancer (shared helper)."""
-    result = run_screening_step(p, cancer, current_day)
+    result = run_screening_step(p, cancer, current_day, metrics)
     if result is None:
         return
 
     record_screening(metrics, p, cancer, result)
 
     if cancer == "cervical":
-        disposition = run_cervical_followup(p, current_day, metrics)
-    else:
-        disposition = run_stub_followup(p, cancer, result, current_day, metrics)
+        run_cervical_followup(p, current_day, metrics)
+    elif cancer == "lung":
+        run_lung_followup(p, current_day, metrics)
 
     if p.exit_reason:
         record_exit(metrics, p.exit_reason)

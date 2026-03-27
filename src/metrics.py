@@ -27,9 +27,6 @@ def initialize_metrics() -> dict:
             lambda: defaultdict(int)
         ),
 
-        # ── Other cancer results ──────────────────────────────────────────────
-        "other_results": defaultdict(lambda: defaultdict(int)),    # cancer → result → count
-
         # ── Cervical follow-up ────────────────────────────────────────────────
         "n_colposcopy":       0,
         "colposcopy_results": defaultdict(int),                    # CIN grade → count
@@ -74,8 +71,6 @@ def record_screening(
         metrics["cervical_results"][result] += 1
         stratum = get_cervical_age_stratum(p.age)
         metrics["cervical_by_age_stratum"][stratum][result] += 1
-    else:
-        metrics["other_results"][cancer][result] += 1
 
 
 def record_exit(metrics: dict, reason: str) -> None:

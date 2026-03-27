@@ -2,9 +2,8 @@
 # followup.py
 # Steps 4–5: Post-screening clinical follow-up pathways.
 # =============================================================================
-# Cervical: full pathway — result routing → colposcopy → CIN grading →
-#           treatment (LEEP / cone) or surveillance.
-# Other cancers: stub — positive screen → referral → treated / untreated.
+# Cervical: result routing → colposcopy → CIN grading → treatment / surveillance
+# Lung:     Lung-RADS routing → repeat LDCT or biopsy chain → malignancy → treatment
 #
 # All probabilities are PLACEHOLDERS — replace with NYP data / ASCCP tables.
 # =============================================================================
@@ -314,36 +313,3 @@ def run_lung_followup(
     return "repeat_ldct_12mo"
 
 
-# ─── Other Cancers: Stub Follow-Up ───────────────────────────────────────────
-
-def run_stub_followup(
-    p: Patient, cancer: str, result: str,
-    current_day: int, metrics: Optional[dict] = None
-) -> str:
-    """
-    Simplified follow-up for non-cervical cancers.
-    Positive screen → LTFU check → treatment referral → treated / untreated.
-    PLACEHOLDER — replace with full clinical pathway as each is built out.
-    """
-    if result != "POSITIVE":
-        p.log(current_day, f"FOLLOWUP {cancer} NEGATIVE → routine surveillance")
-        return "routine_surveillance"
-
-    if check_ltfu_post_abnormal(p, metrics):
-        p.exit_system(current_day, "lost_to_followup")
-        p.log(current_day, f"LTFU {cancer} — no follow-up after positive screen")
-        return "exit"
-
-    # Simplified treatment outcome — PLACEHOLDER (75% success rate)
-    if random.random() < 0.75:
-        p.current_stage = "treated"
-        p.log(current_day, f"TREATED {cancer} — successful")
-        if metrics is not None:
-            metrics["n_treated"] += 1
-        return "treated"
-
-    p.exit_system(current_day, "untreated")
-    p.log(current_day, f"UNTREATED {cancer}")
-    if metrics is not None:
-        metrics["n_untreated"] += 1
-    return "exit"
