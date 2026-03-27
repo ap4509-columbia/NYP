@@ -188,6 +188,19 @@ CAPACITIES = {
 # ── Unscreened Re-entry Delay (days) ──────────────────────────────────────────
 RESCHEDULE_DELAY_DAYS = 90
 
+# ── Inter-Step Scheduling Delays (days) ───────────────────────────────────────
+# Time between referral and the next appointment at each step.
+# These drive SimPy timeouts and are a key lever in scenario analysis
+# (coordinated care reduces these delays).
+# PLACEHOLDER — replace with NYP scheduling data.
+FOLLOWUP_DELAY_DAYS = {
+    "colposcopy":     30,    # abnormal result → colposcopy appointment
+    "leep":           14,    # colposcopy → LEEP procedure
+    "cone_biopsy":    21,    # colposcopy → cone biopsy procedure
+    "lung_biopsy":    14,    # RADS 4 → CT-guided biopsy
+    "lung_treatment": 21,    # malignancy confirmed → treatment start
+}
+
 # ── Procedure Revenue (per event, USD) ────────────────────────────────────────
 # PLACEHOLDER — replace with NYP finance / contract rates.
 # CPT references provided for calibration.
