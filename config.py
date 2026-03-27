@@ -19,6 +19,12 @@ NUM_REPS       = 10       # number of replications for variance analysis
 # "coordinated" = future state (bundled multi-screening program)
 WORKFLOW_MODE = "fragmented"
 
+# ── Active Cancer Pathways ────────────────────────────────────────────────────
+# Controls which cancers are live in the simulation.
+# Lung / colorectal / osteoporosis code is preserved but inactive until
+# clinical pathways and data are ready.
+ACTIVE_CANCERS = ["cervical", "breast"]
+
 # ── Arrivals (mirrors Sophia's parameters) ────────────────────────────────────
 DAILY_PATIENTS = 200
 
@@ -64,9 +70,10 @@ ELIGIBILITY = {
 SCREENING_TESTS = {
     "cervical": {
         # USPSTF Grade A recommendations:
-        "young":  ["cytology"],                          # age 21–29: cytology only (every 3 yrs)
-        "middle": ["cytology", "hpv_alone", "co_test"],  # age 30–65: all three strategies equal evidence
-        "older":  [],                                     # age 65+ with adequate prior screening: do not screen
+        # Base case excludes co-testing — cytology and HPV-alone only.
+        "young":  ["cytology"],              # age 21–29: cytology only (every 3 yrs)
+        "middle": ["cytology", "hpv_alone"], # age 30–65: cytology (3 yrs) or HPV-alone (5 yrs)
+        "older":  [],                         # age 65+ with adequate prior screening: do not screen
     },
     "lung":         ["ldct"],
     "breast":       ["mammogram"],

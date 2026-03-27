@@ -45,15 +45,15 @@ from metrics import initialize_metrics, record_screening, record_exit
 # Patients must make separate visits for cancers outside their provider's scope.
 
 PROVIDER_CANCER_MAP = {
-    "pcp":          ["colorectal", "lung", "osteoporosis"],  # primary care
+    "pcp":          ["cervical", "breast"],   # PCP can refer for both
     "gynecologist": ["cervical", "breast"],
-    "specialist":   ["cervical", "lung", "breast", "colorectal", "osteoporosis"],
+    "specialist":   ["cervical", "breast"],
     "er":           [],   # no preventive screenings in ER
 }
 
-# In coordinated mode: all eligible screenings regardless of entry provider
+# In coordinated mode: all active eligible screenings regardless of entry provider
 COORDINATED_CANCER_MAP = {
-    provider: ["cervical", "lung", "breast", "colorectal", "osteoporosis"]
+    provider: list(cfg.ACTIVE_CANCERS)
     for provider in PROVIDER_CANCER_MAP
 }
 

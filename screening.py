@@ -49,8 +49,14 @@ ELIGIBILITY_CHECKS = {
 
 
 def get_eligible_screenings(p: Patient) -> List[str]:
-    """Return the list of cancer types this patient is currently eligible for."""
-    return [cancer for cancer, check in ELIGIBILITY_CHECKS.items() if check(p)]
+    """
+    Return the list of cancer types this patient is currently eligible for,
+    restricted to cfg.ACTIVE_CANCERS.
+    """
+    return [
+        cancer for cancer, check in ELIGIBILITY_CHECKS.items()
+        if cancer in cfg.ACTIVE_CANCERS and check(p)
+    ]
 
 
 # ─── Screening Interval Check ─────────────────────────────────────────────────

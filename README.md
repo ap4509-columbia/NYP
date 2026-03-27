@@ -12,16 +12,18 @@ The simulation covers **screening → diagnosis**, not treatment economics. The 
 - Compare **fragmented** (current) vs. **coordinated** (future) workflow scenarios
 - Support ROI analysis for expanding screening programs
 
-Cancer pathways modelled:
+**Base case** (active): cervical + breast only.
+Additional pathways are coded as structured stubs — inactive until enabled via `ACTIVE_CANCERS` in `config.py`.
+
 | Cancer | Status |
 |---|---|
-| Cervical | ✅ Full pathway (ASCCP-aligned) |
-| Lung | 🟡 Stub (LD CT → NEGATIVE/POSITIVE) |
-| Breast | 🟡 Stub (mammogram → NEGATIVE/POSITIVE) |
-| Colorectal | 🟡 Stub (colonoscopy/FIT → NEGATIVE/POSITIVE) |
-| Osteoporosis | 🟡 Stub (DEXA → NEGATIVE/POSITIVE) |
+| Cervical | ✅ Active — full pathway (ASCCP-aligned, no co-testing in base case) |
+| Breast | ✅ Active — stub (mammogram → NEGATIVE/POSITIVE) |
+| Lung | ⬜ Inactive — full Lung-RADS v2022 pathway coded, activate when ready |
+| Colorectal | ⬜ Inactive — stub (colonoscopy/FIT → NEGATIVE/POSITIVE) |
+| Osteoporosis | ⬜ Inactive — stub (DEXA → NEGATIVE/POSITIVE) |
 
-Stubs are structured and ready to be filled in as clinical pathways are defined.
+To activate a cancer pathway, add it to `ACTIVE_CANCERS` in `config.py`.
 
 ---
 
@@ -239,23 +241,8 @@ Key functions:
 
 ## Notebooks
 
-### `scenarios.py` — Scenario Definitions & Co-Scheduling Logic
-The improvement analysis engine. Defines four scenarios:
-
-| Scenario key | Description |
-|---|---|
-| `baseline_fragmented` | Current state — each provider screens their domain only; separate appointments per cancer |
-| `gyn_coordinated` | GYN visits bundle cervical + breast; rest fragmented |
-| `coordinated_all` | All due screenings bundled into one encounter per patient |
-| `high_access_coordinated` | Full co-scheduling + reduced scheduling friction/access barriers |
-
-Key functions:
-- `run_encounter(p, provider, day, metrics, scenario)` — scenario-aware encounter logic (single LTFU draw for bundled vs. per-screening for fragmented)
-- `compare_scenarios(scenario_names, patients, providers, ...)` — run all scenarios on the same cohort and return all metrics dicts
-- `age_cluster_summary(patients)` — breaks down multi-screening eligibility by age group (identifies the 40–50 co-scheduling sweet spot)
-- `get_multi_screening_eligible(patients)` — returns co-scheduling candidates (eligible for 2+ screenings)
-
-**Adding a new scenario**: add one entry to the `SCENARIOS` dict in `scenarios.py` — the notebook picks it up automatically.
+### `scenarios.py` — Scenario Definitions & Co-Scheduling Logic *(reserved for future use)*
+Infrastructure for co-scheduling improvement analysis. The module and four scenario stubs (`baseline_fragmented`, `gyn_coordinated`, `coordinated_all`, `high_access_coordinated`) are defined but not yet integrated into the base-case simulation. See **Next Steps** for planned work.
 
 ---
 
@@ -282,16 +269,8 @@ Connects Sophia's arrival layer to Steps 2–6:
 4. Runs the full SimPy simulation
 5. Prints both arrival summary (Sophia's) and screening summary (Steps 2–6)
 
-### `06_scenario_analysis.ipynb` — Co-Scheduling Improvement Analysis
-The primary improvement analysis notebook. Runs all four scenarios on the **same patient cohort** and produces:
-- Age-clustering analysis (where do multiple screenings converge?)
-- Side-by-side comparison table across all scenarios
-- Absolute Δ vs. baseline for each key rate
-- Cervical pathway funnel across all scenarios
-- Encounter savings count (appointments eliminated by co-scheduling)
-- Bar chart visualization
-
-To add a new scenario, edit `scenarios.py` and re-run this notebook.
+### `06_scenario_analysis.ipynb` — Co-Scheduling Improvement Analysis *(reserved for future use)*
+Scaffold notebook for co-scheduling scenario comparison. Not yet wired to the base-case simulation — reserved for when scenario analysis work begins. See **Next Steps**.
 
 ### `05_metrics_outputs.ipynb` — Analysis & Reporting
 - Full summary report
@@ -369,10 +348,11 @@ All placeholder values are marked with `# PLACEHOLDER` comments in `config.py`. 
 | 🔴 Immediate | Confirm procedure codes for LEEP, cone biopsy, colposcopy, CIN grading |
 | 🟡 Near-term | Replace `COLPOSCOPY_RESULT_PROBS` with ASCCP risk table values |
 | 🟡 Near-term | Replace `LTFU_PROBS` with EHR-derived attrition rates |
-| 🟡 Near-term | Build out breast cancer pathway (next clinical priority) |
-| 🟢 Later | Add coordinated-mode capacity assumptions to `config.py` |
-| 🟢 Later | Build lung, colorectal, osteoporosis pathways |
-| 🟢 Later | Multi-replication run + variance analysis (`NUM_REPS` in config) |
+| 🟡 Near-term | Build out breast cancer follow-up pathway (next clinical priority) |
+| 🟢 Future | **Scenario / co-scheduling analysis** — wire `scenarios.py` + `06_scenario_analysis.ipynb` to the base-case simulation; calibrate `ltfu_multiplier` and `scheduling_delay_days` from NYP pilot data or literature |
+| 🟢 Future | Add coordinated-mode capacity assumptions to `config.py` |
+| 🟢 Future | Build lung, colorectal, osteoporosis pathways |
+| 🟢 Future | Multi-replication run + variance analysis (`NUM_REPS` in config) |
 
 ---
 
