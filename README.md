@@ -32,21 +32,28 @@ To activate a cancer pathway, add it to `ACTIVE_CANCERS` in `config.py`.
 ```
 NYP/
 │
-├── config.py                        # Central configuration — all parameters live here
-├── patient.py                       # Shared Patient dataclass (data contract)
-├── population.py                    # Population sampler stub — REPLACE with provided code
+├── README.md
+├── LICENSE
 │
-├── screening.py                     # Steps 2–3: eligibility, test assignment, results
-├── followup.py                      # Steps 4–5: colposcopy, CIN grading, treatment
-├── metrics.py                       # Metric collection, rate computation, reporting
-├── scenarios.py                     # Scenario definitions + co-scheduling logic
+├── src/                                 # Core simulation modules (import from here)
+│   ├── config.py                        # Central configuration — all parameters live here
+│   ├── patient.py                       # Shared Patient dataclass (data contract)
+│   ├── population.py                    # Population sampler stub — REPLACE with provided code
+│   ├── screening.py                     # Steps 2–3: eligibility, test assignment, results
+│   ├── followup.py                      # Steps 4–5: colposcopy, CIN grading, treatment
+│   ├── metrics.py                       # Metric collection, rate computation, reporting
+│   └── scenarios.py                     # Scenario definitions + co-scheduling logic (future)
 │
-├── 01_arrivals.ipynb                # Sophia's arrivals simulation (do not modify)
-├── 02_screening.ipynb               # Demo + tests for screening layer
-├── 03_results_followup.ipynb        # Demo + tests for follow-up pathways
-├── 04_simulation_runner.ipynb       # Full end-to-end orchestration
-├── 05_metrics_outputs.ipynb         # Analysis, funnel, scenario comparison
-└── 06_scenario_analysis.ipynb       # Co-scheduling scenario comparison
+├── notebooks/                           # Jupyter notebooks — run from this folder
+│   ├── 02_screening.ipynb               # Demo + tests for screening layer
+│   ├── 03_results_followup.ipynb        # Demo + tests for follow-up pathways
+│   ├── 04_simulation_runner.ipynb       # Full end-to-end orchestration
+│   ├── 05_metrics_outputs.ipynb         # Analysis, funnel, scenario comparison
+│   └── 06_scenario_analysis.ipynb       # Co-scheduling comparison (future)
+│
+└── reference/                           # Source material — do not modify
+    ├── initial_model_NYP_flow_simulation (1).ipynb   # Sophia's arrivals simulation
+    └── Simulation_draft_Yutong.ipynb                 # Yutong's draft (reference only)
 ```
 
 ### Design Principle
@@ -288,12 +295,12 @@ Scaffold notebook for co-scheduling scenario comparison. Not yet wired to the ba
 ```bash
 jupyter lab --notebook-dir=/path/to/NYP
 ```
-Then open notebooks in order: `02` → `03` → `04` → `05`.
+Then open notebooks from the `notebooks/` folder in order: `02` → `03` → `04` → `05` (all in `notebooks/`).
 
 **Option 2 — Run modules directly**
 ```python
 import sys
-sys.path.insert(0, '/path/to/NYP')
+sys.path.insert(0, '/path/to/NYP/src')
 
 import random, config as cfg
 from population import sample_patient
