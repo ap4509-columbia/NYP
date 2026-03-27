@@ -1,29 +1,25 @@
 # NYP Women's Health Screening Simulation
 
-A discrete-event simulation (DES) of a multi-cancer women's health screening program at NewYork-Presbyterian. The model simulates patient flow from provider arrival through screening, clinical follow-up, and system exit — quantifying drop-off at each step and supporting operational planning.
+A discrete-event simulation (DES) of a multi-cancer women's health screening program at NewYork-Presbyterian. The model simulates patient flow from provider arrival through screening, clinical follow-up, and system exit — quantifying drop-off at each step and supporting operational and financial planning.
 
 ---
 
 ## Project Context
 
-The simulation covers **screening → diagnosis**, not treatment economics. The primary objective is to:
-- Model patient attrition through the screening pathway
-- Identify missed screening opportunities
-- Compare **fragmented** (current) vs. **coordinated** (future) workflow scenarios
-- Support ROI analysis for expanding screening programs
+**Scope:** screening → diagnosis (not treatment economics, except for foregone revenue analysis).
 
-**Base case** (active): cervical + breast only.
-Additional pathways are coded as structured stubs — inactive until enabled via `ACTIVE_CANCERS` in `config.py`.
+**Active cancers:** cervical and lung.
 
-| Cancer | Status |
-|---|---|
-| Cervical | ✅ Active — full pathway (ASCCP-aligned, no co-testing in base case) |
-| Breast | ✅ Active — stub (mammogram → NEGATIVE/POSITIVE) |
-| Lung | ⬜ Inactive — full Lung-RADS v2022 pathway coded, activate when ready |
-| Colorectal | ⬜ Inactive — stub (colonoscopy/FIT → NEGATIVE/POSITIVE) |
-| Osteoporosis | ⬜ Inactive — stub (DEXA → NEGATIVE/POSITIVE) |
+**Primary objectives:**
+- Model patient attrition at every clinical decision node
+- Identify missed screening opportunities and their revenue impact
+- Compare **fragmented** (current state) vs. **coordinated** (future state) workflow scenarios
+- Support ROI analysis for expanding the screening program
 
-To activate a cancer pathway, add it to `ACTIVE_CANCERS` in `config.py`.
+| Cancer | Status | Guideline |
+|---|---|---|
+| Cervical | ✅ Full pathway | USPSTF 2018 — cytology every 3 yrs (21–65) or HPV-alone every 5 yrs (30–65) |
+| Lung | ✅ Full pathway | USPSTF 2021 — annual LDCT, age 50–80, ≥20 pack-years, current/quit ≤15 yrs |
 
 ---
 
@@ -35,115 +31,113 @@ NYP/
 ├── README.md
 ├── LICENSE
 │
-├── src/                                 # Core simulation modules (import from here)
-│   ├── config.py                        # Central configuration — all parameters live here
-│   ├── patient.py                       # Shared Patient dataclass (data contract)
-│   ├── population.py                    # Population sampler stub — REPLACE with provided code
-│   ├── screening.py                     # Steps 2–3: eligibility, test assignment, results
-│   ├── followup.py                      # Steps 4–5: colposcopy, CIN grading, treatment
-│   ├── metrics.py                       # Metric collection, rate computation, reporting
-│   └── scenarios.py                     # Scenario definitions + co-scheduling logic (future)
+├── src/                          # Core simulation modules
+│   ├── config.py                 # All parameters, probabilities, and revenue rates
+│   ├── patient.py                # Patient dataclass — shared data contract
+│   ├── population.py             # Population sampler stub (replace with Yutong's code)
+│   ├── screening.py              # Eligibility, test assignment, result draws
+│   ├── followup.py               # Post-screening clinical pathways
+│   ├── metrics.py                # Counters, rates, revenue analysis, reporting
+│   └── scenarios.py              # Co-scheduling scenario definitions (future)
 │
-├── notebooks/                           # Jupyter notebooks — run from this folder
-│   ├── 02_screening.ipynb               # Demo + tests for screening layer
-│   ├── 03_results_followup.ipynb        # Demo + tests for follow-up pathways
-│   ├── 04_simulation_runner.ipynb       # Full end-to-end orchestration
-│   ├── 05_metrics_outputs.ipynb         # Analysis, funnel, scenario comparison
-│   └── 06_scenario_analysis.ipynb       # Co-scheduling comparison (future)
+├── notebooks/                    # Jupyter notebooks
+│   ├── 02_screening.ipynb        # Screening layer demo and tests
+│   ├── 03_results_followup.ipynb # Follow-up pathway demo and tests
+│   ├── 04_simulation_runner.ipynb# Full end-to-end orchestration
+│   ├── 05_metrics_outputs.ipynb  # Analysis, funnels, revenue, plots
+│   └── 06_scenario_analysis.ipynb# Co-scheduling comparison (future)
 │
-└── reference/                           # Source material — do not modify
-    ├── initial_model_NYP_flow_simulation (1).ipynb   # Sophia's arrivals simulation
-    └── Simulation_draft_Yutong.ipynb                 # Yutong's draft (reference only)
+└── reference/                    # Source material — do not modify
+    ├── initial_model_NYP_flow_simulation (1).ipynb  # Sophia's arrivals simulation
+    └── Simulation_draft_Yutong.ipynb                # Yutong's draft (reference only)
 ```
 
-### Design Principle
-Logic lives in **`.py` modules** — clean, importable, testable.
-**Notebooks** are thin wrappers that import from the modules, demonstrate usage, and run experiments. This means you can test any piece in isolation without running the full simulation.
+**Design principle:** logic lives in `.py` modules — importable, testable, version-controlled cleanly. Notebooks are thin wrappers that call those modules, run scenarios, and show output. You never need to edit a notebook to change a clinical parameter.
 
 ---
 
 ## Simulation Flow
 
 ```
-Women Population Eligible in NYC
-        │
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  STEP 1 — ARRIVAL  [01_arrivals.ipynb — Sophia's layer] │
-│                                                         │
-│  Patient enters via:                                    │
-│    PCP (35%)  │  Gynecologist (25%)                     │
-│    Specialist (20%)  │  ER (20%)                        │
-│                                                         │
-│  Queue management: outpatient scheduling, drop-in       │
-│  routing, ER critical returns, capacity constraints.    │
-└──────────────────────────┬──────────────────────────────┘
-                           │  patient "seen" by provider
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  STEP 2 — SCREENING DECISION  [screening.py]            │
-│                                                         │
-│  Is the patient eligible?                               │
-│    Cervical:     age 21–65, has cervix                  │
-│    Lung:         age 50–80, ≥20 pack-years              │
-│    Breast:       age 40–80                              │
-│    Colorectal:   age 45–80                              │
-│    Osteoporosis: age 65+ or BMI < 19                    │
-│                                                         │
-│  Not eligible / declines → UNSCREENED node:             │
-│    Will reschedule? (50%) → re-enter queue              │
-│    Will not reschedule?   → EXIT SYSTEM                 │
-└──────────────────────────┬──────────────────────────────┘
-                           │  eligible
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  STEP 3 — SCREENING METHODS & RESULTS  [screening.py]   │
-│                                                         │
-│  Cervical test assigned by age (ASCCP guidelines):      │
-│    Age 21–29 → Cytology (Pap)                          │
-│    Age 30–65 → HPV-alone or Co-test                    │
-│                                                         │
-│  Cervical result (6 categories):                        │
-│    NORMAL  │  ASCUS  │  LSIL                            │
-│    ASC-H   │  HSIL   │  HPV_POS_NORMAL_CYTO             │
-│                                                         │
-│  Other cancers: NEGATIVE / POSITIVE (binary stub)       │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  STEP 4 — RESULT ROUTING  [followup.py]                 │
-│                                                         │
-│  NORMAL          → routine surveillance interval        │
-│  ASCUS / LSIL    → colposcopy (LTFU check: 20% drop)   │
-│  ASC-H / HSIL    → colposcopy (expedited)              │
-│  HPV+/normal cyto→ 1-year repeat (40%) or colposcopy   │
-│                                                         │
-│  Other cancers: POSITIVE → referral stub                │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  STEP 5 — CLINICAL FOLLOW-UP  [followup.py]             │
-│                                                         │
-│  Colposcopy → CIN grade draw:                           │
-│    CIN1 / NORMAL  → surveillance (1-year repeat)        │
-│    CIN2 / CIN3    → excisional treatment                │
-│                      LEEP (default) or Cold Knife Cone  │
-│                                                         │
-│  LTFU check before treatment: 10% drop-out             │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  STEP 6 — EXIT / RE-ENTRY  [04_simulation_runner.ipynb] │
-│                                                         │
-│  Treated      → post-treatment delay → surveillance     │
-│                 loop (re-enters system)                 │
-│  Surveillance → returns at 1-year interval              │
-│  Untreated    → exits system                            │
-│  LTFU         → exits system                            │
-└─────────────────────────────────────────────────────────┘
+NYC Eligible Women Population
+          │
+          ▼
+┌──────────────────────────────────────────────────────┐
+│  STEP 1 — ARRIVAL  [Sophia's layer]                  │
+│  Patient enters via PCP / Gynecologist / Specialist  │
+│  Queue management, scheduling, capacity constraints  │
+└────────────────────────┬─────────────────────────────┘
+                         │  patient "seen" by provider
+                         ▼
+┌──────────────────────────────────────────────────────┐
+│  STEP 2 — ELIGIBILITY CHECK  [screening.py]          │
+│                                                      │
+│  Cervical:  age 21–65, has cervix                    │
+│  Lung:      age 50–80, ≥20 pack-years,               │
+│             current smoker OR quit ≤15 years ago     │
+│                                                      │
+│  Not eligible / declines → UNSCREENED node:          │
+│    50% willing to reschedule → re-enter queue        │
+│    50% not willing         → EXIT (foregone revenue) │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────┐
+│  STEP 3 — SCREENING  [screening.py]                  │
+│                                                      │
+│  Cervical (age-stratified, USPSTF 2018):             │
+│    Age 21–29 → Cytology only, every 3 years          │
+│    Age 30–65 → Cytology (3 yrs) or HPV-alone (5 yrs)│
+│    Age 65+   → Stop screening (adequate prior hx)    │
+│                                                      │
+│  Lung (USPSTF 2021 / hospital flowchart):            │
+│    LDCT order placed?      → LTFU if no              │
+│    Patient schedules LDCT? → LTFU if no              │
+│    LDCT completed → Lung-RADS v2022 result drawn     │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────┐
+│  STEP 4 — RESULT ROUTING  [followup.py]              │
+│                                                      │
+│  Cervical cytology:                                  │
+│    NORMAL              → routine surveillance        │
+│    ASCUS/LSIL/ASC-H/HSIL → colposcopy (LTFU check)  │
+│                                                      │
+│  Cervical HPV-alone:                                 │
+│    HPV_NEGATIVE        → routine surveillance        │
+│    HPV_POSITIVE        → 40% 1-yr repeat / 60% colpo │
+│                                                      │
+│  Lung Lung-RADS v2022:                               │
+│    RADS 0              → results communicated →      │
+│                          repeat LDCT in 1–3 months   │
+│    RADS 1 / 2          → results communicated →      │
+│                          repeat LDCT in 12 months    │
+│    RADS 3              → results communicated →      │
+│                          repeat LDCT in 6 months     │
+│    RADS 4A / 4B / 4X  → results communicated →      │
+│                          biopsy pathway              │
+│    Any tier, no communication → LTFU                 │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────┐
+│  STEP 5 — CLINICAL FOLLOW-UP  [followup.py]          │
+│                                                      │
+│  Cervical colposcopy → CIN grade:                    │
+│    NORMAL / CIN1 → surveillance                      │
+│    CIN2 / CIN3   → LEEP or cone biopsy               │
+│    LTFU check before treatment (10% drop)            │
+│                                                      │
+│  Lung biopsy chain (RADS 4A/4B/4X):                  │
+│    Referral made? → scheduled? → completed?          │
+│    → malignancy confirmed? → treatment given?        │
+│    LTFU node at every step                           │
+└────────────────────────┬─────────────────────────────┘
+                         ▼
+┌──────────────────────────────────────────────────────┐
+│  STEP 6 — EXIT / RE-ENTRY                            │
+│  Treated      → surveillance loop                    │
+│  Surveillance → returns at screening interval        │
+│  LTFU / untreated → exits system                     │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -151,198 +145,180 @@ Women Population Eligible in NYC
 ## Module Reference
 
 ### `config.py` — Central Configuration
-All parameters in one place. Change values here; everything picks them up automatically.
+Every tunable value lives here. Change once, everything picks it up.
 
-Key sections:
-- `ELIGIBILITY` — age and clinical rules per cancer type
-- `SCREENING_TESTS` — test modalities by cancer and age stratum
-- `SCREENING_INTERVALS_DAYS` — how often each test recurs
-- `CERVICAL_RESULT_PROBS` — multinomial result probabilities (by age stratum + test)
-- `COLPOSCOPY_RESULT_PROBS` — CIN grade probabilities conditional on triggering result
-- `LTFU_PROBS` — loss-to-follow-up rates at each decision node
-- `WORKFLOW_MODE` — `"fragmented"` (current state) or `"coordinated"` (future state)
-- `CAPACITIES` — daily slot counts for each screening/procedure resource
+| Section | Contents |
+|---|---|
+| `ACTIVE_CANCERS` | Toggle which pathways run |
+| `ELIGIBILITY` | Age ranges and clinical criteria per cancer |
+| `SCREENING_TESTS` | Test modalities by cancer and age stratum |
+| `SCREENING_INTERVALS_DAYS` | Recurrence interval per test |
+| `CERVICAL_RESULT_PROBS` | Multinomial result probabilities (age + test stratified) |
+| `LUNG_RADS_PROBS` | Lung-RADS v2022 category distribution |
+| `LUNG_PATHWAY_PROBS` | Completion probability at each pre/post-LDCT step |
+| `LUNG_RADS_REPEAT_INTERVALS` | Days until repeat LDCT by RADS category |
+| `COLPOSCOPY_RESULT_PROBS` | CIN grade conditional on triggering result |
+| `TREATMENT_ASSIGNMENT` | CIN grade → treatment modality |
+| `LTFU_PROBS` | Drop-out rates at each clinical decision node |
+| `PROCEDURE_REVENUE` | Revenue per procedure (CPT-referenced, PLACEHOLDER) |
+| `CAPACITIES` | Daily slot counts per resource |
 
-> ⚠️ All probability values are **PLACEHOLDERS**. Replace with NYP EHR-derived rates and ASCCP risk table values as they become available.
+> ⚠️ All probability and revenue values are **PLACEHOLDERS**. Replace with NYP EHR-derived rates and finance data as they become available.
 
 ---
 
 ### `patient.py` — Patient Dataclass
-The **shared data contract** between all modules. Every patient object carries:
 
 | Field group | Fields |
 |---|---|
-| Core (Sophia-compatible) | `patient_id`, `day_created`, `patient_type`, `destination`, `critical_status`, `scheduled_day`, `wait_days`, `return_count` |
+| Core | `patient_id`, `day_created`, `patient_type`, `destination` |
 | Demographics | `age`, `race`, `ethnicity`, `insurance` |
-| Clinical flags | `has_cervix`, `smoker`, `pack_years`, `bmi`, `hpv_positive`, `hpv_vaccinated`, `prior_abnormal_pap`, `prior_cin` |
+| Clinical flags | `has_cervix`, `smoker`, `pack_years`, `years_since_quit`, `bmi`, `hpv_positive`, `hpv_vaccinated`, `prior_abnormal_pap`, `prior_cin` |
 | Simulation state | `active`, `current_stage`, `willing_to_reschedule` |
-| Screening history | `last_*_screen_day` (one per cancer type) |
-| Results | `cervical_result`, `lung_result`, `breast_result`, `colorectal_result`, `osteo_result` |
-| Follow-up state | `colposcopy_result`, `treatment_type` |
+| Screening history | `last_cervical_screen_day`, `last_lung_screen_day` |
+| Results | `cervical_result`, `lung_result` |
+| Cervical follow-up | `colposcopy_result`, `treatment_type` |
+| Lung follow-up | `lung_referral_placed`, `lung_ldct_scheduled`, `lung_biopsy_result` |
 | Exit | `exit_reason` |
-| Log | `event_log` — timestamped list of every event for this patient |
+| Log | `event_log` — timestamped list of every event |
 
 Helper methods: `p.log(day, event)`, `p.exit_system(day, reason)`, `p.print_history()`.
-
-> **Backward compatibility**: Our `Patient` is a superset of Sophia's. All her queue-management functions work unchanged on these extended objects.
 
 ---
 
 ### `population.py` — Population Sampler (Stub)
-Defines the interface contract:
+
+Public interface — do not change the signature:
 ```python
 sample_patient(patient_id, day_created, destination, patient_type) -> Patient
 ```
-The stub draws demographics from rough NYC distributions so the simulation runs end-to-end immediately.
-
-> 🔄 **To swap in the provided population sampling code**: replace the body of `sample_patient()` only. The function signature must not change.
+The stub draws demographics from NYC distributions so the simulation runs immediately. **Replace the body** with Yutong's code when it arrives — no other files need to change.
 
 ---
 
 ### `screening.py` — Steps 2–3
-Key functions:
 
 | Function | Purpose |
 |---|---|
-| `get_eligible_screenings(p)` | Returns list of cancer types patient qualifies for |
+| `get_eligible_screenings(p)` | Returns cancer types patient qualifies for (filtered by `ACTIVE_CANCERS`) |
 | `is_due_for_screening(p, cancer, day)` | Checks whether screening interval has elapsed |
 | `get_cervical_age_stratum(age)` | Maps age → `"young"` / `"middle"` / `"older"` |
 | `assign_screening_test(p, cancer)` | Picks test modality (age-stratified for cervical) |
 | `draw_cervical_result(p, test)` | Multinomial result draw with risk-factor adjustments |
-| `draw_other_cancer_result(cancer)` | Binary NEGATIVE/POSITIVE draw (stub) |
-| `run_screening_step(p, cancer, day)` | Full screening event: eligibility → test → result → updates patient |
+| `draw_lung_rads_result()` | Lung-RADS v2022 category draw |
+| `run_lung_pre_ldct(p, day, metrics)` | Pre-LDCT pathway: referral → scheduling → LTFU nodes |
+| `run_screening_step(p, cancer, day, metrics)` | Full screening event: eligibility → test → result |
 | `handle_unscreened(p, day)` | Decision node: will patient reschedule? |
 
 ---
 
 ### `followup.py` — Steps 4–5
-Key functions:
 
 | Function | Purpose |
 |---|---|
-| `route_cervical_result(p, day, metrics)` | Routes result to colposcopy / surveillance / exit |
-| `run_colposcopy(p, day, metrics)` | Draws CIN grade, records on patient |
-| `run_treatment(p, day, metrics)` | LTFU check → surveillance or excisional treatment |
-| `run_cervical_followup(p, day, metrics)` | **Main orchestrator** — chains all cervical follow-up steps |
-| `run_stub_followup(p, cancer, result, day, metrics)` | Simplified follow-up for non-cervical cancers |
+| `route_cervical_result(p, day, metrics)` | Routes cytology/HPV result to next step |
+| `run_colposcopy(p, day, metrics)` | Draws CIN grade, updates patient |
+| `run_treatment(p, day, metrics)` | LTFU check → surveillance or LEEP/cone |
+| `run_cervical_followup(p, day, metrics)` | Full cervical pipeline orchestrator |
+| `run_lung_followup(p, day, metrics)` | Full lung pipeline: RADS routing → biopsy chain |
 
-Loss-to-follow-up is checked at two explicit nodes:
-1. **Post-abnormal screen** → before colposcopy (20% LTFU, configurable)
-2. **Post-colposcopy** → before treatment (10% LTFU, configurable)
+LTFU is checked explicitly at every clinical decision node — not as a bulk end-of-pathway draw.
 
 ---
 
-### `metrics.py` — Metrics & Reporting
-Key functions:
+### `metrics.py` — Metrics and Revenue
 
 | Function | Purpose |
 |---|---|
-| `initialize_metrics()` | Creates a fresh metrics dict for one run |
-| `record_screening(metrics, p, cancer, result)` | Log a completed screen |
-| `record_exit(metrics, reason)` | Log a patient exit and classify outcome |
-| `compute_rates(metrics)` | Derive key percentages (screening rate, LTFU rate, etc.) |
-| `print_summary(metrics)` | Formatted report to stdout |
-| `print_patient_trace(patients, n)` | Print event logs for debugging |
+| `initialize_metrics()` | Fresh metrics dict for one run |
+| `record_screening(metrics, p, cancer, result)` | Log a completed screening |
+| `record_exit(metrics, reason)` | Log a patient exit |
+| `compute_rates(metrics)` | Screening rate, abnormal rate, LTFU rate, etc. |
+| `compute_revenue(metrics)` | Realized + foregone revenue by procedure and LTFU node |
+| `print_summary(metrics)` | Formatted clinical summary to stdout |
+| `print_revenue_summary(metrics)` | Formatted revenue summary to stdout |
+| `print_patient_trace(patients, n)` | Event logs for debugging |
+
+#### Revenue analysis
+
+`compute_revenue(metrics)` returns:
+```python
+{
+    "realized_total":        float,   # revenue from completed procedures
+    "foregone_total":        float,   # revenue lost to LTFU / unscreened
+    "realized_by_procedure": dict,    # breakdown by procedure type
+    "foregone_by_node": {
+        "unscreened_cervical":          float,  # eligible but never screened
+        "ltfu_post_abnormal_cervical":  float,  # abnormal but no colposcopy
+        "ltfu_post_colposcopy":         float,  # colposcopy but no treatment
+        "lung_no_ldct":                 float,  # eligible but no LDCT
+        "lung_no_biopsy":               float,  # RADS 4 but no biopsy
+    }
+}
+```
+
+Revenue rates are set in `config.PROCEDURE_REVENUE` (CPT-referenced PLACEHOLDERs — replace with NYP contract rates).
 
 ---
 
-## Notebooks
+### `scenarios.py` — Co-Scheduling Scenarios *(future)*
 
-### `scenarios.py` — Scenario Definitions & Co-Scheduling Logic *(reserved for future use)*
-Infrastructure for co-scheduling improvement analysis. The module and four scenario stubs (`baseline_fragmented`, `gyn_coordinated`, `coordinated_all`, `high_access_coordinated`) are defined but not yet integrated into the base-case simulation. See **Next Steps** for planned work.
-
----
-
-### `01_arrivals.ipynb` — Sophia's Arrivals Simulation *(do not modify)*
-Handles patient generation, provider queues, scheduling, and ER logic. The **handoff point** is when a patient is marked "seen" by a provider — that triggers Steps 2–6.
-
-### `02_screening.ipynb` — Screening Layer Demo & Tests
-- Eligibility edge-case verification
-- Test assignment by age stratum
-- Result distribution sanity check (observed vs. expected %)
-- Smoke test: 30 patients through `run_screening_step`
-
-### `03_results_followup.ipynb` — Follow-Up Pathway Demo & Tests
-- Routing distribution per result category (stochastic, 200 trials each)
-- Colposcopy CIN grade distribution vs. config expectations
-- End-to-end trace: 10 patients from screening result → disposition
-- Mini summary report
-
-### `04_simulation_runner.ipynb` — Full Orchestration
-Connects Sophia's arrival layer to Steps 2–6:
-1. `%run`s Sophia's notebook to load her queue functions
-2. Overrides patient creation with `sample_patient()` (enriched demographics)
-3. Wraps her provider queue processor to trigger screening after each "seen" event
-4. Runs the full SimPy simulation
-5. Prints both arrival summary (Sophia's) and screening summary (Steps 2–6)
-
-### `06_scenario_analysis.ipynb` — Co-Scheduling Improvement Analysis *(reserved for future use)*
-Scaffold notebook for co-scheduling scenario comparison. Not yet wired to the base-case simulation — reserved for when scenario analysis work begins. See **Next Steps**.
-
-### `05_metrics_outputs.ipynb` — Analysis & Reporting
-- Full summary report
-- Key rate table
-- Cervical results by age stratum
-- **Pathway funnel** — shows count and % drop at every step
-- **Workflow scenario comparison** — fragmented vs. coordinated side-by-side
-- Plot placeholder (bar chart once matplotlib is confirmed)
+Four scenarios are defined — `baseline_fragmented`, `gyn_coordinated`, `coordinated_all`, `high_access_coordinated` — but not yet wired to the main simulation. Reserved for the co-scheduling improvement analysis phase.
 
 ---
 
 ## How to Run
 
-**Option 1 — Jupyter Lab (recommended)**
+**Option 1 — Jupyter Lab**
 ```bash
 jupyter lab --notebook-dir=/path/to/NYP
 ```
-Then open notebooks from the `notebooks/` folder in order: `02` → `03` → `04` → `05` (all in `notebooks/`).
+Open notebooks from the `notebooks/` folder.
 
-**Option 2 — Run modules directly**
+**Option 2 — Python directly**
 ```python
 import sys
 sys.path.insert(0, '/path/to/NYP/src')
 
-import random, config as cfg
+import random
 from population import sample_patient
 from screening import get_eligible_screenings, run_screening_step
-from followup import run_cervical_followup
-from metrics import initialize_metrics, print_summary
+from followup import run_cervical_followup, run_lung_followup
+from metrics import initialize_metrics, print_summary, print_revenue_summary
 
 random.seed(42)
 metrics = initialize_metrics()
 
-for i in range(100):
+for i in range(500):
     p = sample_patient(i, 0, 'gynecologist', 'outpatient')
     metrics['n_patients'] += 1
     for cancer in get_eligible_screenings(p):
-        result = run_screening_step(p, cancer, 0)
-        if result and cancer == 'cervical':
-            run_cervical_followup(p, 0, metrics)
+        result = run_screening_step(p, cancer, 0, metrics)
+        if result:
+            if cancer == 'cervical':
+                run_cervical_followup(p, 0, metrics)
+            elif cancer == 'lung':
+                run_lung_followup(p, 0, metrics)
 
 print_summary(metrics)
+print_revenue_summary(metrics)
 ```
 
 ---
 
-## Integrating the Provided Population Sampling Code
+## Replacing Placeholder Values
 
-When the population sampling code is delivered, open `population.py` and replace everything below the `# ── Public interface ──` comment with the provided implementation. The function signature must remain:
-```python
-def sample_patient(patient_id: int, day_created: int,
-                   destination: str, patient_type: str) -> Patient:
-```
-No other files need to change.
+All placeholders are marked with `# PLACEHOLDER` in `config.py`. Priority order:
 
----
-
-## Replacing Placeholder Parameters
-
-All placeholder values are marked with `# PLACEHOLDER` comments in `config.py`. Priority order for replacement:
-
-1. **`CERVICAL_RESULT_PROBS`** — from NYP EHR abnormal Pap rates (confirmed roughly consistent with national expectations per clinical team)
-2. **`COLPOSCOPY_RESULT_PROBS`** — from ASCCP risk table slides (clinician to share)
-3. **`LTFU_PROBS`** — from NYP EHR attrition analysis (Neil's logistic regression outputs)
-4. **`POSITIVE_RATES`** (other cancers) — from literature / NYP data as each pathway is built out
+| Priority | Parameter | Source |
+|---|---|---|
+| 🔴 Now | `PROCEDURE_REVENUE` | NYP finance / contract rates |
+| 🔴 Now | Population sampler | Yutong's code → drop into `population.py` |
+| 🔴 Now | `CERVICAL_RESULT_PROBS` | NYP EHR abnormal Pap rates |
+| 🟡 Soon | `COLPOSCOPY_RESULT_PROBS` | ASCCP risk table slides |
+| 🟡 Soon | `LTFU_PROBS` | NYP EHR attrition analysis |
+| 🟡 Soon | `LUNG_PATHWAY_PROBS` | NYP LDCT volume / referral data |
+| 🟢 Future | `LUNG_RADS_PROBS` | NYP LDCT registry data |
 
 ---
 
@@ -350,29 +326,22 @@ All placeholder values are marked with `# PLACEHOLDER` comments in `config.py`. 
 
 | Priority | Task |
 |---|---|
-| 🔴 Immediate | Swap in provided population sampling code into `population.py` |
-| 🔴 Immediate | Replace `CERVICAL_RESULT_PROBS` with NYP EHR rates |
-| 🔴 Immediate | Confirm procedure codes for LEEP, cone biopsy, colposcopy, CIN grading |
-| 🟡 Near-term | Replace `COLPOSCOPY_RESULT_PROBS` with ASCCP risk table values |
-| 🟡 Near-term | Replace `LTFU_PROBS` with EHR-derived attrition rates |
-| 🟡 Near-term | Build out breast cancer follow-up pathway (next clinical priority) |
-| 🟢 Future | **Scenario / co-scheduling analysis** — wire `scenarios.py` + `06_scenario_analysis.ipynb` to the base-case simulation; calibrate `ltfu_multiplier` and `scheduling_delay_days` from NYP pilot data or literature |
-| 🟢 Future | Add coordinated-mode capacity assumptions to `config.py` |
-| 🟢 Future | Build lung, colorectal, osteoporosis pathways |
-| 🟢 Future | Multi-replication run + variance analysis (`NUM_REPS` in config) |
+| 🔴 Immediate | Build `runner.py` — `SimulationRunner` class with `run()`, `plot_all()`, `revenue_summary()` |
+| 🔴 Immediate | Drop in Yutong's population sampling code |
+| 🔴 Immediate | Replace all PLACEHOLDER values with NYP data |
+| 🟡 Near-term | Wire `scenarios.py` into the runner for co-scheduling analysis |
+| 🟡 Near-term | Build visualizations — cervical funnel, lung funnel, RADS distribution, revenue waterfall |
+| 🟢 Future | Multi-replication runs + variance analysis (`NUM_REPS` in config) |
 
 ---
 
 ## Dependencies
 
 ```
-simpy >= 4.1.1      # discrete-event simulation engine
-```
-Install: `pip install simpy`
-
-Optional (for plots in `05_metrics_outputs.ipynb`):
-```
+simpy >= 4.1.1
 matplotlib
 ```
+
+Install: `pip install simpy matplotlib`
 
 All other dependencies (`random`, `dataclasses`, `collections`, `typing`) are Python standard library.

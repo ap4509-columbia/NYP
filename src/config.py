@@ -187,3 +187,25 @@ CAPACITIES = {
 
 # ── Unscreened Re-entry Delay (days) ──────────────────────────────────────────
 RESCHEDULE_DELAY_DAYS = 90
+
+# ── Procedure Revenue (per event, USD) ────────────────────────────────────────
+# PLACEHOLDER — replace with NYP finance / contract rates.
+# CPT references provided for calibration.
+PROCEDURE_REVENUE = {
+    # Cervical screening
+    "cytology":       156,    # CPT 88175 (liquid-based cytology)
+    "hpv_alone":      198,    # CPT 87624 (hrHPV nucleic acid)
+
+    # Cervical follow-up
+    "colposcopy":     312,    # CPT 57454 (colposcopy w/ biopsy)
+    "leep":           847,    # CPT 57461 (LEEP excision)
+    "cone_biopsy":   1240,    # CPT 57520 (cold-knife cone)
+    "surveillance":     0,    # watchful waiting — no billable procedure
+
+    # Lung screening
+    "ldct":           285,    # CPT 71271 (low-dose CT thorax)
+
+    # Lung follow-up
+    "lung_biopsy":   2100,    # CPT 32405 (CT-guided needle biopsy)
+    "lung_treatment": 18500,  # surgery / radiation / med onc — rough composite
+}

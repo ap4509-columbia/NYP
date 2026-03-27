@@ -201,3 +201,131 @@ def print_patient_trace(patients: List[Patient], n: int = 5) -> None:
     """Print event logs for the first n patients (for debugging)."""
     for p in patients[:n]:
         p.print_history()
+
+
+# =============================================================================
+# Revenue Analysis
+# =============================================================================
+
+def compute_revenue(metrics: dict) -> dict:
+    """
+    Calculate realized and foregone procedure revenue from a completed simulation run.
+
+    Realized revenue  — billed for procedures that actually occurred.
+    Foregone revenue  — lost because patients dropped out at a LTFU node.
+                        Foregone amounts are the *minimum* revenue lost (screening
+                        only); downstream cascade (e.g. missed LEEP after missed
+                        colposcopy) is reported separately in foregone_cascade.
+
+    All rates are PLACEHOLDERS — replace with NYP finance / contract data.
+    Set individual values in config.PROCEDURE_REVENUE.
+
+    Returns
+    -------
+    dict with keys:
+        realized_total        : float
+        foregone_total        : float
+        realized_by_procedure : dict[str, float]
+        foregone_by_node      : dict[str, float]
+    """
+    import config as cfg
+    rev = cfg.PROCEDURE_REVENUE
+
+    # ── Realized revenue ──────────────────────────────────────────────────────
+    realized = {
+        # Cervical screenings — split by test type not tracked separately in
+        # metrics, so use average of cytology + hpv_alone as a proxy.
+        # For exact split, add per-test counter to initialize_metrics().
+        "cervical_screening": (
+            metrics["n_screened"].get("cervical", 0)
+            * (rev["cytology"] + rev["hpv_alone"]) / 2
+        ),
+        "colposcopy":  metrics["n_colposcopy"] * rev["colposcopy"],
+        "leep":        metrics["n_treatment"].get("leep", 0)        * rev["leep"],
+        "cone_biopsy": metrics["n_treatment"].get("cone_biopsy", 0) * rev["cone_biopsy"],
+
+        # Lung
+        "ldct":           metrics["lung_ldct_completed"]       * rev["ldct"],
+        "lung_biopsy":    metrics["lung_biopsy_completed"]     * rev["lung_biopsy"],
+        "lung_treatment": metrics["lung_treatment_given"]      * rev["lung_treatment"],
+    }
+    realized_total = sum(realized.values())
+
+    # ── Foregone revenue ──────────────────────────────────────────────────────
+    # Each node: patients who dropped out × revenue of the missed procedure
+    # (+ a conservative estimate of one downstream procedure where applicable).
+
+    cervical_eligible  = metrics["n_eligible_any"]
+    cervical_screened  = metrics["n_screened"].get("cervical", 0)
+    avg_cerv_screen    = (rev["cytology"] + rev["hpv_alone"]) / 2
+
+    # How many abnormal cervical results were there?
+    total_abnormal = sum(
+        v for k, v in metrics["cervical_results"].items()
+        if k not in ("NORMAL", "HPV_NEGATIVE")
+    )
+
+    foregone = {
+        # Eligible cervical patients who were never screened
+        "unscreened_cervical": (
+            max(cervical_eligible - cervical_screened, 0) * avg_cerv_screen
+        ),
+        # Abnormal result but LTFU before colposcopy
+        "ltfu_post_abnormal_cervical": (
+            metrics["ltfu_post_abnormal"] * (rev["colposcopy"] + rev["leep"] * 0.3)
+            # 0.3 ≈ fraction of colposcopies that lead to excisional treatment
+        ),
+        # Completed colposcopy but LTFU before treatment
+        "ltfu_post_colposcopy": (
+            metrics["ltfu_post_colposcopy"] * rev["leep"]
+        ),
+
+        # Lung: eligible but no LDCT order placed
+        "lung_no_ldct": (
+            max(
+                metrics["lung_eligible"] - metrics["lung_referral_placed"], 0
+            ) * rev["ldct"]
+        ),
+        # LDCT completed but RADS 4 result not followed up with biopsy
+        "lung_no_biopsy": (
+            max(
+                metrics["lung_biopsy_referral"] - metrics["lung_biopsy_completed"], 0
+            ) * rev["lung_biopsy"]
+        ),
+    }
+    foregone_total = sum(foregone.values())
+
+    return {
+        "realized_total":        realized_total,
+        "foregone_total":        foregone_total,
+        "realized_by_procedure": realized,
+        "foregone_by_node":      foregone,
+    }
+
+
+def print_revenue_summary(metrics: dict) -> None:
+    """Print a formatted revenue summary to stdout."""
+    r = compute_revenue(metrics)
+
+    print("\n" + "=" * 65)
+    print("REVENUE ANALYSIS  (PLACEHOLDER CPT rates — replace with NYP data)")
+    print("=" * 65)
+
+    print("\nRealized revenue (procedures completed):")
+    for proc, amt in r["realized_by_procedure"].items():
+        if amt > 0:
+            print(f"  {proc:<30} ${amt:>12,.0f}")
+    print(f"  {'TOTAL':<30} ${r['realized_total']:>12,.0f}")
+
+    print("\nForegone revenue (lost to LTFU / unscreened):")
+    for node, amt in r["foregone_by_node"].items():
+        if amt > 0:
+            print(f"  {node:<30} ${amt:>12,.0f}")
+    print(f"  {'TOTAL':<30} ${r['foregone_total']:>12,.0f}")
+
+    total = r["realized_total"] + r["foregone_total"]
+    if total > 0:
+        pct_lost = 100 * r["foregone_total"] / total
+        print(f"\n  Revenue capture rate: {100 - pct_lost:.1f}%  "
+              f"({pct_lost:.1f}% foregone)")
+    print("=" * 65)
