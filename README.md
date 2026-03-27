@@ -338,10 +338,10 @@ All placeholders are marked with `# PLACEHOLDER` in `config.py`. Priority order:
 ## Dependencies
 
 ```
-simpy >= 4.1.1
 matplotlib
 ```
 
-Install: `pip install simpy matplotlib`
+Install: `pip install matplotlib`
 
 All other dependencies (`random`, `dataclasses`, `collections`, `typing`) are Python standard library.
+The simulation does **not** use SimPy — patient flow is modeled as a direct function call chain, not a coroutine-based event loop.
