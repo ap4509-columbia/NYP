@@ -35,11 +35,8 @@ def check_ltfu_post_colposcopy(p: Patient, metrics: Optional[dict] = None) -> bo
 
 # ─── Cervical: Result Routing ─────────────────────────────────────────────────
 
-# Cytology results that trigger colposcopy referral
-_CYTOLOGY_COLPOSCOPY_TRIGGERS = {"ASCUS", "LSIL", "ASC-H", "HSIL"}
-
-# Normal result labels (one per test type)
-_NORMAL_RESULTS = {"NORMAL", "HPV_NEGATIVE"}
+# Results that trigger colposcopy referral
+_COLPOSCOPY_TRIGGERS = {"ASCUS", "LSIL", "ASC-H", "HSIL", "HPV_POS_NORMAL_CYTO"}
 
 
 def route_cervical_result(
@@ -48,42 +45,31 @@ def route_cervical_result(
     """
     Determine the clinical next step after a cervical screening result.
 
-    Cytology (age 21–65):
-      NORMAL → routine surveillance
-      ASCUS / LSIL / ASC-H / HSIL → colposcopy (after LTFU check)
-
-    HPV-alone (age 30–65):
-      HPV_NEGATIVE → routine surveillance
-      HPV_POSITIVE → colposcopy referral (ASCCP: triage via genotype or cytology;
-                      simplified here as 40% low-risk 1-yr repeat, 60% colposcopy)
-
-    Returns: "colposcopy" | "one_year_repeat" | "routine_surveillance" | "exit"
+    Returns one of:
+      "colposcopy"         — patient referred and follows up
+      "one_year_repeat"    — low-risk management (HPV+/normal cyto path)
+      "routine_surveillance" — normal result, return to standard interval
+      "exit"               — lost to follow-up
     """
     result = p.cervical_result
 
-    if result in _NORMAL_RESULTS:
-        p.log(current_day, f"ROUTE cervical {result} → routine surveillance")
+    if result == "NORMAL":
+        p.log(current_day, "ROUTE cervical NORMAL → routine surveillance")
         return "routine_surveillance"
 
-    if result in _CYTOLOGY_COLPOSCOPY_TRIGGERS:
+    if result in _COLPOSCOPY_TRIGGERS:
         if check_ltfu_post_abnormal(p, metrics):
             p.exit_system(current_day, "lost_to_followup")
             p.log(current_day, f"LTFU after {result} — no colposcopy follow-up")
             return "exit"
-        p.log(current_day, f"ROUTE {result} → colposcopy")
-        return "colposcopy"
 
-    if result == "HPV_POSITIVE":
-        if check_ltfu_post_abnormal(p, metrics):
-            p.exit_system(current_day, "lost_to_followup")
-            p.log(current_day, "LTFU after HPV_POSITIVE — no follow-up")
-            return "exit"
-        # ASCCP triage: ~40% managed with 1-year repeat cytology (low-risk path)
-        # ~60% referred directly to colposcopy (PLACEHOLDER split)
-        if random.random() < 0.40:
-            p.log(current_day, "ROUTE HPV_POSITIVE → 1-year repeat cytology (low-risk mgmt)")
+        # HPV+/normal cytology: 40% chance of 1-year repeat instead of immediate colposcopy
+        # (per ASCCP low-risk management pathway)  PLACEHOLDER rate
+        if result == "HPV_POS_NORMAL_CYTO" and random.random() < 0.40:
+            p.log(current_day, "ROUTE HPV+/normal cyto → 1-year repeat (low-risk mgmt)")
             return "one_year_repeat"
-        p.log(current_day, "ROUTE HPV_POSITIVE → colposcopy")
+
+        p.log(current_day, f"ROUTE {result} → colposcopy")
         return "colposcopy"
 
     # Fallback
@@ -98,7 +84,7 @@ def draw_colposcopy_result(p: Patient) -> str:
     Draw CIN grade from colposcopy, conditional on the triggering result.
     Uses COLPOSCOPY_RESULT_PROBS from config (PLACEHOLDER).
     """
-    key   = f"from_{p.cervical_result}"   # matches COLPOSCOPY_RESULT_PROBS keys
+    key   = f"from_{p.cervical_result}"
     probs = cfg.COLPOSCOPY_RESULT_PROBS.get(
         key, {"NORMAL": 0.50, "CIN1": 0.25, "CIN2": 0.15, "CIN3": 0.10}
     )

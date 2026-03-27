@@ -77,33 +77,32 @@ SCREENING_INTERVALS_DAYS = {
 }
 
 # ── Cervical Result Probabilities ─────────────────────────────────────────────
+# Multinomial over: NORMAL | ASCUS | LSIL | ASC-H | HSIL | HPV_POS_NORMAL_CYTO
 # PLACEHOLDER — replace with NYP EHR rates / ASCCP risk table values
-#
-# Cytology result categories (Pap smear): NORMAL | ASCUS | LSIL | ASC-H | HSIL
-#   - HPV status is NOT reported by cytology alone → no HPV result in these tables
-#   - USPSTF: cytology is the only test for ages 21–29; HPV testing not recommended <30
-#
-# HPV-alone result categories (hrHPV test): HPV_NEGATIVE | HPV_POSITIVE
-#   - No cytology categories in this table; HPV test does not return Pap results
-#   - USPSTF: HPV-alone every 5 years is an option only for ages 30–65
 CERVICAL_RESULT_PROBS = {
-    "young": {               # age 21–29 — cytology only (USPSTF Grade A)
-        "NORMAL": 0.890,
-        "ASCUS":  0.040,
-        "LSIL":   0.045,
-        "ASC-H":  0.015,
-        "HSIL":   0.010,
+    "young": {                      # age 21–29, cytology only
+        "NORMAL":              0.880,
+        "ASCUS":               0.040,
+        "LSIL":                0.045,
+        "ASC-H":               0.015,
+        "HSIL":                0.010,
+        "HPV_POS_NORMAL_CYTO": 0.010,
     },
-    "middle_cytology": {     # age 30–65 — cytology every 3 years (USPSTF Grade A)
-        "NORMAL": 0.910,
-        "ASCUS":  0.035,
-        "LSIL":   0.030,
-        "ASC-H":  0.015,
-        "HSIL":   0.010,
+    "middle_cytology": {            # age 30–65, cytology
+        "NORMAL":              0.900,
+        "ASCUS":               0.035,
+        "LSIL":                0.030,
+        "ASC-H":               0.015,
+        "HSIL":                0.010,
+        "HPV_POS_NORMAL_CYTO": 0.010,
     },
-    "middle_hpv": {          # age 30–65 — hrHPV-alone every 5 years (USPSTF Grade A)
-        "HPV_NEGATIVE": 0.880,
-        "HPV_POSITIVE": 0.120,
+    "middle_hpv": {                 # age 30–65, HPV-alone
+        "NORMAL":              0.880,
+        "ASCUS":               0.000,
+        "LSIL":                0.000,
+        "ASC-H":               0.000,
+        "HSIL":                0.000,
+        "HPV_POS_NORMAL_CYTO": 0.120,
     },
 }
 
@@ -154,11 +153,11 @@ LTFU_PROBS = {
 # ── Colposcopy Result Probabilities ───────────────────────────────────────────
 # PLACEHOLDER — to be powered by ASCCP risk tables
 COLPOSCOPY_RESULT_PROBS = {
-    "from_ASCUS":        {"NORMAL": 0.60, "CIN1": 0.25, "CIN2": 0.10, "CIN3": 0.05},
-    "from_LSIL":         {"NORMAL": 0.40, "CIN1": 0.35, "CIN2": 0.15, "CIN3": 0.10},
-    "from_ASC-H":        {"NORMAL": 0.25, "CIN1": 0.20, "CIN2": 0.30, "CIN3": 0.25},
-    "from_HSIL":         {"NORMAL": 0.10, "CIN1": 0.10, "CIN2": 0.30, "CIN3": 0.50},
-    "from_HPV_POSITIVE": {"NORMAL": 0.50, "CIN1": 0.30, "CIN2": 0.15, "CIN3": 0.05},
+    "from_ASCUS":               {"NORMAL": 0.60, "CIN1": 0.25, "CIN2": 0.10, "CIN3": 0.05},
+    "from_LSIL":                {"NORMAL": 0.40, "CIN1": 0.35, "CIN2": 0.15, "CIN3": 0.10},
+    "from_ASC-H":               {"NORMAL": 0.25, "CIN1": 0.20, "CIN2": 0.30, "CIN3": 0.25},
+    "from_HSIL":                {"NORMAL": 0.10, "CIN1": 0.10, "CIN2": 0.30, "CIN3": 0.50},
+    "from_HPV_POS_NORMAL_CYTO": {"NORMAL": 0.50, "CIN1": 0.30, "CIN2": 0.15, "CIN3": 0.05},
 }
 
 # ── Treatment Assignment by CIN Grade ─────────────────────────────────────────
