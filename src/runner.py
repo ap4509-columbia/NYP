@@ -1,21 +1,32 @@
 # =============================================================================
 # runner.py
-# SimulationRunner — discrete-event simulation entry point using SimPy.
+# SimulationRunner — daily discrete-event simulation using SimPy.
 # =============================================================================
 #
-# Architecture:
-#   - SimPy Environment provides the clock (unit = days).
-#   - Each patient is a SimPy process: arrives, waits in resource queues,
-#     gets screened, waits for follow-up appointments, exits.
-#   - Resources (cytology slots, colposcopy slots, LDCT slots, etc.) have
-#     finite daily capacity from config.CAPACITIES. When all slots are taken,
-#     patients queue — this is where fragmented vs. coordinated differences
-#     become measurable.
-#   - Inter-step delays (e.g., 30-day wait for colposcopy) come from
-#     config.FOLLOWUP_DELAY_DAYS.
+# Daily cycle
+# -----------
+# Each simulation day is one SimPy time unit. The main process ticks forward
+# one day at a time and processes all providers in sequence.
 #
-# Usage:
-#   sim = SimulationRunner(n_patients=2000, seed=42)
+# PCP / Gynecologist / Specialist
+#   1. Scheduled outpatients fill their reserved slots first (OUTPATIENT_FRACTION).
+#   2. Drop-ins fill remaining capacity (including unused outpatient slots).
+#   3. Drop-in overflow → appended to tomorrow's drop-in queue for same provider.
+#
+# ER
+#   - No scheduled outpatient slots — all walk-in.
+#   - Overflow splits:
+#       ER_OVERFLOW_RETRY_PROB  → retry ER tomorrow (drop-in, day+1)
+#       1 - above               → convert to outpatient at PCP/Gyno/Specialist
+#
+# Patient generation
+#   Each day, DAILY_PATIENTS new patients are created.
+#   - outpatients (70%): booked for a future day (OUTPATIENT_LEAD_DAYS ahead)
+#   - drop-ins    (30%): join today's drop-in queue immediately
+#
+# Usage
+# -----
+#   sim = SimulationRunner(n_days=365, seed=42)
 #   sim.run()
 #   sim.summary()
 #   sim.revenue_summary()
@@ -23,6 +34,8 @@
 # =============================================================================
 
 import random
+from collections import defaultdict
+
 import simpy
 
 import config as cfg
@@ -49,81 +62,189 @@ from metrics import (
     compute_revenue,
 )
 
+_NON_ER_PROVIDERS = ["pcp", "gynecologist", "specialist"]
+_ALL_PROVIDERS    = _NON_ER_PROVIDERS + ["er"]
+
+
+# =============================================================================
+# Patient Queue Manager
+# =============================================================================
+
+class PatientQueues:
+    """
+    Manages scheduled outpatient and drop-in queues for all providers.
+
+    outpatient[provider][day] → [Patient, ...]   (scheduled for that day)
+    dropin[provider]          → [Patient, ...]   (today's walk-ins)
+    """
+
+    def __init__(self):
+        # provider → {day: [patients]}
+        self.outpatient: dict = defaultdict(lambda: defaultdict(list))
+        # provider → [patients]  (reset each day after processing)
+        self.dropin: dict = defaultdict(list)
+
+    def schedule_outpatient(self, p: Patient, provider: str, day: int) -> None:
+        """Book patient into a provider's outpatient slot on a future day."""
+        self.outpatient[provider][day].append(p)
+
+    def add_dropin(self, p: Patient, provider: str) -> None:
+        """Add patient to a provider's walk-in queue."""
+        self.dropin[provider].append(p)
+
+    def process_day(self, provider: str, day: int):
+        """
+        Process one provider's queues for the given day.
+
+        Priority order:
+          1. Scheduled outpatients fill their reserved slots.
+          2. Drop-ins fill remaining capacity
+             (including any unused outpatient slots).
+          3. Leftover outpatients (rare edge case) → rescheduled for day+1.
+
+        Returns
+        -------
+        seen     : list[Patient]  patients who will be seen today
+        overflow : list[Patient]  drop-ins who could not be accommodated
+        """
+        total      = cfg.PROVIDER_CAPACITY.get(provider, 0)
+        outpt_frac = cfg.OUTPATIENT_FRACTION.get(provider, 0.0)
+        outpt_cap  = int(total * outpt_frac)
+        dropin_cap = total - outpt_cap
+
+        # ── Outpatients ───────────────────────────────────────────────────────
+        today_outpts    = self.outpatient[provider].pop(day, [])
+        seen_outpts     = today_outpts[:outpt_cap]
+        bumped_outpts   = today_outpts[outpt_cap:]          # pushed to tomorrow
+        for p in bumped_outpts:
+            self.outpatient[provider][day + 1].append(p)
+
+        # ── Drop-ins ──────────────────────────────────────────────────────────
+        # Unused outpatient slots open to drop-ins
+        extra          = outpt_cap - len(seen_outpts)
+        available      = dropin_cap + extra
+        today_dropins  = list(self.dropin.get(provider, []))
+        seen_dropins   = today_dropins[:available]
+        overflow       = today_dropins[available:]
+        self.dropin[provider] = []                          # clear today's queue
+
+        return seen_outpts + seen_dropins, overflow
+
+
+# =============================================================================
+# Simulation Runner
+# =============================================================================
 
 class SimulationRunner:
     """
-    Discrete-event simulation of NYP women's health screening.
+    Daily discrete-event simulation of NYP women's health screening.
 
     Parameters
     ----------
-    n_patients : int
-        Total number of patients to generate (arrival process stops after this).
-    seed       : int
-        Random seed for reproducibility.
-    sim_days   : int
-        Simulation horizon in days (default: SIM_DAYS from config).
+    n_days     : int   Simulation horizon in days.
+    seed       : int   Random seed.
+    daily_rate : int   Mean number of new patients generated per day.
     """
 
     def __init__(
         self,
-        n_patients: int = 1000,
+        n_days:     int = cfg.SIM_DAYS,
         seed:       int = cfg.RANDOM_SEED,
-        sim_days:   int = cfg.SIM_DAYS,
+        daily_rate: int = cfg.DAILY_PATIENTS,
     ):
-        self.n_patients = n_patients
+        self.n_days     = n_days
         self.seed       = seed
-        self.sim_days   = sim_days
+        self.daily_rate = daily_rate
         self.metrics    = None
-        self._patients  = []   # completed patient records (for tracing / debugging)
+        self._patients  = []   # completed patient records
 
-    # ── Resource setup ────────────────────────────────────────────────────────
+    # ── Patient generation ────────────────────────────────────────────────────
 
-    def _make_resources(self, env: simpy.Environment) -> dict:
+    def _generate_daily_arrivals(
+        self, day: int, queues: PatientQueues, patient_id_counter: list
+    ) -> None:
         """
-        Create one SimPy Resource per procedure type, capacity from config.
-        Patients that cannot immediately acquire a slot are queued by SimPy.
+        Create today's new patients and route them into queues.
+
+        Outpatients (70%): booked for a future day using OUTPATIENT_LEAD_DAYS.
+        Drop-ins   (30%): added directly to today's drop-in queue.
         """
-        return {
-            name: simpy.Resource(env, capacity=cap)
-            for name, cap in cfg.CAPACITIES.items()
-        }
+        _dest_keys    = list(cfg.DESTINATION_PROBS.keys())
+        _dest_w       = list(cfg.DESTINATION_PROBS.values())
+        _type_keys    = list(cfg.PATIENT_TYPE_PROBS.keys())
+        _type_w       = list(cfg.PATIENT_TYPE_PROBS.values())
 
-    # ── Patient process ───────────────────────────────────────────────────────
+        n_today = random.poisson_approx(self.daily_rate)   # see helper below
 
-    def _patient_process(
+        for _ in range(n_today):
+            pid          = patient_id_counter[0]
+            patient_id_counter[0] += 1
+            destination  = random.choices(_dest_keys, weights=_dest_w)[0]
+            patient_type = random.choices(_type_keys, weights=_type_w)[0]
+
+            p = sample_patient(pid, day, destination, patient_type)
+
+            if patient_type == "outpatient" and destination != "er":
+                lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(destination, (1, 7))
+                appt_day = day + random.randint(lo, hi)
+                queues.schedule_outpatient(p, destination, appt_day)
+            else:
+                # Drop-in (or outpatient directed to ER — treated as drop-in)
+                queues.add_dropin(p, destination)
+
+    # ── Overflow routing ──────────────────────────────────────────────────────
+
+    def _route_overflow(
+        self, overflow: list, provider: str, day: int, queues: PatientQueues
+    ) -> None:
+        """
+        Route patients who could not be seen today.
+
+        ER overflow:
+          ER_OVERFLOW_RETRY_PROB  → tomorrow's ER drop-in queue
+          otherwise               → outpatient slot at PCP / Gyno / Specialist
+
+        Non-ER overflow:
+          → tomorrow's drop-in queue for the same provider
+        """
+        for p in overflow:
+            if provider == "er":
+                if random.random() < cfg.ER_OVERFLOW_RETRY_PROB:
+                    # Retry ER tomorrow
+                    queues.add_dropin(p, "er")
+                else:
+                    # Convert to scheduled outpatient at a non-ER provider
+                    alt    = random.choice(_NON_ER_PROVIDERS)
+                    lo, hi = cfg.OUTPATIENT_LEAD_DAYS.get(alt, (1, 7))
+                    queues.schedule_outpatient(p, alt, day + random.randint(lo, hi))
+            else:
+                # Same provider, tomorrow's drop-in queue
+                queues.add_dropin(p, provider)
+
+    # ── Screening + follow-up for one seen patient ────────────────────────────
+
+    def _process_patient(
         self, env: simpy.Environment, p: Patient, resources: dict
     ):
         """
-        SimPy generator process for one patient's full journey.
-
-        Flow
-        ----
-        1. Eligibility check
-        2. For each eligible cancer:
-             a. Wait for + acquire a screening resource slot
-             b. Perform screening → draw result
-             c. If abnormal:
-                  - Wait for follow-up appointment (scheduling delay)
-                  - Wait for + acquire follow-up resource slot
-                  - Run clinical follow-up (colposcopy / biopsy chain)
-                  - If treatment needed: wait + acquire treatment slot
-        3. Record exits and wait times throughout
+        SimPy process: screen + follow up one patient.
+        Yields at resource requests and inter-step scheduling delays.
         """
-        # ── Eligibility ───────────────────────────────────────────────────────
-        eligible = get_eligible_screenings(p)
+        day = int(env.now)
         self.metrics["n_patients"] += 1
 
+        eligible = get_eligible_screenings(p)
+
         if not eligible:
-            outcome = handle_unscreened(p, int(env.now))
+            outcome = handle_unscreened(p, day)
             self.metrics["n_unscreened"] += 1
             if outcome == "reschedule":
-                self.metrics["n_reschedule"]   += 1
+                self.metrics["n_reschedule"]    += 1
                 self.metrics["ltfu_unscreened"] += 1
             return
 
         self.metrics["n_eligible_any"] += 1
 
-        # ── Screening ─────────────────────────────────────────────────────────
         for cancer in eligible:
             if not p.active:
                 break
@@ -132,31 +253,28 @@ class SimulationRunner:
             if test == "ineligible":
                 continue
 
-            # Acquire a screening slot (queue if at capacity)
+            # Acquire a screening resource slot (queue if at daily capacity)
             resource = resources.get(test)
             if resource:
                 with resource.request() as req:
                     t0 = env.now
-                    yield req                            # wait in queue
+                    yield req
                     self.metrics["wait_times"][test].append(env.now - t0)
-                yield env.timeout(1)                    # 1 day to complete test
+                yield env.timeout(1)   # test takes 1 day
 
             day    = int(env.now)
             result = run_screening_step(p, cancer, day, self.metrics)
 
             if result is None:
-                # Patient LTFU before test completed (e.g. lung pre-LDCT nodes)
+                # LTFU before test completed (lung pre-LDCT nodes)
                 if p.exit_reason:
                     record_exit(self.metrics, p.exit_reason)
                 return
 
             record_screening(self.metrics, p, cancer, result)
 
-            # ── Cervical follow-up ─────────────────────────────────────────────
             if cancer == "cervical":
-                yield from self._cervical_followup(env, p, result, resources)
-
-            # ── Lung follow-up ─────────────────────────────────────────────────
+                yield from self._cervical_followup(env, p, resources)
             elif cancer == "lung":
                 yield from self._lung_followup(env, p, resources)
 
@@ -168,27 +286,32 @@ class SimulationRunner:
     # ── Cervical follow-up sub-process ────────────────────────────────────────
 
     def _cervical_followup(
-        self, env: simpy.Environment, p: Patient, result: str, resources: dict
+        self, env: simpy.Environment, p: Patient, resources: dict
     ):
         """
         Cervical follow-up as a SimPy sub-process.
-        Yields at scheduling delays and resource requests so the clock advances
-        correctly between screening, colposcopy, and treatment.
+        Yields at scheduling delays and resource acquisition.
+
+        Steps with SimPy timing:
+          Abnormal result → wait FOLLOWUP_DELAY_DAYS["colposcopy"] days
+                          → acquire colposcopy slot
+                          → run colposcopy
+          If excisional tx → wait FOLLOWUP_DELAY_DAYS[treatment] days
+                           → acquire treatment slot
         """
-        # Route the result
-        day        = int(env.now)
-        next_step  = route_cervical_result(p, day, self.metrics)
+        day       = int(env.now)
+        next_step = route_cervical_result(p, day, self.metrics)
 
         if next_step in ("routine_surveillance", "one_year_repeat", "exit"):
             return
 
         if next_step == "colposcopy":
-            # Wait for colposcopy appointment slot
+            # Wait for colposcopy appointment
             yield env.timeout(cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30))
 
-            colpo_resource = resources.get("colposcopy")
-            if colpo_resource:
-                with colpo_resource.request() as req:
+            colpo_res = resources.get("colposcopy")
+            if colpo_res:
+                with colpo_res.request() as req:
                     t0 = env.now
                     yield req
                     self.metrics["wait_times"]["colposcopy"].append(env.now - t0)
@@ -199,16 +322,15 @@ class SimulationRunner:
             if cin is None:
                 return
 
-            # Determine and schedule treatment
             disposition = run_treatment(p, day, self.metrics)
 
             if disposition not in ("exit", "surveillance") and p.treatment_type:
                 ttype = p.treatment_type
                 yield env.timeout(cfg.FOLLOWUP_DELAY_DAYS.get(ttype, 14))
 
-                treat_resource = resources.get(ttype)
-                if treat_resource:
-                    with treat_resource.request() as req:
+                treat_res = resources.get(ttype)
+                if treat_res:
+                    with treat_res.request() as req:
                         t0 = env.now
                         yield req
                         self.metrics["wait_times"][ttype].append(env.now - t0)
@@ -221,47 +343,71 @@ class SimulationRunner:
     ):
         """
         Lung follow-up as a SimPy sub-process.
-        Handles result communication, and for RADS 4 patients the biopsy wait.
+        Models wait times for biopsy and treatment appointments.
         """
         day = int(env.now)
         run_lung_followup(p, day, self.metrics)
 
-        # If biopsy was triggered (RADS 4A/4B/4X) and completed, model the wait
         if p.lung_biopsy_result is not None:
             yield env.timeout(cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14))
 
-        # If malignancy confirmed, model the wait to treatment
         if p.lung_biopsy_result == "malignant":
             yield env.timeout(cfg.FOLLOWUP_DELAY_DAYS.get("lung_treatment", 21))
 
-        # Required by SimPy: must yield at least once in a generator
-        yield env.timeout(0)
+        yield env.timeout(0)   # SimPy requires at least one yield
 
-    # ── Arrival process ───────────────────────────────────────────────────────
+    # ── Daily tick ────────────────────────────────────────────────────────────
 
-    def _arrival_process(
-        self, env: simpy.Environment, resources: dict
+    def _daily_process(
+        self, env: simpy.Environment, queues: PatientQueues, resources: dict
     ):
         """
-        Generate patients via a Poisson process.
-        Mean inter-arrival time = 1 / DAILY_PATIENTS days.
-        Each patient is launched as an independent SimPy process.
+        Main SimPy process — advances the simulation one day at a time.
+
+        Each day:
+          1. Generate new patient arrivals → route to outpatient / drop-in queues.
+          2. For each provider, process daily queues respecting capacity.
+          3. Route overflow per provider-specific rules.
+          4. Launch a SimPy process for each patient who is seen.
+          5. Advance clock by 1 day.
         """
-        _dest_keys     = list(cfg.DESTINATION_PROBS.keys())
-        _dest_weights  = list(cfg.DESTINATION_PROBS.values())
-        _type_keys     = list(cfg.PATIENT_TYPE_PROBS.keys())
-        _type_weights  = list(cfg.PATIENT_TYPE_PROBS.values())
+        pid_counter = [0]   # mutable so nested functions can increment it
 
-        for patient_id in range(self.n_patients):
-            # Exponential inter-arrival (Poisson process)
-            inter_arrival = random.expovariate(cfg.DAILY_PATIENTS)
-            yield env.timeout(inter_arrival)
+        while True:
+            day = int(env.now)
 
-            destination  = random.choices(_dest_keys,  weights=_dest_weights)[0]
-            patient_type = random.choices(_type_keys,  weights=_type_weights)[0]
+            # 1. New arrivals
+            self._generate_daily_arrivals(day, queues, pid_counter)
 
-            p = sample_patient(patient_id, int(env.now), destination, patient_type)
-            env.process(self._patient_process(env, p, resources))
+            # 2–4. Process each provider
+            for provider in _ALL_PROVIDERS:
+                seen, overflow = queues.process_day(provider, day)
+
+                # Route overflow before processing seen patients
+                self._route_overflow(overflow, provider, day, queues)
+
+                # Track overflow volume in metrics
+                self.metrics.setdefault("daily_overflow", defaultdict(int))
+                self.metrics["daily_overflow"][provider] += len(overflow)
+
+                # Launch SimPy process for each seen patient
+                for p in seen:
+                    env.process(self._process_patient(env, p, resources))
+
+            # 5. Advance to next day
+            yield env.timeout(1)
+
+            if day >= self.n_days - 1:
+                return
+
+    # ── Resource setup ────────────────────────────────────────────────────────
+
+    def _make_resources(self, env: simpy.Environment) -> dict:
+        """Create SimPy Resources for each screening/procedure type."""
+        return {
+            name: simpy.Resource(env, capacity=cap)
+            for name, cap in cfg.CAPACITIES.items()
+        }
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
@@ -271,7 +417,7 @@ class SimulationRunner:
 
         Returns
         -------
-        metrics dict — pass to print_summary() / compute_revenue() directly,
+        metrics dict — pass directly to print_summary() / compute_revenue(),
         or use the convenience methods below.
         """
         random.seed(self.seed)
@@ -280,9 +426,10 @@ class SimulationRunner:
 
         env       = simpy.Environment()
         resources = self._make_resources(env)
+        queues    = PatientQueues()
 
-        env.process(self._arrival_process(env, resources))
-        env.run(until=self.sim_days)
+        env.process(self._daily_process(env, queues, resources))
+        env.run(until=self.n_days + 1)   # +1 so last day's processes complete
 
         return self.metrics
 
@@ -305,15 +452,36 @@ class SimulationRunner:
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         fig.suptitle(
-            f"NYP Screening Simulation  (n={self.metrics['n_patients']:,} patients)",
+            f"NYP Screening Simulation  "
+            f"(n={self.metrics['n_patients']:,} patients, {self.n_days} days)",
             fontsize=13, fontweight="bold",
         )
-
         self._plot_cervical_funnel(axes[0, 0])
         self._plot_lung_funnel(axes[0, 1])
         self._plot_rads_distribution(axes[1, 0])
         self._plot_revenue(axes[1, 1])
+        plt.tight_layout()
+        plt.show()
 
+    def plot_overflow(self) -> None:
+        """Bar chart of total daily overflow by provider."""
+        self._require_run()
+        import matplotlib.pyplot as plt
+
+        overflow = self.metrics.get("daily_overflow", {})
+        if not overflow:
+            print("No overflow recorded.")
+            return
+
+        providers = list(overflow.keys())
+        totals    = [overflow[p] for p in providers]
+        plt.figure(figsize=(7, 4))
+        plt.bar(providers, totals, color="#ED7D31")
+        plt.title("Total Patient Overflow by Provider")
+        plt.ylabel("Patients overflowed (cumulative)")
+        plt.xlabel("Provider")
+        for i, v in enumerate(totals):
+            plt.text(i, v + max(totals) * 0.01, f"{v:,}", ha="center", fontsize=9)
         plt.tight_layout()
         plt.show()
 
@@ -326,18 +494,18 @@ class SimulationRunner:
             if k not in ("NORMAL", "HPV_NEGATIVE")
         )
         steps = [
-            ("Eligible",           m["n_eligible_any"]),
-            ("Screened",           m["n_screened"].get("cervical", 0)),
-            ("Abnormal result",    total_abnormal),
-            ("Colposcopy",         m["n_colposcopy"]),
-            ("Treated",            m["n_treated"]),
+            ("Eligible",        m["n_eligible_any"]),
+            ("Screened",        m["n_screened"].get("cervical", 0)),
+            ("Abnormal result", total_abnormal),
+            ("Colposcopy",      m["n_colposcopy"]),
+            ("Treated",         m["n_treated"]),
         ]
         labels = [s[0] for s in steps]
         values = [s[1] for s in steps]
-        bars = ax.barh(labels[::-1], values[::-1], color="#4472C4")
+        bars   = ax.barh(labels[::-1], values[::-1], color="#4472C4")
         ax.set_title("Cervical Screening Funnel")
         ax.set_xlabel("Patients")
-        _max = max(values) if values else 1
+        _max = max(values) if any(values) else 1
         for bar, val in zip(bars, values[::-1]):
             ax.text(
                 bar.get_width() + _max * 0.01,
@@ -348,20 +516,20 @@ class SimulationRunner:
     def _plot_lung_funnel(self, ax) -> None:
         m = self.metrics
         steps = [
-            ("Eligible",              m["lung_eligible"]),
-            ("LDCT ordered",          m["lung_referral_placed"]),
-            ("LDCT completed",        m["lung_ldct_completed"]),
-            ("Results communicated",  m["lung_result_communicated"]),
-            ("Biopsy completed",      m["lung_biopsy_completed"]),
-            ("Malignancy confirmed",  m["lung_malignancy_confirmed"]),
-            ("Treatment given",       m["lung_treatment_given"]),
+            ("Eligible",             m["lung_eligible"]),
+            ("LDCT ordered",         m["lung_referral_placed"]),
+            ("LDCT completed",       m["lung_ldct_completed"]),
+            ("Results communicated", m["lung_result_communicated"]),
+            ("Biopsy completed",     m["lung_biopsy_completed"]),
+            ("Malignancy confirmed", m["lung_malignancy_confirmed"]),
+            ("Treatment given",      m["lung_treatment_given"]),
         ]
         labels = [s[0] for s in steps]
         values = [s[1] for s in steps]
-        bars = ax.barh(labels[::-1], values[::-1], color="#ED7D31")
+        bars   = ax.barh(labels[::-1], values[::-1], color="#ED7D31")
         ax.set_title("Lung LDCT Pathway Funnel")
         ax.set_xlabel("Patients")
-        _max = max(values) if values else 1
+        _max = max(values) if any(values) else 1
         for bar, val in zip(bars, values[::-1]):
             ax.text(
                 bar.get_width() + _max * 0.01,
@@ -370,10 +538,10 @@ class SimulationRunner:
             )
 
     def _plot_rads_distribution(self, ax) -> None:
-        m        = self.metrics
-        cats     = ["RADS_0", "RADS_1", "RADS_2", "RADS_3", "RADS_4A", "RADS_4B_4X"]
-        counts   = [m["lung_rads_distribution"].get(r, 0) for r in cats]
-        colors   = ["#A9D18E", "#70AD47", "#FFD966", "#F4B183", "#FF0000", "#C00000"]
+        m      = self.metrics
+        cats   = ["RADS_0", "RADS_1", "RADS_2", "RADS_3", "RADS_4A", "RADS_4B_4X"]
+        counts = [m["lung_rads_distribution"].get(r, 0) for r in cats]
+        colors = ["#A9D18E", "#70AD47", "#FFD966", "#F4B183", "#FF0000", "#C00000"]
         ax.bar(cats, counts, color=colors)
         ax.set_title("Lung-RADS Distribution (completed LDCTs)")
         ax.set_xlabel("Lung-RADS Category")
@@ -387,7 +555,7 @@ class SimulationRunner:
         bars   = ax.bar(["Realized", "Foregone"], vals, color=colors)
         ax.set_title("Revenue: Realized vs Foregone")
         ax.set_ylabel("USD")
-        _max = max(vals) if vals else 1
+        _max = max(vals) if any(vals) else 1
         for bar, val in zip(bars, vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
@@ -404,3 +572,18 @@ class SimulationRunner:
     def _require_run(self) -> None:
         if self.metrics is None:
             raise RuntimeError("Call run() first.")
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _poisson_approx(lam: float) -> int:
+    """Normal approximation to Poisson for large lambda (daily arrivals)."""
+    import math
+    val = int(random.gauss(lam, math.sqrt(lam)) + 0.5)
+    return max(0, val)
+
+
+# Monkey-patch so _generate_daily_arrivals can call random.poisson_approx
+random.poisson_approx = _poisson_approx

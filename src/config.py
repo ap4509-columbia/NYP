@@ -44,6 +44,27 @@ PROVIDER_CAPACITY = {
     "er":           25,
 }
 
+# Fraction of each provider's daily capacity reserved for scheduled outpatients.
+# Remainder is available to drop-ins. ER = 0 (drop-in only).
+OUTPATIENT_FRACTION = {
+    "pcp":          0.75,   # 30 outpatient slots, 10 drop-in slots
+    "gynecologist": 0.73,   # 22 outpatient slots,  8 drop-in slots
+    "specialist":   0.75,   # 15 outpatient slots,  5 drop-in slots
+    "er":           0.00,   # ER is entirely drop-in
+}
+
+# Scheduling lead time for new outpatient appointments (uniform lo–hi days ahead).
+# PLACEHOLDER — replace with NYP scheduling data.
+OUTPATIENT_LEAD_DAYS = {
+    "pcp":          (1,  7),
+    "gynecologist": (7,  21),
+    "specialist":   (14, 28),
+}
+
+# ER overflow routing: fraction of patients who retry ER tomorrow vs.
+# convert to an outpatient appointment at PCP / Gynecologist / Specialist.
+ER_OVERFLOW_RETRY_PROB = 0.70   # PLACEHOLDER
+
 # ── Age Strata ────────────────────────────────────────────────────────────────
 AGE_STRATA = {
     "young":  (21, 29),
