@@ -70,9 +70,31 @@ class Patient:
     # ── ER triage flag ────────────────────────────────────────────────────────
     critical_status: bool = False  # True = critical ER patient (returns next day)
 
+    # ── Stable population / longitudinal tracking ─────────────────────────────
+    # These fields support the 70-year cycling model where established patients
+    # re-visit annually and their demographics (age) update over time.
+    #
+    # is_established  — True for patients in the cycling pool; False for new
+    #                   entrants / drop-ins who have not yet completed their
+    #                   first visit.
+    # age_at_entry    — snapshot of age when the patient joined the pool.
+    #                   Used to compute current age via:
+    #                       age = age_at_entry + (day - simulation_entry_day) // 365
+    # simulation_entry_day — pool-entry day, used for age aging calculation.
+    # visit_count     — incremented each time the patient is seen by a provider.
+    # next_visit_day  — day the next annual appointment is scheduled; set by
+    #                   _reschedule_established() after each visit.
+    # exit_day        — day the patient left the system (mortality, LTFU, etc.).
+    is_established:       bool         = False  # cycling patient vs new entrant
+    age_at_entry:         int          = 0      # age on pool-entry day
+    simulation_entry_day: int          = 0      # day patient was added to pool
+    visit_count:          int          = 0      # total provider visits recorded
+    next_visit_day:       Optional[int] = None  # next scheduled annual visit day
+
     # ── Exit state ────────────────────────────────────────────────────────────
+    exit_day:    Optional[int] = None
     exit_reason: Optional[str] = None
-    # treated | untreated | lost_to_followup | ineligible
+    # treated | untreated | lost_to_followup | ineligible | mortality
 
     # ── Per-patient event log: [(day, event_string), ...] ─────────────────────
     # Each call to p.log() appends a (day, event_string) tuple here.
@@ -85,10 +107,20 @@ class Patient:
         self.event_log.append((day, event))
 
     def exit_system(self, day: int, reason: str) -> None:
-        """Mark patient as inactive, record exit reason, and log the exit event."""
+        """
+        Mark patient as inactive, record exit reason and exit day, and log the event.
+
+        The exit_day field is used by the stable-population model to sort
+        patients into the flush buffer and to compute time-in-system statistics.
+        Calling this method more than once is safe — subsequent calls are no-ops
+        because active is already False.
+        """
+        if not self.active:
+            return  # already exited — idempotent guard
         self.active        = False
         self.current_stage = "exited"
         self.exit_reason   = reason
+        self.exit_day      = day
         self.log(day, f"EXIT — {reason}")
 
     def print_history(self) -> None:

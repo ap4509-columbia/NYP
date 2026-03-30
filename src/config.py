@@ -36,9 +36,9 @@
 RANDOM_SEED = 42
 
 # ── Simulation Horizon ────────────────────────────────────────────────────────
-SIM_YEARS      = 30
+SIM_YEARS      = 70                      # full 70-year longitudinal horizon
 DAYS_PER_YEAR  = 365
-SIM_DAYS       = SIM_YEARS * DAYS_PER_YEAR
+SIM_DAYS       = SIM_YEARS * DAYS_PER_YEAR   # = 25,550 days
 NUM_REPS       = 10       # number of replications for variance analysis
 
 # ── Workflow Mode ─────────────────────────────────────────────────────────────
@@ -251,6 +251,70 @@ FOLLOWUP_DELAY_DAYS = {
     "lung_biopsy":    14,    # RADS 4 → CT-guided biopsy
     "lung_treatment": 21,    # malignancy confirmed → treatment start
 }
+
+# =============================================================================
+# STABLE POPULATION MODEL
+# =============================================================================
+#
+# HOW IT WORKS
+# ─────────────────────────────────────────────────────────────────────────────
+# The stable-population model maintains a fixed cohort of ~SIMULATED_POPULATION
+# established patients who cycle through the provider system annually. Each
+# year, some patients are removed (mortality, permanent LTFU) and replaced by
+# an equal number of new entrants (drop-ins), keeping the total population
+# roughly constant across the 70-year simulation horizon.
+#
+#   Established patients → visit once per ANNUAL_VISIT_INTERVAL days →
+#       rescheduled immediately for next year → age updated each sweep
+#
+#   Mortality sweep → runs every MORTALITY_CHECK_DAYS → Bernoulli draw per
+#       patient with age-adjusted annual probability →  dead patients exit,
+#       are flushed to SQLite, and replaced by new entrants
+#
+#   Warmup → at day 0, SIMULATED_POPULATION established patients are spread
+#       evenly across days 0…ANNUAL_VISIT_INTERVAL so providers start near
+#       capacity from day 1 (no cold-start bias in year-1 metrics)
+#
+# SCALE FACTOR
+# ─────────────────────────────────────────────────────────────────────────────
+# 1 simulated patient represents POPULATION_SCALE_FACTOR real patients.
+# NYC eligible women ~1.5M → 1.5M / 100 = 15,000 simulated patients.
+# All metrics scale by this factor when extrapolating to real-world counts.
+# =============================================================================
+
+# ── Stable population size and scale ─────────────────────────────────────────
+POPULATION_SCALE_FACTOR = 100          # 1 sim patient = 100 NYC women
+SIMULATED_POPULATION    = 15_000       # established cycling patients in pool
+
+# ── Replacement flow ──────────────────────────────────────────────────────────
+# New drop-in entrants per day replace patients lost to mortality / permanent exit.
+# Set low (mortality alone drives ~2–5 exits/day at steady state).
+# PLACEHOLDER — calibrate to match observed NYC turnover rate.
+NEW_PATIENT_DAILY_RATE  = 4            # ~4 new entrants/day ≈ 1,460/year ≈ 10% turnover
+
+# ── Visit scheduling ──────────────────────────────────────────────────────────
+ANNUAL_VISIT_INTERVAL  = 365           # days between established patient visits
+WARMUP_DAYS            = 365           # spread initial cohort across first full year
+
+# ── Mortality sweep cadence ───────────────────────────────────────────────────
+MORTALITY_CHECK_DAYS   = 30            # run mortality Bernoulli draws every N days
+
+# ── Age-specific annual mortality rates for US women (PLACEHOLDER) ────────────
+# Source: CDC WONDER / NCHS Life Tables (women, all causes, approximate).
+# PLACEHOLDER — replace with NYC-specific mortality data if available.
+# Keys: (age_lo, age_hi) inclusive; value: annual probability of death.
+ANNUAL_MORTALITY_RATE = {
+    (21,  29): 0.0006,
+    (30,  39): 0.0009,
+    (40,  49): 0.0020,
+    (50,  59): 0.0045,
+    (60,  69): 0.0100,
+    (70,  80): 0.0230,
+}
+
+# ── Database persistence ──────────────────────────────────────────────────────
+DB_PATH           = "nyp_simulation.db"  # SQLite file path (relative to working dir)
+DB_FLUSH_INTERVAL = 30                   # flush exited patients to SQLite every N days
 
 # ── Procedure Revenue (per event, USD) ────────────────────────────────────────
 # PLACEHOLDER — replace with NYP finance / contract rates.

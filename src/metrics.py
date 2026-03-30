@@ -90,6 +90,10 @@ def initialize_metrics() -> dict:
 
         # ── Wait times (days, by resource) ────────────────────────────────────
         "wait_times": defaultdict(list),
+
+        # ── Stable population (only populated when use_stable_population=True) ─
+        "mortality_count":    0,   # total patients removed by mortality sweep
+        "pool_size_snapshot": [],  # (day, pool_size) snapshots for longitudinal plot
     }
 
 
