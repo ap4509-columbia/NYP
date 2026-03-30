@@ -68,16 +68,14 @@ NYP/
 │   ├── metrics_outputs.ipynb     # Analysis, funnels, revenue, plots
 │   └── scenario_analysis.ipynb   # Co-scheduling comparison (future)
 │
-├── archive/                      # Archived demo notebooks — not required to run the simulation
+├── archive/                      # Archived and reference notebooks — not required to run the simulation
 │   ├── 02_screening.ipynb        # Screening layer walkthrough (reference only)
-│   └── 03_results_followup.ipynb # Follow-up pathway walkthrough (reference only)
+│   ├── 03_results_followup.ipynb # Follow-up pathway walkthrough (reference only)
+│   ├── initial_model_NYP_flow_simulation (1).ipynb  # Sophia's arrivals simulation (source)
+│   └── Simulation_draft_Yutong.ipynb                # Yutong's multi-cancer draft (source)
 │
-├── docs/
-│   └── GLOSSARY.md               # Definitions for all medical terms, acronyms, and CPT codes
-│
-└── reference/                    # Source material — do not modify
-    ├── initial_model_NYP_flow_simulation (1).ipynb  # Sophia's arrivals simulation
-    └── Simulation_draft_Yutong.ipynb                # Yutong's draft (reference only)
+└── docs/
+    └── GLOSSARY.md               # Definitions for all medical terms, acronyms, and CPT codes
 ```
 
 **Design principle:** all logic lives in `.py` modules — importable, testable, version-controlled cleanly. Notebooks are thin wrappers that call those modules, run scenarios, and display output. You never need to edit a notebook to change a clinical parameter.
