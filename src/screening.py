@@ -2,6 +2,25 @@
 # screening.py
 # Steps 2–3: Eligibility checks, test assignment, and result draws.
 # =============================================================================
+#
+# ROLE IN THE SIMULATION
+# ─────────────────────────────────────────────────────────────────────────────
+# This module implements the decision layer that runs immediately after a patient
+# is seen by a provider. It answers three sequential questions:
+#   1. Should this patient be screened? (eligibility + interval check)
+#   2. Which test should they receive? (age-stratified test assignment)
+#   3. What was the result? (stochastic draw from a probability table)
+#
+# For lung cancer, it also models the two pre-LDCT steps (referral placed,
+# scan scheduled) that can produce LTFU before the scan even happens.
+#
+# DEPENDENCY DIRECTION
+# ─────────────────────────────────────────────────────────────────────────────
+# screening.py ← called by runner.py and notebook 04
+# screening.py → reads config.py for all parameters
+# screening.py → writes result fields on Patient objects
+# followup.py  ← picks up where screening.py leaves off (reads patient.cervical_result, etc.)
+#
 # All probabilities are PLACEHOLDERS — replace with NYP data.
 # =============================================================================
 
@@ -15,7 +34,13 @@ from patient import Patient
 # ─── Eligibility ──────────────────────────────────────────────────────────────
 
 def is_eligible_cervical(p: Patient) -> bool:
-    """Patient must be age 21–65 AND have a cervix (e.g. no prior hysterectomy)."""
+    """
+    Return True if the patient meets USPSTF cervical screening eligibility criteria.
+
+    Criteria: age 21–65 AND anatomically has a cervix (no prior hysterectomy).
+    Age bounds are read from config.ELIGIBILITY['cervical'] so they can be
+    adjusted without touching this function.
+    """
     e = cfg.ELIGIBILITY["cervical"]
     return e["age_min"] <= p.age <= e["age_max"] and p.has_cervix
 
@@ -44,8 +69,12 @@ ELIGIBILITY_CHECKS = {
 
 def get_eligible_screenings(p: Patient) -> List[str]:
     """
-    Return a list of cancer types this patient is eligible to be screened for,
-    filtered to only the cancers currently active in the simulation (ACTIVE_CANCERS).
+    Return the list of cancer types this patient is eligible to be screened for today.
+
+    Loops over ACTIVE_CANCERS (set in config) and runs each cancer's eligibility
+    function. Returns only those where the patient passes. The result may be empty
+    (patient is ineligible for everything today) or contain multiple cancers (patient
+    is due for both cervical and lung on the same visit).
     """
     return [
         cancer for cancer, check in ELIGIBILITY_CHECKS.items()
@@ -64,9 +93,15 @@ _LAST_SCREEN_FIELD = {
 
 def is_due_for_screening(p: Patient, cancer: str, current_day: int) -> bool:
     """
-    Returns True if the patient should be screened today.
-    A patient is due if they have never been screened (last_day = -1)
-    or if enough days have passed since their last screen (based on test interval).
+    Return True if enough time has passed since this patient's last screen.
+
+    A patient is always due if they have never been screened (last_day = -1).
+    Otherwise, the interval between screens depends on the assigned test type:
+    cytology → 3 years, HPV-alone → 5 years, LDCT → 1 year. These are defined
+    in config.SCREENING_INTERVALS_DAYS.
+
+    This check prevents the simulation from over-screening a patient who was
+    recently seen at a different visit within the same interval window.
     """
     last_day = getattr(p, _LAST_SCREEN_FIELD[cancer], -1)
     if last_day < 0:
@@ -80,11 +115,13 @@ def is_due_for_screening(p: Patient, cancer: str, current_day: int) -> bool:
 
 def get_cervical_age_stratum(age: int) -> str:
     """
-    Classify patient age into USPSTF cervical screening stratum.
-    This determines which test is offered and which result probabilities apply.
+    Classify a patient's age into the USPSTF cervical screening stratum.
+
+    The stratum controls both which tests are offered and which probability
+    table is used when drawing a result:
       young  (21–29): cytology only, every 3 years
       middle (30–65): cytology every 3 years OR HPV-alone every 5 years
-      older  (66+):   no routine screening if adequate prior history
+      older  (66+):   no routine screening if prior history is adequate
     """
     if 21 <= age <= 29:
         return "young"
@@ -118,9 +155,13 @@ def assign_screening_test(p: Patient, cancer: str) -> str:
 
 def _adjust_probs(probs: dict, inflate_keys: list, factor: float) -> dict:
     """
-    Multiply selected result categories by a risk-adjustment factor,
-    then renormalise so all probabilities still sum to 1.
-    Used to simulate higher abnormal rates in higher-risk patients (HPV+, prior CIN).
+    Apply a multiplicative risk adjustment to selected result categories, then renormalise.
+
+    Multiplies each key in inflate_keys by factor, leaving the others unchanged.
+    After inflation the whole dict is divided by its sum so all values still add to 1.
+    This is how the model represents higher abnormal rates in higher-risk patients:
+    HPV positivity inflates all abnormal cytology categories; prior CIN2/3 further
+    inflates the high-grade categories specifically.
     """
     adjusted = {k: v * factor if k in inflate_keys else v for k, v in probs.items()}
     total    = sum(adjusted.values())
@@ -185,12 +226,16 @@ def run_lung_pre_ldct(
     p: Patient, current_day: int, metrics: Optional[dict] = None
 ) -> bool:
     """
-    Simulate the two steps that must happen before an LDCT scan is performed:
-      1. Provider places a referral order
-      2. Patient schedules the scan
+    Simulate the two administrative steps that must clear before an LDCT scan occurs.
 
-    Each step has a dropout probability (LTFU). Returns True only if both
-    steps succeed and the scan proceeds. Returns False if the patient is lost.
+    In real-world lung cancer screening, a significant fraction of eligible patients
+    never complete their scan because one of these two steps fails:
+      1. Provider places a referral/order (many eligible patients are never referred).
+      2. Patient schedules and shows up for the scan (many referred patients never book).
+
+    Each step draws a Bernoulli sample against the configured probability. If either
+    step fails the patient is classified as LTFU and the function returns False.
+    Returns True only when both steps succeed and the scan should proceed.
     """
     if metrics is not None:
         metrics["lung_eligible"] += 1
@@ -283,17 +328,16 @@ def run_screening_step(
 
 def days_until_eligible(p: Patient, cancer: str) -> int:
     """
-    How many days until this patient becomes eligible for the given cancer screening?
+    Return how many days until this patient becomes eligible for the given cancer screen.
 
-    Returns
-    -------
-    0   Already eligible right now.
-    >0  Will become eligible in this many days (approximate, age-based).
-    -1  Permanently ineligible — criteria can never be met (no cervix, aged out,
-        never-smoker, etc.).
+    This drives the three-way eligibility routing in the runner:
+      0   — eligible right now (call run_screening_step)
+      > 0 — will become eligible in ~N days (schedule a return visit)
+      -1  — permanently ineligible (no cervix, aged out, never smoked, etc.);
+            no return visit should be scheduled — exit the patient silently
 
-    Used by the runner to decide whether to schedule a return visit (>0)
-    or silently exit the patient from the system (-1).
+    For lung, the function also handles the case where a current smoker will eventually
+    accumulate enough pack-years to qualify, returning the estimated wait time.
     """
     if cancer == "cervical":
         e = cfg.ELIGIBILITY["cervical"]

@@ -2,8 +2,33 @@
 # followup.py
 # Steps 4–5: Post-screening clinical follow-up pathways.
 # =============================================================================
-# Cervical: result routing → colposcopy → CIN grading → treatment / surveillance
-# Lung:     Lung-RADS routing → repeat LDCT or biopsy chain → malignancy → treatment
+#
+# ROLE IN THE SIMULATION
+# ─────────────────────────────────────────────────────────────────────────────
+# This module picks up where screening.py leaves off. Once a result is written
+# onto the Patient object, followup.py determines what happens next clinically:
+#   - Is the result normal? → return to routine surveillance schedule.
+#   - Is the result abnormal? → refer for a confirmatory/treatment procedure,
+#     subject to stochastic loss-to-follow-up (LTFU) at each decision node.
+#
+# Cervical pathway:
+#   result routing → (LTFU check) → colposcopy → CIN grade draw
+#   → (LTFU check) → treatment assignment (surveillance or LEEP)
+#
+# Lung pathway:
+#   RADS routing → result communicated → (LTFU check) → biopsy referral
+#   → scheduling → completion → malignancy confirmed → treatment
+#
+# Each LTFU check is a Bernoulli draw against a config probability. If the
+# patient fails any check, they exit the system as "lost_to_followup" and no
+# further steps run. This models the real-world attrition that happens between
+# referral and follow-up appointment completion.
+#
+# DEPENDENCY DIRECTION
+# ─────────────────────────────────────────────────────────────────────────────
+# followup.py  ← called by runner.py and notebook 04
+# followup.py  → reads config.py for LTFU probs, colposcopy probs, treatment assignment
+# followup.py  → reads/writes Patient fields (cervical_result, colposcopy_result, etc.)
 #
 # All probabilities are PLACEHOLDERS — replace with NYP data / ASCCP tables.
 # =============================================================================

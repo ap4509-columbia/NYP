@@ -2,6 +2,24 @@
 # metrics.py
 # Metric collection, aggregation, and summary reporting.
 # =============================================================================
+#
+# ROLE IN THE SIMULATION
+# ─────────────────────────────────────────────────────────────────────────────
+# This module is the observability layer of the simulation. It defines:
+#   - The metrics dict schema (initialize_metrics) — a single dict that
+#     accumulates counts and lists as events fire across all patients and days.
+#   - Recording functions (record_screening, record_exit) — called inline by
+#     screening.py and followup.py whenever a significant event occurs.
+#   - Aggregation and reporting (compute_rates, print_summary) — convert raw
+#     counts into interpretable rates and print a formatted results table.
+#   - Revenue analysis (compute_revenue, print_revenue_summary) — translate
+#     procedure volumes into estimated revenue for finance planning.
+#
+# The metrics dict is intentionally a plain Python dict (not a class) so it
+# can be passed into any function without import dependencies. Every function
+# in screening.py and followup.py accepts an optional `metrics` argument —
+# passing None disables recording (useful for unit tests and isolated demos).
+# =============================================================================
 
 from collections import defaultdict
 from typing import List
@@ -10,7 +28,21 @@ from patient import Patient
 
 
 def initialize_metrics() -> dict:
-    """Return a fresh metrics dictionary for one simulation run."""
+    """
+    Create and return a fresh metrics dictionary for one simulation run.
+
+    The dict is structured into logical groups:
+      - Volume counters: how many patients were seen, eligible, or unscreened.
+      - Screening counts: per-cancer screening totals, cervical result distributions.
+      - Cervical follow-up: colposcopy counts, CIN grade distribution, treatment types.
+      - Outcomes: treated, untreated, LTFU totals.
+      - LTFU breakdown: how many patients were lost at each specific node.
+      - Lung pathway funnel: step-by-step counts from referral through treatment.
+      - Wait times: lists of days waited at each resource (for scheduling analysis).
+
+    Call this at the start of each simulation replication so state doesn't carry
+    over between runs.
+    """
     return {
         # ── Volume ────────────────────────────────────────────────────────────
         "n_patients":     0,
@@ -64,7 +96,14 @@ def initialize_metrics() -> dict:
 def record_screening(
     metrics: dict, p: Patient, cancer: str, result: str
 ) -> None:
-    """Record a completed screening event."""
+    """
+    Record a completed screening event in the metrics dict.
+
+    Increments the per-cancer screening counter and, for cervical screenings,
+    also tallies the result category and the age-stratum breakdown. The stratum
+    breakdown is used to verify that the simulation's result distribution matches
+    expected rates for young vs. middle-aged women separately.
+    """
     from screening import get_cervical_age_stratum   # local import to avoid circularity
     metrics["n_screened"][cancer] += 1
     if cancer == "cervical":
@@ -74,7 +113,14 @@ def record_screening(
 
 
 def record_exit(metrics: dict, reason: str) -> None:
-    """Record a patient exit and classify outcome."""
+    """
+    Record a patient's exit from the system and classify it into an outcome bucket.
+
+    Called whenever a patient's pathway ends, whether through successful treatment,
+    voluntary departure without treatment, or LTFU. The reason string comes from
+    patient.exit_reason (set by patient.exit_system()) and maps to one of three
+    outcome counters: treated, untreated, or lost_to_followup.
+    """
     metrics["n_exited"] += 1
     if reason == "treated":
         metrics["n_treated"] += 1
@@ -85,7 +131,14 @@ def record_exit(metrics: dict, reason: str) -> None:
 
 
 def compute_rates(metrics: dict) -> dict:
-    """Derive key percentage rates from raw counts."""
+    """
+    Derive key percentage rates from the raw event counts in the metrics dict.
+
+    Converts raw counts into the rates that appear in the summary report:
+    screening rate, abnormal rate, colposcopy completion rate, treatment
+    completion rate, and overall LTFU rate. Uses max(..., 1) denominators to
+    avoid division-by-zero in runs where a particular event never occurred.
+    """
     n     = max(metrics["n_patients"], 1)
     cerv  = max(metrics["n_screened"]["cervical"], 1)
     colpo = max(metrics["n_colposcopy"], 1)
@@ -106,7 +159,15 @@ def compute_rates(metrics: dict) -> dict:
 
 
 def print_summary(metrics: dict) -> None:
-    """Print a formatted simulation summary to stdout."""
+    """
+    Print a formatted summary of the simulation results to stdout.
+
+    Covers all major pipeline sections in order: patient volumes, screening
+    counts by cancer, cervical result distribution (with age-stratum breakdown),
+    colposcopy and treatment counts, outcome totals, LTFU breakdown by node,
+    and the full lung LDCT pathway funnel. Calls compute_rates() internally
+    to derive the percentage columns.
+    """
     rates = compute_rates(metrics)
 
     print("=" * 65)
@@ -198,7 +259,15 @@ def print_summary(metrics: dict) -> None:
 
 
 def print_patient_trace(patients: List[Patient], n: int = 5) -> None:
-    """Print event logs for the first n patients (for debugging)."""
+    """
+    Print the full event log for the first n patients in the list.
+
+    Each patient's log is a chronological list of (day, event_string) tuples
+    recorded by patient.log() throughout the simulation. This is the primary
+    tool for verifying that the clinical logic is flowing correctly — reading
+    a trace makes it immediately obvious if a step fired out of order or a
+    patient ended up in an unexpected state.
+    """
     for p in patients[:n]:
         p.print_history()
 

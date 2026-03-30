@@ -2,12 +2,26 @@
 # population.py
 # Population sampler — STUB INTERFACE
 # =============================================================================
-# This file defines the contract for patient generation.
-# The provided population sampling code will REPLACE the body of
-# `sample_patient()` below. The function signature must remain stable.
 #
-# Stub uses rough NYC demographic distributions so Steps 2–6 run
-# end-to-end before the real sampler arrives.
+# ROLE IN THE SIMULATION
+# ─────────────────────────────────────────────────────────────────────────────
+# This module is the patient factory. Whenever the simulation needs a new patient,
+# it calls sample_patient(), which draws all demographic and clinical attributes
+# from probability distributions calibrated to the NYC eligible-women population.
+#
+# The resulting Patient object carries the fields that screening.py and followup.py
+# need to make decisions: age (for eligibility and stratum), has_cervix (cervical
+# eligibility), pack_years / smoker (lung eligibility), hpv_positive and prior_cin
+# (risk adjustment for result draws).
+#
+# STUB → REAL SAMPLER
+# ─────────────────────────────────────────────────────────────────────────────
+# This file is intentionally a thin stub. The real population sampling code will
+# REPLACE the body of sample_patient() only — the function signature and return
+# type must remain stable so no other file needs to change.
+#
+# All distribution values marked PLACEHOLDER must be replaced with NYC census /
+# NYP EHR-derived rates before the model is used for planning.
 # =============================================================================
 
 import random
@@ -61,18 +75,34 @@ _HYSTERECTOMY_RATE = {       # prevalence by age group, PLACEHOLDER
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _weighted_choice(dist: dict):
+    """Draw one key from a {key: weight} dict using weighted random selection."""
     keys    = list(dist.keys())
     weights = list(dist.values())
     return random.choices(keys, weights=weights, k=1)[0]
 
 
 def _sample_age() -> int:
+    """
+    Sample a patient age from the NYC age bracket distribution.
+
+    First picks a bracket ((lo, hi), weight) pair using the bracket weights,
+    then draws a uniform integer within that bracket. This two-step approach
+    gives a realistic piecewise-uniform age distribution rather than a smooth
+    continuous one.
+    """
     brackets, weights = zip(*_AGE_BRACKETS)
     (lo, hi) = random.choices(brackets, weights=weights, k=1)[0]
     return random.randint(lo, hi)
 
 
 def _rate_for_age(table: dict, age: int, default: float = 0.05) -> float:
+    """
+    Look up the rate for a given age from a {(lo, hi): rate} bracket table.
+
+    Iterates through the bracket keys until the patient's age falls within one.
+    Returns default if no bracket matches (e.g. age is outside all defined ranges).
+    Used for hysterectomy prevalence and HPV vaccination coverage lookups.
+    """
     for (lo, hi), rate in table.items():
         if lo <= age <= hi:
             return rate

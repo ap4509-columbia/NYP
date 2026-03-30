@@ -2,8 +2,35 @@
 # config.py
 # NYP Women's Health Screening Simulation — Central Configuration
 # =============================================================================
-# All clinical parameters, probabilities, capacities, and workflow settings
-# live here. Replace PLACEHOLDER values with NYP data as it becomes available.
+#
+# DESIGN PHILOSOPHY
+# ─────────────────────────────────────────────────────────────────────────────
+# This file is the single source of truth for every numeric parameter in the
+# simulation. No probability, capacity, or interval value is hard-coded
+# anywhere else in the codebase — they all come from here.
+#
+# This means that to run a scenario analysis (e.g. "what if we doubled
+# colposcopy capacity?" or "what if LTFU post-abnormal dropped from 20% to 10%?"),
+# you change exactly one number in this file and re-run.
+#
+# SECTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+#   1. Simulation horizon & replication settings
+#   2. Workflow mode toggle (fragmented vs. coordinated care)
+#   3. Arrivals (mirrors Sophia's parameters)
+#   4. Provider capacities and scheduling lead times
+#   5. Eligibility criteria (USPSTF guidelines)
+#   6. Test modalities and screening intervals
+#   7. Result probability tables (cervical cytology, HPV-alone, Lung-RADS)
+#   8. Lung pathway step probabilities (referral, scheduling, biopsy, treatment)
+#   9. Loss-to-follow-up probabilities
+#  10. Colposcopy result probabilities (ASCCP risk tables)
+#  11. Treatment assignment by CIN grade
+#  12. Resource capacities (SimPy)
+#  13. Procedure revenue (CPT-based placeholders)
+#
+# All values marked PLACEHOLDER must be replaced with NYP EHR-derived rates
+# before the model is used for operational or planning decisions.
 # =============================================================================
 
 RANDOM_SEED = 42
