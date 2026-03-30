@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS patients (
     cervical_result      TEXT,      -- last cervical screening result
     lung_result          TEXT,      -- last lung screening result
     colposcopy_result    TEXT,      -- last colposcopy result (if any)
-    treatment_type       TEXT       -- surveillance | leep | cone_biopsy (if any)
+    treatment_type       TEXT,      -- surveillance | leep | cone_biopsy (if any)
+    last_cervical_screen_day  INTEGER,   -- simulation day of the patient's last cervical screening (-1 = never screened)
+    last_lung_screen_day      INTEGER    -- simulation day of the patient's last lung screening (-1 = never screened)
 );
 """
 
@@ -76,6 +78,8 @@ _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_patients_race            ON patients(race);",
     "CREATE INDEX IF NOT EXISTS idx_events_patient_id        ON events(patient_id);",
     "CREATE INDEX IF NOT EXISTS idx_events_day               ON events(day);",
+    "CREATE INDEX IF NOT EXISTS idx_patients_last_cervical_screen ON patients(last_cervical_screen_day);",
+    "CREATE INDEX IF NOT EXISTS idx_patients_last_lung_screen     ON patients(last_lung_screen_day);",
 ]
 
 
@@ -170,6 +174,8 @@ class SimulationDB:
                 p.lung_result,
                 p.colposcopy_result,
                 p.treatment_type,
+                p.last_cervical_screen_day,
+                p.last_lung_screen_day,
             )
             for p in patients
         ]
@@ -181,8 +187,9 @@ class SimulationDB:
                 patient_id, age_at_entry, age_at_exit, race, insurance,
                 is_established, simulation_entry_day, exit_day, exit_reason,
                 visit_count, has_cervix, smoker, pack_years,
-                cervical_result, lung_result, colposcopy_result, treatment_type
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                cervical_result, lung_result, colposcopy_result, treatment_type,
+                last_cervical_screen_day, last_lung_screen_day
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )

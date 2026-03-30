@@ -191,9 +191,11 @@ class PatientQueues:
             self.dropin[provider].append(p)
             return earliest_day
 
-        # Advance day until a slot is available (never overfills)
+        # Advance day until a slot is available (never overfills).
+        # Count only active patients — inactive (dead/exited) patients leave
+        # their slot logically vacated so replacement entrants can fill it.
         day = earliest_day
-        while len(self.outpatient[provider][day]) >= cap:
+        while sum(1 for q in self.outpatient[provider][day] if q.active) >= cap:
             day += 1
 
         self.outpatient[provider][day].append(p)
@@ -201,9 +203,9 @@ class PatientQueues:
         # Hard post-condition: the booked day must not exceed capacity.
         # This catches any future bug where two threads / code paths race on
         # the same slot, or where the cap calculation is wrong.
-        booked_count = len(self.outpatient[provider][day])
+        booked_count = sum(1 for q in self.outpatient[provider][day] if q.active)
         assert booked_count <= cap, (
-            f"CAPACITY VIOLATION: {provider} day {day} has {booked_count} "
+            f"CAPACITY VIOLATION: {provider} day {day} has {booked_count} active "
             f"outpatients but cap={cap}. Check _outpatient_cap() and config."
         )
 
@@ -255,8 +257,17 @@ class PatientQueues:
         # Drop-ins fill remaining total capacity, computed from ACTUAL headcount
         # so that a scenario capacity change doesn't leave ghost slack or
         # miscount available slots.
-        remaining        = max(0, total_cap - n_outpts)
-        today_dropins    = list(self.dropin.get(provider, []))
+        remaining     = max(0, total_cap - n_outpts)
+
+        # NYP MODEL ASSUMPTION — age-based drop-in priority (cfg.AGE_PRIORITY_THRESHOLD)
+        # Women aged 40+ are sorted to the front of the drop-in queue before the
+        # capacity slice is applied. This ensures that when the drop-in pool exceeds
+        # available slots, younger patients overflow rather than high-revenue 40+ patients.
+        # Ordering within each age group preserves arrival order (stable sort).
+        today_dropins = sorted(
+            self.dropin.get(provider, []),
+            key=lambda p: (0 if p.age >= cfg.AGE_PRIORITY_THRESHOLD else 1),
+        )
         seen_dropins     = today_dropins[:remaining]
         overflow         = today_dropins[remaining:]
         self.dropin[provider] = []
@@ -417,13 +428,34 @@ class SimulationRunner:
         self._pid    = 0
 
         if self.use_stable_population:
+            # If resetting, delete the old file first so _create_schema() always
+            # builds on a clean slate (avoids stale-column errors on index creation
+            # when schema has been extended since the last run).
+            if self.reset_db and self.db_path:
+                import os
+                try:
+                    os.remove(self.db_path)
+                except FileNotFoundError:
+                    pass
             self._db = SimulationDB(db_path=self.db_path)
-            if self.reset_db:
-                self._db.reset()
             self._initialize_population()
 
         for day in range(self.n_days):
             self._tick(day)
+
+        # Final year checkpoint (captures year-70 stats at end of loop)
+        if self.metrics.get("year_checkpoints") is not None:
+            last_year = self.n_days // 365
+            self.metrics["year_checkpoints"].append({
+                "year":           last_year,
+                "day":            self.n_days,
+                "pool_size":      len(self._established_pool) if self.use_stable_population else None,
+                "cum_cervical":   self.metrics["n_screened"]["cervical"],
+                "cum_lung":       self.metrics["n_screened"]["lung"],
+                "cum_mortality":  self.metrics.get("mortality_count", 0),
+                "cum_colposcopy": self.metrics["n_colposcopy"],
+                "cum_treated":    self.metrics["n_treated"],
+            })
 
         # Final flush of any remaining exited patients
         if self.use_stable_population and self._db:
@@ -585,6 +617,20 @@ class SimulationRunner:
             # Flush exited patients to SQLite in batches
             self._flush_exited_patients(day=day)
 
+        # Annual checkpoint — record cumulative stats at each year boundary
+        if day > 0 and day % 365 == 0:
+            year = day // 365
+            self.metrics["year_checkpoints"].append({
+                "year":           year,
+                "day":            day,
+                "pool_size":      len(self._established_pool) if self.use_stable_population else None,
+                "cum_cervical":   self.metrics["n_screened"]["cervical"],
+                "cum_lung":       self.metrics["n_screened"]["lung"],
+                "cum_mortality":  self.metrics.get("mortality_count", 0),
+                "cum_colposcopy": self.metrics["n_colposcopy"],
+                "cum_treated":    self.metrics["n_treated"],
+            })
+
         # 1. Follow-ups due today
         for p, context in self._queues.get_due_followups(day):
             self._run_followup(p, context, day)
@@ -627,10 +673,12 @@ class SimulationRunner:
         immediately after each visit. This separates the two flows cleanly.
         """
         if self.use_stable_population:
-            # New entrants are always drop-ins; they join the general pool
-            # but are NOT added to _established_pool yet (they enter cycling
-            # only if they become regulars — modelled implicitly over time).
-            rate = cfg.NEW_PATIENT_DAILY_RATE
+            # Organic new patients: first-time visitors, women turning 21, new
+            # movers, etc. They arrive as drop-ins and are seen like any walk-in.
+            # After their first visit they join the established cycling pool
+            # (handled in _screen_patient) so they become regular annual patients.
+            # This is distinct from mortality replacements (_spawn_replacement_entrants).
+            rate = cfg.ORGANIC_NEW_PATIENT_DAILY_RATE
         else:
             rate = self.daily_rate
 
@@ -794,6 +842,26 @@ class SimulationRunner:
         if self.use_stable_population and p.is_established and p.active:
             self._reschedule_established(p, day)
 
+        # ── Open-loop: convert first-time visitors into established patients ───
+        # Organic new patients (from _generate_arrivals) arrive as drop-ins with
+        # is_established=False. After their first successful visit, they join the
+        # established cycling pool so they become regular annual patients.
+        # Pool cap (SIMULATED_POPULATION) is enforced — if the pool is already at
+        # target size (maintained by mortality replacement), the patient completes
+        # their visit but does not join the cycling cohort.
+        elif (
+            self.use_stable_population
+            and not p.is_established
+            and p.active
+            and len(self._established_pool) < cfg.SIMULATED_POPULATION
+        ):
+            p.is_established       = True
+            p.age_at_entry         = p.age
+            p.simulation_entry_day = day
+            self._established_pool.append(p)
+            self._reschedule_established(p, day)
+            p.log(day, "FIRST VISIT COMPLETE — joined established cycling pool")
+
     # =========================================================================
     # Stable population management
     # =========================================================================
@@ -827,10 +895,17 @@ class SimulationRunner:
 
         warmup = max(1, cfg.WARMUP_DAYS)
         for i, p in enumerate(pool):
-            # Spread appointments evenly across the warmup window
+            # Spread first appointments evenly across the warmup window
             target_day = int(i * warmup / len(pool))
             booked_day = self._queues.schedule_outpatient(p, p.destination, target_day)
             p.next_visit_day = booked_day
+
+            # Pre-book ADVANCE_SCHEDULE_YEARS - 1 additional annual visits so
+            # providers are booked out years in advance from day 0.
+            for yr in range(1, cfg.ADVANCE_SCHEDULE_YEARS):
+                self._queues.schedule_outpatient(
+                    p, p.destination, booked_day + yr * cfg.ANNUAL_VISIT_INTERVAL
+                )
 
         self._established_pool = pool
 
@@ -898,10 +973,19 @@ class SimulationRunner:
         debugging. The patient object itself is placed in the future
         outpatient queue — so no separate pool management is needed.
         """
-        next_day         = day + cfg.ANNUAL_VISIT_INTERVAL
-        booked_day       = self._queues.schedule_outpatient(p, p.destination, next_day)
-        p.next_visit_day = booked_day
-        p.log(day, f"ESTABLISHED — next annual visit scheduled for day {booked_day}")
+        # Each visit, extend the advance-schedule window by one year at the far end.
+        # The near-end appointments (years 1 through ADVANCE_SCHEDULE_YEARS-1 from now)
+        # were already pre-booked from the previous visit's rescheduling or warmup.
+        # We only need to add the appointment at the new far horizon.
+        far_day    = day + cfg.ADVANCE_SCHEDULE_YEARS * cfg.ANNUAL_VISIT_INTERVAL
+        booked_far = self._queues.schedule_outpatient(p, p.destination, far_day)
+
+        # next_visit_day tracks the NEXT actual visit (1 year from now), not the far booking
+        p.next_visit_day = day + cfg.ANNUAL_VISIT_INTERVAL
+        p.log(day, (
+            f"ESTABLISHED — advance window extended to day {booked_far} "
+            f"(year {booked_far // 365}); next visit ~day {p.next_visit_day}"
+        ))
 
     def _spawn_replacement_entrants(self, day: int) -> None:
         """
@@ -925,8 +1009,16 @@ class SimulationRunner:
         if self._pending_new_entries <= 0:
             return
 
+        # If organic new patients (from _generate_arrivals) have already filled
+        # the pool to target, we don't need additional replacements this day.
+        if len(self._established_pool) >= cfg.SIMULATED_POPULATION:
+            self._pending_new_entries = 0
+            return
+
         # Spread replacements: spawn up to NEW_PATIENT_DAILY_RATE per day
-        to_spawn = min(self._pending_new_entries, cfg.NEW_PATIENT_DAILY_RATE)
+        # Cap so we never over-fill beyond SIMULATED_POPULATION
+        headroom = cfg.SIMULATED_POPULATION - len(self._established_pool)
+        to_spawn = min(self._pending_new_entries, cfg.NEW_PATIENT_DAILY_RATE, headroom)
 
         for _ in range(to_spawn):
             from population import _sample_established_destination
@@ -939,10 +1031,17 @@ class SimulationRunner:
             p.age_at_entry         = p.age
             p.simulation_entry_day = day
 
-            # Schedule their first visit in the next 1–14 days
+            # Schedule their first visit in the next 1–14 days, then pre-book
+            # ADVANCE_SCHEDULE_YEARS - 1 subsequent annual visits so the replacement
+            # joins the multi-year advance schedule immediately.
             earliest  = day + random.randint(1, 14)
             booked    = self._queues.schedule_outpatient(p, dest, earliest)
             p.next_visit_day = booked
+
+            for yr in range(1, cfg.ADVANCE_SCHEDULE_YEARS):
+                self._queues.schedule_outpatient(
+                    p, dest, booked + yr * cfg.ANNUAL_VISIT_INTERVAL
+                )
 
             self._established_pool.append(p)
 

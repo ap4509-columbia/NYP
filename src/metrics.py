@@ -94,6 +94,11 @@ def initialize_metrics() -> dict:
         # ── Stable population (only populated when use_stable_population=True) ─
         "mortality_count":    0,   # total patients removed by mortality sweep
         "pool_size_snapshot": [],  # (day, pool_size) snapshots for longitudinal plot
+
+        # ── Annual checkpoints (one dict per year, for longitudinal plots) ──────
+        # Each entry: {year, day, pool_size, cum_cervical, cum_lung,
+        #              cum_mortality, cum_colposcopy, cum_treated}
+        "year_checkpoints": [],
     }
 
 

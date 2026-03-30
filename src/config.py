@@ -286,14 +286,48 @@ FOLLOWUP_DELAY_DAYS = {
 POPULATION_SCALE_FACTOR = 100          # 1 sim patient = 100 NYC women
 SIMULATED_POPULATION    = 15_000       # established cycling patients in pool
 
-# ── Replacement flow ──────────────────────────────────────────────────────────
-# New drop-in entrants per day replace patients lost to mortality / permanent exit.
-# Set low (mortality alone drives ~2–5 exits/day at steady state).
-# PLACEHOLDER — calibrate to match observed NYC turnover rate.
-NEW_PATIENT_DAILY_RATE  = 4            # ~4 new entrants/day ≈ 1,460/year ≈ 10% turnover
+# ── Patient flow into the system (open-loop model) ───────────────────────────
+#
+# There are TWO distinct flows of new patients. The simulation is NOT a closed
+# system — patients continuously enter throughout all 70 years.
+#
+# 1. ORGANIC NEW ENTRANTS (ORGANIC_NEW_PATIENT_DAILY_RATE)
+#    Women who are genuinely new to NYP: first-time visitors, recent movers,
+#    women turning 21, patients switching providers. They arrive as drop-ins,
+#    get screened at their first visit, then join the established cycling pool
+#    for annual follow-ups (up to SIMULATED_POPULATION cap).
+#    PLACEHOLDER — calibrate to NYP patient acquisition data.
+#
+# 2. MORTALITY REPLACEMENTS (NEW_PATIENT_DAILY_RATE)
+#    Patients spawned specifically to replace mortality exits and keep the pool
+#    at exactly SIMULATED_POPULATION. Separate from organic flow — they enter
+#    directly as established cycling patients, not as drop-ins.
+#    Rate-limited to spread replacements across days rather than spawning all
+#    deaths at once on the mortality-sweep day.
+
+ORGANIC_NEW_PATIENT_DAILY_RATE = 10   # ~10 new first-time patients/day ≈ 3,650/year
+NEW_PATIENT_DAILY_RATE         = 4    # mortality-replacement rate (max per day)
+
+# ── NYP MODEL ASSUMPTION: Age-based drop-in queue priority ───────────────────
+# Hospital preference for revenue maximization: when drop-in capacity is limited
+# and some walk-in patients must be deferred to the next day, women aged 40+
+# receive priority and are seen before younger patients.
+#
+# RATIONALE: The 40+ cohort is disproportionately associated with higher-revenue
+# procedures — colposcopy, LEEP, cone biopsy, and LDCT — so prioritizing them
+# maximises expected procedure revenue per available drop-in slot.
+#
+# This applies ONLY to drop-in queue ordering. All scheduled outpatients retain
+# their guaranteed slot regardless of age (capacity contract is unchanged).
+AGE_PRIORITY_THRESHOLD = 40           # women aged >= this receive drop-in priority
 
 # ── Visit scheduling ──────────────────────────────────────────────────────────
 ANNUAL_VISIT_INTERVAL  = 365           # days between established patient visits
+# Number of years of outpatient appointments to pre-book for each established patient.
+# At warmup, each patient is scheduled for ADVANCE_SCHEDULE_YEARS annual visits.
+# After each visit, the far end of the window is extended by one year, so the
+# patient always has approximately ADVANCE_SCHEDULE_YEARS future appointments booked.
+ADVANCE_SCHEDULE_YEARS = 5
 WARMUP_DAYS            = 365           # spread initial cohort across first full year
 
 # ── Mortality sweep cadence ───────────────────────────────────────────────────
