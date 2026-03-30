@@ -1,6 +1,6 @@
 # NYP Women's Health Screening Simulation — Digital Twin
 
-A discrete-event simulation (DES) of a multi-cancer women's health screening program at NewYork-Presbyterian. The model simulates patient flow from provider arrival through screening, clinical follow-up, and system exit — quantifying drop-off at each step and supporting operational and financial planning.
+A discrete-event simulation (DES) of a multi-cancer women's health screening program at NewYork-Presbyterian. The model simulates patient flow from provider arrival through screening, clinical follow-up, and system exit — across a **70-year longitudinal horizon** — quantifying drop-off at each step and supporting operational and financial planning.
 
 ---
 
@@ -27,7 +27,9 @@ The simulation is built to be calibrated with NYP EHR data — all clinical prob
 
 **Active cancers:** cervical and lung.
 
-**Simulation window:** configurable; default 365 days (1 year), extendable to 30 years.
+**Simulation window:** 70 years (25,550 days) — the full longitudinal horizon over which a stable patient population is tracked from entry through eventual mortality or departure.
+
+**Population scale:** 15,000 simulated patients represent approximately 1.5 million NYC eligible women (scale factor 1:100).
 
 **Primary objectives:**
 - Model patient attrition at every clinical decision node
@@ -53,17 +55,18 @@ NYP/
 ├── src/                          # Core simulation modules
 │   ├── config.py                 # All parameters, probabilities, and revenue rates
 │   ├── patient.py                # Patient dataclass — shared data contract
-│   ├── population.py             # Population sampler (NYC demographics)
+│   ├── population.py             # Population sampler (NYC demographics + mortality helpers)
 │   ├── screening.py              # Eligibility, test assignment, result draws
 │   ├── followup.py               # Post-screening clinical pathways
 │   ├── metrics.py                # Counters, rates, revenue analysis, reporting
+│   ├── db.py                     # SQLite persistence layer — patient + event log storage
 │   ├── runner.py                 # SimulationRunner — day-by-day orchestration + queue engine
 │   └── scenarios.py              # Co-scheduling scenario definitions (future)
 │
 ├── notebooks/                    # Jupyter notebooks
 │   ├── 02_screening.ipynb        # Screening layer demo and tests
 │   ├── 03_results_followup.ipynb # Follow-up pathway demo and tests
-│   ├── 04_simulation_runner.ipynb# Full end-to-end orchestration
+│   ├── 04_simulation_runner.ipynb# Full end-to-end orchestration + 70-year run + visualizations
 │   ├── 05_metrics_outputs.ipynb  # Analysis, funnels, revenue, plots
 │   └── 06_scenario_analysis.ipynb# Co-scheduling comparison (future)
 │
@@ -76,50 +79,102 @@ NYP/
 
 ---
 
-## Source Files
+## The Open-System 70-Year Population Model
 
-### `src/config.py`
-The single source of truth for every tunable value in the simulation. All clinical probabilities (result distributions, LTFU rates, pathway completion rates), revenue rates, provider capacities, scheduling parameters, and eligibility criteria live here. Changing a value in `config.py` propagates everywhere — no other file needs to be touched. All probability and revenue values are currently marked `# PLACEHOLDER` and must be replaced with NYP EHR and finance data before the simulation produces calibrated output.
+This is the conceptual core of the simulation. Understanding it is essential before reading any of the code.
 
-### `src/patient.py`
-Defines the `Patient` dataclass — the shared data contract between every module. A single `Patient` object is created on arrival and passed through eligibility, screening, follow-up, and exit without copying. It holds all demographic fields (age, race, insurance), clinical flags (has_cervix, pack_years, hpv_positive, prior_cin), simulation state (active, current_stage), screening history (last screen day per cancer), results (cervical_result, lung_result), follow-up state (colposcopy_result, treatment_type, lung biopsy chain flags), exit reason, and a timestamped event log. Helper methods `p.log()`, `p.exit_system()`, and `p.print_history()` are used throughout.
+### What "open system" means
 
-### `src/population.py`
-Generates individual `Patient` objects sampled from NYC demographic distributions. The public interface is one function: `sample_patient(patient_id, day_created, destination, patient_type) → Patient`. The current stub draws age, race/ethnicity, insurance, smoking history, HPV status, hysterectomy status, and BMI from population-weighted distributions based on NYC data. This is the intended integration point for Yutong's population code — replace the function body without changing the signature and no other file needs to change.
+The simulation does **not** run a fixed cohort of patients and watch them age to death. Instead, it models an **open system** — the way a real hospital actually works:
 
-### `src/screening.py`
-Implements Steps 2–3 of the patient journey: eligibility determination, future eligibility estimation, test assignment, and result draws. Key functions: `get_eligible_screenings()` returns which cancers a patient qualifies for right now; `days_until_eligible()` returns how many days until a patient will become eligible (used to schedule return visits for patients who are close but not yet eligible, vs. permanently ineligible patients who exit silently); `assign_screening_test()` picks the test modality (age-stratified for cervical per USPSTF 2018); `draw_cervical_result()` draws a multinomial result with risk-factor inflation for HPV+ and prior CIN history; `run_lung_pre_ldct()` models the two pre-LDCT LTFU nodes (referral placed, LDCT scheduled); `run_screening_step()` orchestrates the full screening event for one cancer.
+- Patients **enter** continuously: new women move to NYC, turn 21, switch providers, are referred by their PCP, or simply come in for the first time
+- Patients **exit** continuously: some die, some reach the end of their screening-eligible years, some are permanently lost to follow-up
+- A core group is **retained**: established patients who have an ongoing relationship with NYP return year after year for their annual visit and periodic screenings
 
-### `src/followup.py`
-Implements Steps 4–5: result routing and clinical follow-up pathways for both cancers. For cervical, `route_cervical_result()` branches on result category (normal → surveillance; abnormal cytology → colposcopy; HPV+ → 40% 1-year repeat / 60% colposcopy per ASCCP triage); `run_colposcopy()` draws a CIN grade from result-conditional distributions; `run_treatment()` applies the treatment decision rule (CIN1 → surveillance, CIN2/3 → LEEP) with a 10% LTFU check before the procedure. For lung, `run_lung_followup()` handles result communication (10% LTFU), RADS category routing (repeat LDCT intervals for RADS 0–3), and the full biopsy chain for RADS 4 (referral → scheduling → completion → malignancy confirmation → treatment), with an explicit LTFU check at every step.
+Over 70 years, the composition of the patient pool shifts as generations of patients cycle through — but the total number of active patients remains approximately stable at 15,000 (representing ~1.5 million NYC women).
 
-### `src/metrics.py`
-Collects and aggregates all simulation outputs into a single metrics dictionary. `initialize_metrics()` returns a fresh dict at the start of each run. `record_screening()` and `record_exit()` are called by the runner as events occur. `compute_rates()` derives percentages (screening rate, abnormal rate, colposcopy completion, LTFU rate). `compute_revenue()` calculates realized revenue from completed procedures and foregone revenue lost at each LTFU node, broken down by procedure type and drop-off point. `print_summary()` and `print_revenue_summary()` produce formatted clinical and financial summaries to stdout.
+### The three patient flows
 
-### `src/runner.py`
-The orchestration layer that owns the clock, all queues, and the daily tick. `SimulationRunner` runs the full simulation (`run()`), exposes `summary()`, `revenue_summary()`, `plot_all()`, and `plot_queues()` after the run completes. Internally, `PatientQueues` manages three queue types: outpatient (advance-scheduled, never overfills), drop-in (walk-ins, fills remaining capacity), and follow-up (future-dated procedures with per-procedure slot capacity). Each day, follow-ups are processed before new arrivals so procedure slots are consumed before walk-ins are seen. See the [Queuing Engine](#the-queuing-engine--detailed) section for the full mechanics.
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    OPEN-SYSTEM PATIENT POOL                          │
+│                      (target: 15,000 patients)                       │
+│                                                                       │
+│  INFLOW 1 — Organic new patients                                      │
+│  10 new first-time patients/day arrive as drop-ins.                   │
+│  After their first visit they join the established cycling pool.      │
+│  These represent: women turning 21, new NYC residents,                │
+│  patients switching providers, first-time visitors.                   │
+│                                                                       │
+│  INFLOW 2 — Mortality replacements                                    │
+│  Up to 4 patients/day, spawned specifically to replace patients       │
+│  removed by the monthly mortality sweep. Prevents pool shrinkage.     │
+│  These enter directly as established cycling patients.                │
+│                                                                       │
+│  CYCLING CORE — Established patients                                  │
+│  ~15,000 patients with an annual appointment at their primary         │
+│  provider. Each visit triggers an immediate reschedule for the        │
+│  next 5 annual visits (multi-year advance scheduling window).         │
+│                                                                       │
+│  OUTFLOW 1 — Mortality                                                │
+│  Checked every 30 days. Age-specific Bernoulli draw per patient       │
+│  (US life tables). Dead patients exit and are replaced.               │
+│                                                                       │
+│  OUTFLOW 2 — LTFU / ineligible                                        │
+│  Patients who decline rescheduling, age permanently out of            │
+│  eligibility, or are lost in the clinical follow-up pathway.          │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-### `src/scenarios.py`
-Defines four co-scheduling scenarios for future comparative analysis: `baseline_fragmented` (current state — each provider screens only their domain), `gyn_coordinated` (GYN visits also identify lung-eligible patients and place LDCT referrals), `coordinated_all` (all due screenings bundled into one encounter), and `high_access_coordinated` (full co-scheduling plus reduced scheduling friction). Each scenario is a config dict with keys for `cancer_map`, `co_schedule`, `ltfu_multiplier`, `scheduling_delay_days`, and `capacity_multiplier`. Not yet wired to the main runner — reserved for the scenario analysis phase once clinical probabilities are calibrated.
+### The warmup period
 
----
+On simulation day 0, all 15,000 established patients are created and their first annual visits are **spread evenly across year 1** (the warmup window). This prevents a cold-start artifact where providers are empty on day 1 and fill up slowly — instead, from day 1 onwards, providers operate near capacity as they would in a real steady-state clinic.
 
-## Notebooks
+Each patient is also immediately pre-booked for their next **5 annual visits** (configurable via `ADVANCE_SCHEDULE_YEARS`), so the schedule book is filled years in advance from day 0.
 
-### `notebooks/02_screening.ipynb`
-Tests and validates the screening layer (`screening.py`) in isolation. Verifies eligibility logic across age groups and clinical profiles, confirms test modality assignment follows USPSTF age stratification, and runs Monte Carlo sampling (5,000 trials) to validate that result probability distributions match the configured values. A smoke test runs 30 patients through `run_screening_step()` and prints their event logs. Use this notebook to sanity-check `config.py` probability changes before running the full simulation.
+### Multi-year advance scheduling
 
-### `notebooks/03_results_followup.ipynb`
-Tests and demonstrates the follow-up pathways (`followup.py`) in isolation. Shows stochastic LTFU branching at each decision node (e.g., ASCUS → colposcopy referral with 20% LTFU), draws CIN grade distributions from result-conditional probabilities, and traces complete patient journeys from screening result through colposcopy and treatment. Useful for verifying that LTFU rates and CIN grade distributions match clinical expectations before integrating with the full runner.
+At any point in the simulation, every established patient has approximately 5 future annual appointments already booked. The mechanism:
 
-### `notebooks/04_simulation_runner.ipynb`
-End-to-end simulation notebook. Runs `SimulationRunner` for a configurable number of days, prints the clinical summary and revenue summary, and calls `plot_all()` to produce the four-panel chart (cervical funnel, lung funnel, Lung-RADS distribution, realized vs. foregone revenue). The primary notebook for running the simulation and viewing top-line results. Start here for a full run.
+- **Warmup:** each patient is scheduled for visits in years 1 through 5
+- **After each visit:** the far edge of the window is extended by one year (year N+5 is booked). The near-end appointments (years 2 through 5) were already in the queue from the previous visit's rescheduling
+- **Replacements:** new entrants are also immediately pre-booked for their first 5 annual visits
 
-### `notebooks/05_metrics_outputs.ipynb`
-Deep-dive analytics on simulation output. Loads results from a completed run and produces: cervical result breakdowns by age stratum (young/middle/older), full pathway funnels with drop-off percentages at each step, LTFU rates by node, wait-time distributions by resource, and a workflow comparison table (fragmented vs. coordinated). Also contains a matplotlib bar chart of the cervical result distribution. Use this notebook to diagnose where patients are dropping off and to compare scenarios once `scenarios.py` is wired in.
+This means that at year 35, the schedule already contains confirmed appointments through year 40 for every active patient.
 
-### `notebooks/06_scenario_analysis.ipynb`
-Compares all four co-scheduling scenarios on a shared, fixed patient cohort to isolate the effect of workflow changes from population sampling noise. Identifies age-clustering opportunities (patients in the 40–50 range eligible for multiple screenings simultaneously), runs all four scenarios on deep copies of the same patients, and produces side-by-side comparison tables for screening rate, LTFU rate, colposcopy completion, and encounter savings. Includes per-scenario cervical funnels and a multi-bar matplotlib plot comparing key rates across scenarios. This notebook is the eventual deliverable for the ROI analysis — it will be fully meaningful once LTFU multipliers and capacity adjustments in `scenarios.py` are calibrated against NYP data.
+### Vacancy filling
+
+When a patient dies, their future appointments remain in the scheduling queue as inactive records. Rather than letting those phantom bookings block new patients, `schedule_outpatient()` counts only **active** patients when checking slot capacity. This means a slot vacated by a deceased patient is immediately available to a replacement or organic new entrant — mirroring how a real scheduling desk would reassign a cancelled appointment.
+
+### Age-based drop-in priority
+
+> **NYP model assumption (revenue maximization):** When drop-in capacity is limited and some walk-in patients must be deferred to the next day, women aged 40+ receive priority over younger patients.
+
+**Rationale:** The 40+ cohort is disproportionately associated with higher-revenue procedures — colposcopy, LEEP, cone biopsy, and LDCT — so prioritising them when the drop-in queue exceeds available slots maximises expected revenue per available slot. This applies **only** to drop-in queue ordering. All scheduled outpatients retain their guaranteed slot regardless of age.
+
+### Scale interpretation
+
+| Simulation unit | Real-world equivalent |
+|---|---|
+| 1 simulated patient | 100 NYC eligible women |
+| 15,000 sim patients | ~1.5 million NYC eligible women |
+| 1 cervical screen | 100 cervical screens in the real NYC population |
+
+All volume outputs from the simulation should be multiplied by `POPULATION_SCALE_FACTOR = 100` when extrapolating to real-world planning figures.
+
+### What the 70-year run produces
+
+After a full 70-year run:
+
+| Metric | Approximate value (sim scale) |
+|---|---|
+| Total provider contacts | ~1.5 million |
+| Total cervical screens | ~310,000 |
+| Total lung LDCT screens | ~18,000 |
+| Total colposcopies | ~35,000 |
+| Total LEEP / cone treatments | ~8,500 |
+| Mortality exits | ~15,000 |
+| Pool stability | 15,000 throughout |
 
 ---
 
@@ -127,16 +182,17 @@ Compares all four co-scheduling scenarios on a shared, fixed patient cohort to i
 
 ### Time Model
 
-The simulation runs as a **day-by-day tick loop**. The clock is an integer (`day = 0, 1, 2, …, n_days - 1`). Every day, the runner:
+The simulation runs as a **day-by-day tick loop**. The clock is an integer (`day = 0, 1, 2, …, 25549`). Every day, in this exact order:
 
-1. Processes all follow-up appointments that are due today (before new arrivals)
-2. Generates new patient arrivals (Poisson draw)
-3. Routes arrivals to provider queues (outpatient or drop-in)
-4. Seats patients at each provider (respecting capacity)
-5. Runs screening and result routing for each seen patient
-6. Schedules future follow-up appointments for abnormal results
+1. **Mortality sweep** (every 30 days): age all patients; Bernoulli mortality draw per patient; remove the dead; queue replacements
+2. **Spawn replacements**: create up to 4 new established patients to refill the pool
+3. **Flush to database**: batch-write exited patients to SQLite (every 30 days)
+4. **Annual checkpoint** (every 365 days): snapshot cumulative stats for longitudinal plots
+5. **Follow-up appointments**: process all clinical follow-ups due today (colposcopy, LEEP, biopsy) before new arrivals
+6. **New arrivals**: create 10 organic new patients; route to provider queues
+7. **Provider queues**: seat patients (outpatients first, then age-prioritised drop-ins); screen seen patients; schedule follow-ups for abnormal results
 
-This order matters: follow-ups are processed first so that procedure slots (colposcopy, LEEP, biopsy) are consumed before the day's new patients arrive, accurately modeling finite capacity.
+This ordering matters: follow-ups consume procedure slots before new arrivals arrive, accurately modeling finite procedural capacity.
 
 ---
 
@@ -149,9 +205,9 @@ NYC Eligible Women Population
 ┌──────────────────────────────────────────────────────┐
 │  STEP 1 — ARRIVAL                                     │
 │  Patient enters via PCP / Gynecologist / Specialist / ER│
-│  70% outpatient (scheduled in advance)               │
+│  70% outpatient (scheduled in advance, up to 5 yrs)  │
 │  30% drop-in (walk-in, seen same day if capacity)    │
-│  ER patients are always drop-in                      │
+│  Drop-in priority: age 40+ seen before age <40       │
 └────────────────────────┬─────────────────────────────┘
                          │ patient "seen" by provider
                          ▼
@@ -163,17 +219,10 @@ NYC Eligible Women Population
 │             current smoker OR quit ≤15 years ago     │
 │                                                      │
 │  Not eligible → three outcomes:                      │
-│                                                      │
-│  1. Not yet eligible (turning 21 soon, current       │
-│     smoker approaching 20 pk-yrs, not yet 50)        │
-│     → schedule return visit at eligibility date      │
-│                                                      │
-│  2. Permanently ineligible (no cervix, aged out,     │
-│     never-smoker, quit window closed)                │
-│     → EXIT silently (no revenue impact)              │
-│                                                      │
-│  3. Eligible but screening not offered [future]      │
-│     → 50% reschedule / 50% EXIT (foregone revenue)  │
+│  1. Not yet eligible → schedule return at future date│
+│  2. Permanently ineligible → exit silently           │
+│  3. Established patient: ineligible but retained     │
+│     → reschedule annual visit (no screening)         │
 └────────────────────────┬─────────────────────────────┘
                          ▼
 ┌──────────────────────────────────────────────────────┐
@@ -202,14 +251,10 @@ NYC Eligible Women Population
 │    HPV_POSITIVE        → 40% 1-yr repeat / 60% colpo │
 │                                                      │
 │  Lung Lung-RADS v2022:                               │
-│    RADS 0              → results communicated →      │
-│                          repeat LDCT in 1–3 months   │
-│    RADS 1 / 2          → results communicated →      │
-│                          repeat LDCT in 12 months    │
-│    RADS 3              → results communicated →      │
-│                          repeat LDCT in 6 months     │
-│    RADS 4A / 4B / 4X  → results communicated →      │
-│                          biopsy pathway              │
+│    RADS 0              → repeat LDCT in 1–3 months  │
+│    RADS 1 / 2          → repeat LDCT in 12 months   │
+│    RADS 3              → repeat LDCT in 6 months    │
+│    RADS 4A / 4B / 4X  → biopsy pathway              │
 │    Any tier, no communication → LTFU                 │
 └────────────────────────┬─────────────────────────────┘
                          ▼
@@ -222,22 +267,29 @@ NYC Eligible Women Population
 │    LTFU check before treatment (10% drop)            │
 │                                                      │
 │  Lung biopsy chain (RADS 4A/4B/4X):                  │
-│    Referral made? → scheduled? → completed?          │
-│    → malignancy confirmed? → treatment given?        │
+│    Referral → scheduling → completion →              │
+│    malignancy confirmed → treatment given            │
 │    LTFU node at every step                           │
 └────────────────────────┬─────────────────────────────┘
                          ▼
 ┌──────────────────────────────────────────────────────┐
-│  STEP 6 — EXIT / RE-ENTRY                            │
-│  Treated      → surveillance loop                    │
-│  Surveillance → returns at screening interval        │
-│  LTFU / untreated → exits system                     │
+│  STEP 6 — EXIT OR RE-ENTRY                           │
+│                                                      │
+│  Treated established patient →                       │
+│    re-activated; rescheduled for next annual visit   │
+│                                                      │
+│  Established patient LTFU from cancer pathway →      │
+│    re-activated; still cycles annually               │
+│    (LTFU from a specific pathway ≠ leaving the pool) │
+│                                                      │
+│  New patient LTFU / permanently ineligible → EXIT    │
+│  Mortality → EXIT; slot freed; replacement spawned   │
 └──────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## The Queuing Engine — Detailed
+## The Queuing Engine
 
 The queue engine lives in `runner.py` and is the architectural core of the simulation. It manages three distinct queue types, each with different scheduling and capacity semantics.
 
@@ -245,97 +297,88 @@ The queue engine lives in `runner.py` and is the architectural core of the simul
 
 ```
 PatientQueues
-├── outpatient[provider][day]   → list[Patient]   Scheduled appointments
-├── dropin[provider]            → list[Patient]   Today's walk-ins
-├── followup[day]               → list[(Patient, context)]  Future procedures
-└── daily_slots[day][procedure] → int             Remaining slots per procedure
+├── outpatient[provider][day]    → list[Patient]          Scheduled appointments
+├── dropin[provider]             → list[Patient]          Today's walk-ins
+├── followup[day]                → list[(Patient, context)] Future clinical procedures
+└── daily_slots[day][procedure]  → int                    Remaining procedure slots
 ```
 
 ---
 
-### Queue Type 1: Outpatient Scheduling
+### Queue Type 1 — Outpatient Scheduling (advance, guaranteed)
 
-Outpatients call ahead and book a future appointment. The scheduler finds the **earliest available day** on or after a lead-time window:
+Outpatients call ahead and book a future appointment. The scheduler finds the **earliest available day** on or after a lead-time window. Slot availability is determined by counting only **active** patients — a slot vacated by a deceased patient becomes available immediately to the next booking:
 
 ```python
 def schedule_outpatient(self, p, provider, earliest_day) -> int:
-    cap = _outpatient_cap(provider)   # e.g., 24 for GYN (80% of 30 slots)
+    cap = _outpatient_cap(provider)        # e.g., 38 for PCP (75% of 70 slots = 52)
     day = earliest_day
-    while len(self.outpatient[provider][day]) >= cap:
-        day += 1                      # push forward until a slot opens
+    while sum(1 for q in self.outpatient[provider][day] if q.active) >= cap:
+        day += 1                           # push forward until a slot opens
     self.outpatient[provider][day].append(p)
     return day
 ```
 
-**Key property:** The scheduler never overfills a day. Outpatient slots are always guaranteed — the scheduler will push the appointment as far forward as needed to find a free slot. This models a realistic booking system where patients get a confirmed date.
+**Capacity guarantee:** The scheduler never overfills a day. Outpatient slots are always guaranteed — the scheduler will push the appointment as far forward as needed to find a free slot, but never double-books. A hard assertion fires immediately if this invariant is ever violated, preventing silent capacity bugs.
 
-Lead-time windows (from `config.py`):
+**Multi-year advance booking:** In stable-population mode, established patients are pre-booked for the next 5 annual visits at all times. After each visit, `_reschedule_established()` adds the appointment at the far end of the window (5 years out), so the schedule book stays filled:
+
+```
+Patient visit on day 1825 (year 5)
+  → already has appointments booked for years 6, 7, 8, 9 (from previous rescheduling)
+  → _reschedule_established() adds year 10 booking
+  → patient now has years 6–10 confirmed in queue
+```
+
+Lead-time windows for new (non-established) outpatients:
 - PCP: 1–7 days
-- Gynecologist: 7–28 days
-- Specialist: 14–60 days
+- Gynecologist: 7–21 days
+- Specialist: 14–28 days
 
 ---
 
-### Queue Type 2: Drop-In Processing
+### Queue Type 2 — Drop-In Processing (same-day, age-prioritised)
 
-Drop-ins arrive and want to be seen today. On each tick, the runner processes them after seating outpatients:
+Drop-ins arrive and want to be seen today. Before applying the capacity cut, the drop-in list is sorted so women aged 40+ appear first (NYP revenue-maximisation assumption). Then the queue is sliced to available capacity:
 
 ```python
 def process_day(self, provider, day):
     outpt_cap  = _outpatient_cap(provider)
     dropin_cap = _dropin_cap(provider)
+    total_cap  = outpt_cap + dropin_cap        # = PROVIDER_CAPACITY[provider]
 
-    # 1. Seat all scheduled outpatients (guaranteed capacity)
+    # All scheduled outpatients are always seated
     seen_outpts = self.outpatient[provider].pop(day, [])
 
-    # 2. Drop-ins fill remaining capacity, including unused outpatient slots
-    extra         = max(0, outpt_cap - len(seen_outpts))
-    available     = dropin_cap + extra
-    today_dropins = list(self.dropin.get(provider, []))
-    seen_dropins  = today_dropins[:available]
-    overflow      = today_dropins[available:]
-    self.dropin[provider] = []        # clear queue regardless
+    # Sort drop-ins: age 40+ first, then under-40 (stable sort preserves arrival order)
+    remaining     = max(0, total_cap - len(seen_outpts))
+    today_dropins = sorted(dropin[provider], key=lambda p: (0 if p.age >= 40 else 1))
+    seen_dropins  = today_dropins[:remaining]
+    overflow      = today_dropins[remaining:]  # deferred to tomorrow
 
     return seen_outpts + seen_dropins, overflow
 ```
 
-**Key insight:** If fewer outpatients show up than their reserved cap (common in the early days of the sim before the schedule fills), those unused slots roll over to drop-ins. This maximizes utilization and matches how real clinic operations work.
+**Key insight:** If fewer outpatients show up than their reserved cap (e.g., due to some having died since booking), those unused slots roll over to drop-ins on the same day. The total capacity is never wasted.
 
 **Overflow routing:**
-- **PCP / GYN / Specialist overflow:** Patient is re-added to tomorrow's drop-in queue for the same provider. Wait time grows by 1 day.
-- **ER overflow:** 70% retry the ER tomorrow. 30% are converted to a scheduled outpatient appointment at a random non-ER provider (PCP, GYN, or Specialist), earliest available slot.
-
-Wait time is recorded as `day_seen - day_created` and logged per resource in `metrics["wait_times"]`.
+- PCP / GYN / Specialist overflow: patient re-added to tomorrow's drop-in queue for the same provider; wait time grows by 1 day
+- ER overflow: 70% retry ER tomorrow; 30% converted to a scheduled outpatient appointment at a random non-ER provider
 
 ---
 
-### Queue Type 3: Follow-Up Scheduling
+### Queue Type 3 — Follow-Up Scheduling (future-dated procedures)
 
-After a screening event produces an actionable result (abnormal Pap, RADS 4 lung), the patient is placed in a future-day follow-up queue:
+After a screening event produces an actionable result (abnormal Pap, RADS 4 lung finding), the patient is placed in a future-day follow-up queue:
 
 ```python
 def schedule_followup(self, p, context, due_day) -> None:
     self.followup[due_day].append((p, context))
 ```
 
-The `context` dict carries the clinical state: `{"cancer": "cervical", "step": "colposcopy"}` or `{"cancer": "lung", "step": "biopsy"}`.
+The `context` dict carries clinical state: `{"cancer": "cervical", "step": "colposcopy"}`.
 
-On the due day, follow-ups are processed **before** new arrivals in `_tick()`:
-
-```python
-def _tick(self, day):
-    # Step 1: Process follow-ups first (consumes procedure slots before walk-ins)
-    for p, context in self._queues.get_due_followups(day):
-        self._run_followup(p, context, day)
-
-    # Step 2: Generate arrivals
-    self._generate_arrivals(day)
-
-    # Step 3: Process provider queues
-    for provider in _ALL_PROVIDERS:
-        seen, overflow = self._queues.process_day(provider, day)
-        ...
-```
+On the due day, follow-ups are processed **before** new arrivals in `_tick()`, so procedure slots are consumed before any walk-ins are seen. This accurately models the real-world situation where scheduled procedures take priority over same-day demand.
 
 ---
 
@@ -350,77 +393,136 @@ def consume_slot(self, procedure, day) -> bool:
     if self.daily_slots[day][procedure] > 0:
         self.daily_slots[day][procedure] -= 1
         return True
-    return False   # fully booked today
+    return False   # fully booked today — patient requeued for tomorrow
 ```
 
-**If no slot is available**, the patient is re-queued for tomorrow's same step:
+If no slot is available, the patient is re-queued for tomorrow's same step, creating realistic queue build-up under high demand.
+
+---
+
+### How a Full Patient Journey Flows Through the Queues
+
+```
+Day 0 (warmup):   Patient scheduled for annual visit on day 47
+                  Pre-booked for days 412, 777, 1142, 1507 (years 2–5)
+
+Day 47:           Patient seen at GYN
+                  → cervical screen: HSIL result drawn
+                  → schedule_followup({step: colposcopy}, due_day=77)
+                  → _reschedule_established() books year-6 visit (day 1872)
+
+Day 77:           _run_followup() called
+                  → consume_slot("colposcopy", 77)?
+                      NO  → re-queue for day 78 (slot contention)
+                      YES → CIN3 drawn
+                          → run_treatment(): LTFU check (10%)
+                              PASS → schedule_followup({step: leep}, due_day=91)
+
+Day 91:           → consume_slot("leep", 91)? YES
+                  → LEEP completed; treatment revenue recorded
+                  → patient re-activated; continues annual cycling
+```
+
+---
+
+## The Database Layer
+
+### Why a database?
+
+A 70-year simulation with 15,000 cycling patients produces hundreds of thousands of patient records and millions of individual events. Keeping everything in memory throughout the run is wasteful and prevents post-run analysis. `db.py` adds a zero-infrastructure SQLite persistence layer that:
+
+- Writes exited patient records to disk in **batch** (every 30 days) rather than row-by-row, keeping the simulation hot loop fast
+- Enables **SQL queries after the run** — e.g., "show me all patients who had a CIN3 diagnosis and then died before treatment" — which is impossible from the metrics dict alone
+- Provides **longitudinal tracking** across the 70-year horizon: patient IDs are stable, so a patient who entered in year 1 can be traced through all their visits until mortality in year 55
+- Uses **WAL mode** (Write-Ahead Logging) so notebooks can run summary queries while the simulation is still writing
+
+### Schema
+
+```sql
+-- One row per patient (written when the patient exits the system)
+CREATE TABLE patients (
+    patient_id                INTEGER PRIMARY KEY,
+    age_at_entry              INTEGER,
+    age_at_exit               INTEGER,
+    race                      TEXT,
+    insurance                 TEXT,
+    is_established            INTEGER,   -- 1 = cycling pool patient; 0 = one-time visitor
+    simulation_entry_day      INTEGER,
+    exit_day                  INTEGER,
+    exit_reason               TEXT,      -- mortality | lost_to_followup | untreated | ineligible
+    visit_count               INTEGER,   -- total provider visits recorded
+    has_cervix                INTEGER,
+    smoker                    INTEGER,
+    pack_years                REAL,
+    cervical_result           TEXT,      -- last cervical screening result
+    lung_result               TEXT,      -- last lung screening result
+    colposcopy_result         TEXT,      -- last colposcopy result (if any)
+    treatment_type            TEXT,      -- surveillance | leep | cone_biopsy (if any)
+    last_cervical_screen_day  INTEGER,   -- simulation day of last cervical screen (-1 = never)
+    last_lung_screen_day      INTEGER    -- simulation day of last lung screen (-1 = never)
+);
+
+-- Full timestamped event log for every patient
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id  INTEGER,
+    day         INTEGER,
+    event       TEXT,
+    FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
+);
+```
+
+Indexes are created on `exit_reason`, `is_established`, `race`, `last_cervical_screen_day`, `last_lung_screen_day`, `patient_id`, and `day` for fast post-run queries.
+
+### Batch-write pattern
+
+Patients are held in an in-memory flush buffer throughout the simulation and written to SQLite in bulk every `DB_FLUSH_INTERVAL = 30` days. A single `executemany` call handles the whole batch — one database transaction regardless of batch size. This gives ~100–1000× better write throughput than per-row commits.
+
+All writes use `INSERT OR IGNORE` — if the simulation is restarted after a crash, re-flushing a patient already in the database is a silent no-op. This makes the database idempotent.
+
+### Querying the database after a run
 
 ```python
-if not self._queues.consume_slot("colposcopy", day):
-    self._queues.schedule_followup(
-        p, {"cancer": "cervical", "step": "colposcopy"}, day + 1
-    )
-    return
+sim = SimulationRunner(n_days=cfg.SIM_DAYS, use_stable_population=True,
+                       db_path="nyp_70yr.db", reset_db=True)
+metrics = sim.run()
+
+# Built-in summary
+sim.db_summary()
+
+# Ad-hoc SQL via sim._db.query()
+rows = sim._db.query("""
+    SELECT race, AVG(age_at_exit) AS mean_age_exit, COUNT(*) AS n
+    FROM patients
+    WHERE exit_reason = 'mortality'
+    GROUP BY race
+    ORDER BY n DESC
+""")
+
+# Trace one patient's complete journey
+history = sim._db.get_patient_history(patient_id=42)
+for day, event in history:
+    print(f"Day {day:>5}: {event}")
+
+sim.close_db()   # always close explicitly after all queries
 ```
 
-This creates realistic queue buildup. If LDCT capacity is 4 slots/day and 10 RADS 4 patients all need biopsies on the same day, 6 of them wait — their biopsy delay is real time in the simulation.
+### `last_cervical_screen_day` and `last_lung_screen_day`
 
-Default capacities (from `config.CAPACITIES`, all PLACEHOLDER — replace with NYP actuals):
+Every patient record in the database carries the simulation day of their most recent cervical screening and their most recent lung LDCT. These fields enable queries like:
 
-| Procedure | Slots/day |
-|---|---|
-| Cytology | 8 |
-| HPV co-test | 6 |
-| LDCT | 4 |
-| Colposcopy | 3 |
-| LEEP | 2 |
-| Cone biopsy | 1 |
-| Lung biopsy | 2 |
+```sql
+-- Patients who were last screened more than 3 years before they died
+SELECT COUNT(*) FROM patients
+WHERE exit_reason = 'mortality'
+  AND last_cervical_screen_day >= 0
+  AND (exit_day - last_cervical_screen_day) > 1095;
 
----
-
-### How Cervical Follow-Up Flows Through the Queue
-
-```
-Day N:   Abnormal Pap result drawn during screening encounter
-         → schedule_followup(p, {cancer: cervical, step: colposcopy}, day=N+30)
-
-Day N+30: _run_followup() called
-          → consume_slot("colposcopy", N+30)?
-              NO  → re-queue for day N+31 (slot contention)
-              YES → run_colposcopy() → CIN grade drawn
-                    → run_treatment() → LTFU check (10% drop)
-                        LTFU  → p.exit_reason = "lost_to_followup"
-                        CIN1  → surveillance (no further steps)
-                        CIN2+ → schedule_followup({step: leep}, day=N+30+14)
-
-Day N+44: _run_followup() called
-          → consume_slot("leep", N+44)?
-              NO  → re-queue for day N+45
-              YES → procedure complete; treatment revenue recorded
-```
-
----
-
-### How Lung Follow-Up Flows Through the Queue
-
-```
-Day N:   LDCT completed during screening encounter
-         → run_lung_followup() called immediately (result communication + RADS routing)
-             LTFU at communication? (10%) → exit
-             RADS 0/1/2/3 → set next_ldct_day on patient; no queue entry
-             RADS 4A/4B → schedule_followup({step: biopsy}, day=N+14)
-
-Day N+14: _run_followup() called
-          → consume_slot("lung_biopsy", N+14)?
-              NO  → re-queue for day N+15
-              YES → biopsy steps run:
-                    referral placed? (80%) → LTFU if no
-                    biopsy scheduled? (78%) → LTFU if no
-                    biopsy completed? (88%) → LTFU if no
-                    malignancy confirmed? (25%)
-                      NO  → benign; resume surveillance
-                      YES → treatment given? (92%) → LTFU if no
+-- Average days between last cervical screen and exit, by insurance type
+SELECT insurance, AVG(exit_day - last_cervical_screen_day) AS avg_gap
+FROM patients
+WHERE last_cervical_screen_day >= 0
+GROUP BY insurance;
 ```
 
 ---
@@ -440,9 +542,9 @@ def _poisson(lam: float) -> int:
 
 **Distribution:** Normal approximation to Poisson(`λ = 200`).
 
-**Why Poisson:** Patient arrivals at a clinic are the canonical Poisson process — a large number of independent individuals each with a small probability of showing up on any given day. The Poisson distribution is the standard model for count data of this type (unscheduled, memoryless, non-negative integer). For large `λ` (≥ ~30), the Poisson and Normal distributions are nearly identical, so `gauss(λ, √λ)` is used as a computationally simple approximation that avoids implementing a true Poisson sampler.
+**Why Poisson:** Patient arrivals at a clinic are the canonical Poisson process — a large number of independent individuals each with a small probability of showing up on any given day. For large `λ` (≥ ~30), `gauss(λ, √λ)` is a computationally simple approximation that avoids implementing a true Poisson sampler.
 
-**Parameters:** `λ = 200` daily patients (PLACEHOLDER — mirrors Sophia's arrival model). This produces a standard deviation of ~14 patients/day (`√200 ≈ 14.1`), meaning on a typical day you'd see anywhere from ~172 to ~228 patients (±2 SD). Replace `DAILY_PATIENTS` with NYP throughput data for the target clinics.
+**Parameters:** `λ = 200` daily patients total across all providers (PLACEHOLDER). This produces a standard deviation of ~14 patients/day (`√200 ≈ 14.1`). Replace `DAILY_PATIENTS` with NYP throughput data.
 
 ---
 
@@ -453,17 +555,9 @@ DESTINATION_PROBS = {"pcp": 0.35, "gynecologist": 0.25, "specialist": 0.20, "er"
 dest = random.choices(destinations, weights=weights)[0]
 ```
 
-**Distribution:** Categorical (single draw from a weighted discrete distribution).
+**Distribution:** Categorical — one draw from a weighted discrete distribution.
 
-**Why Categorical:** Each patient goes to exactly one provider destination. A categorical draw is the natural model — one outcome from a mutually exclusive, exhaustive set of options. The weights encode the relative volume at each entry point.
-
-**Parameters (all PLACEHOLDER):**
-- **PCP 35%:** Primary care is the most common entry point; PCPs see the broadest patient mix and are the most likely to identify screening-eligible patients incidentally during general visits.
-- **Gynecologist 25%:** Second-highest volume; GYN visits are the natural home for cervical screening and the primary co-scheduling target for the coordinated-care scenarios.
-- **Specialist 20%:** Pulmonology, oncology, internal medicine — providers likely to encounter lung-eligible patients (older, smoking history). Lower volume than PCP/GYN.
-- **ER 20%:** Emergency visits; screening is rarely the primary reason but ER patients may be the hardest-to-reach population (uninsured, lack of PCP). High LTFU expected from this channel.
-
-Replace with actual visit-volume proportions from NYP scheduling data.
+**Parameters (all PLACEHOLDER):** PCP 35% / GYN 25% / Specialist 20% / ER 20%. Replace with actual visit-volume proportions from NYP scheduling data.
 
 ---
 
@@ -471,14 +565,9 @@ Replace with actual visit-volume proportions from NYP scheduling data.
 
 ```python
 PATIENT_TYPE_PROBS = {"outpatient": 0.70, "drop_in": 0.30}
-ptype = random.choices(types, weights=weights)[0]
 ```
 
-**Distribution:** Bernoulli (binary categorical — two outcomes).
-
-**Why Bernoulli:** Each patient is either scheduled in advance or a walk-in. There is no middle ground. A weighted binary draw is the simplest correct model.
-
-**Parameters (PLACEHOLDER):** 70% outpatient / 30% drop-in. This ratio reflects the fact that most clinic visits at an academic medical center are pre-scheduled, but a meaningful fraction are same-day or walk-in (urgent care, ER, patients calling for a same-day slot). The ER is always drop-in regardless of this setting. Replace with NYP patient-type data per clinic.
+**Distribution:** Bernoulli — 70% outpatient (advance-scheduled), 30% drop-in (walk-in). ER is always drop-in regardless of this setting. Replace with NYP patient-type data per clinic.
 
 ---
 
@@ -489,16 +578,7 @@ OUTPATIENT_LEAD_DAYS = {"pcp": (1, 7), "gynecologist": (7, 21), "specialist": (1
 earliest = day + random.randint(lo, hi)
 ```
 
-**Distribution:** Discrete Uniform over `[lo, hi]` days.
-
-**Why Uniform:** Lead time depends on scheduling availability, which varies day-to-day based on cancellations and slot releases. Without detailed scheduling data, a uniform distribution over a plausible range is the minimum-assumption model — it says "we know the earliest and latest typical wait, but have no reason to prefer any particular day within that window." It is a deliberate placeholder for a more calibrated distribution (e.g., empirical from NYP scheduling data, or a shifted Geometric if next-available-slot logic were modeled explicitly).
-
-**Parameters (all PLACEHOLDER):**
-- **PCP 1–7 days:** PCPs have high throughput and relatively short waits; patients can often get in within the week.
-- **Gynecologist 7–21 days:** GYN scheduling is tighter; 1–3 weeks is typical for a non-urgent visit.
-- **Specialist 14–28 days:** Specialty appointments have the longest lead times; 2–4 weeks reflects the reality of limited specialist slots.
-
-Replace with NYP scheduling data. If the distribution turns out to be skewed (many short waits, occasional very long waits), a log-normal or empirical distribution would be more appropriate.
+**Distribution:** Discrete Uniform over `[lo, hi]` days. Chosen as the minimum-assumption model for scheduling wait times; replace with empirical distributions from NYP scheduling data when available.
 
 ---
 
@@ -510,37 +590,7 @@ outpatient_slots = int(total_capacity * fraction)
 dropin_slots     = total_capacity - outpatient_slots
 ```
 
-**Distribution:** Deterministic (fixed fraction of total daily capacity).
-
-**Why deterministic:** The split between reserved outpatient slots and open drop-in slots is an operational policy decision, not a random variable. A clinic sets this ratio in advance (e.g., "we hold 30 of 40 PCP slots for scheduled patients"). Using a fixed fraction accurately models that policy and makes it easy to test the effect of changing the ratio in scenario analysis.
-
-**Parameters (PLACEHOLDER):**
-- **PCP:** 75% outpatient (30 slots), 25% drop-in (10 slots) — high throughput; enough drop-in capacity for urgent same-day needs.
-- **GYN:** ~73% outpatient (22 slots), ~27% drop-in (8 slots) — slightly higher drop-in share than PCP; GYN sees more urgent gynecologic complaints.
-- **Specialist:** 75% outpatient (15 slots), 25% drop-in (5 slots) — small absolute drop-in capacity reflects that specialist walk-ins are uncommon.
-- **ER:** 0% outpatient — ER is entirely drop-in by design; no advance scheduling.
-
-An important queue property: unused outpatient slots roll over to drop-ins on the same day (a patient who cancels their GYN slot frees it for a walk-in). This is implemented in `process_day()` via `extra = max(0, outpt_cap - len(seen_outpts))`.
-
----
-
-### ER Overflow Routing — Bernoulli
-
-```python
-ER_OVERFLOW_RETRY_PROB = 0.70
-if random.random() < ER_OVERFLOW_RETRY_PROB:
-    re-queue for ER tomorrow
-else:
-    schedule outpatient at random non-ER provider
-```
-
-**Distribution:** Bernoulli(`p = 0.70`).
-
-**Why Bernoulli:** When an ER patient cannot be seen today (capacity full), they face a binary decision: return to the ER tomorrow, or accept a scheduled outpatient appointment elsewhere. A Bernoulli draw captures this binary choice. The probability `p` encodes the relative likelihood of each path.
-
-**Parameters (PLACEHOLDER):** 70% retry ER / 30% convert to outpatient. This reflects the intuition that most ER overflow patients have urgent or undifferentiated complaints that keep them in the ED pathway, while a minority are willing and able to wait for a scheduled appointment at a less acute setting. The 30% conversion rate is a key lever in scenario analysis — if it increases, more patients enter the scheduled system with better continuity-of-care, which is favorable for screening follow-through.
-
-**Non-ER overflow** (PCP, GYN, Specialist) is deterministic: every overflow patient re-queues for the same provider tomorrow. There is no Bernoulli draw because these patients have an established relationship with a specific provider and a scheduled appointment — leaving that queue for a different provider would break continuity.
+**Distribution:** Deterministic — the split between reserved outpatient slots and open drop-in slots is an operational policy decision, not a random variable. Unused outpatient slots roll over to drop-ins on the same day, maximising utilisation.
 
 ---
 
@@ -551,22 +601,11 @@ FOLLOWUP_DELAY_DAYS = {
     "colposcopy":  30,   # abnormal result → colposcopy appointment
     "leep":        14,   # colposcopy → LEEP procedure
     "cone_biopsy": 21,   # colposcopy → cone biopsy
-    "lung_biopsy": 14,   # RADS 4 → biopsy
+    "lung_biopsy": 14,   # RADS 4 → CT-guided biopsy
 }
-due_day = current_day + FOLLOWUP_DELAY_DAYS[step]
 ```
 
-**Distribution:** Deterministic (fixed offset from the triggering event).
-
-**Why deterministic:** These delays represent standard scheduling targets — the number of days a provider aims for between an abnormal result and the next procedure. Using a fixed value rather than a random draw makes the model easier to interpret and to calibrate: you can directly compare the simulated delay to NYP's actual scheduling data and adjust the single number. If scheduling data shows high variance (e.g., colposcopy wait times range 14–60 days depending on clinic load), this can be replaced with a Uniform or log-normal draw.
-
-**Parameters (all PLACEHOLDER):**
-- **Colposcopy 30 days:** ASCCP guidance suggests colposcopy within 4 weeks of an abnormal result; 30 days is the modeled target.
-- **LEEP 14 days:** Treatment follows colposcopy quickly for CIN2/3; 2 weeks is the standard scheduling target post-diagnosis.
-- **Cone biopsy 21 days:** Slightly longer than LEEP due to OR scheduling complexity.
-- **Lung biopsy 14 days:** ACR and NCCN guidelines recommend timely workup for RADS 4 findings; 14 days is the modeled target.
-
-These delays are a primary lever in co-scheduling scenario analysis — the `gyn_coordinated` and `coordinated_all` scenarios will reduce these values to model the effect of streamlined same-system care.
+**Distribution:** Deterministic (fixed offset from the triggering event). These delays are a primary lever in co-scheduling scenario analysis — coordinated-care scenarios will reduce these values to model streamlined same-system care.
 
 ---
 
@@ -589,44 +628,29 @@ LTFU is checked explicitly at every clinical decision node, not applied as a bul
 
 > All values are PLACEHOLDERs. Replace with NYP EHR-derived attrition rates.
 
----
-
-## Module Reference
-
-### `config.py` — Central Configuration
-
-Every tunable value lives here. Change once, everything picks it up.
-
-| Section | Contents |
-|---|---|
-| `ACTIVE_CANCERS` | Toggle which pathways run |
-| `DAILY_PATIENTS` | Expected arrivals per day |
-| `DESTINATION_PROBS` | Provider routing weights |
-| `PATIENT_TYPE_PROBS` | Outpatient vs. drop-in mix |
-| `PROVIDER_CAPACITY` | Daily slot counts per provider |
-| `OUTPATIENT_FRACTION` | Fraction of slots reserved for outpatients |
-| `OUTPATIENT_LEAD_DAYS` | Scheduling lead-time range per provider |
-| `ER_OVERFLOW_RETRY_PROB` | Probability ER overflow retries ER (vs. converts to outpatient) |
-| `ELIGIBILITY` | Age ranges and clinical criteria per cancer |
-| `SCREENING_INTERVALS_DAYS` | Recurrence interval per test |
-| `CERVICAL_RESULT_PROBS` | Multinomial result probabilities (age + test stratified) — PLACEHOLDER |
-| `LUNG_RADS_PROBS` | Lung-RADS v2022 category distribution — PLACEHOLDER |
-| `LUNG_PATHWAY_PROBS` | Completion probability at each pre/post-LDCT step — PLACEHOLDER |
-| `LUNG_RADS_REPEAT_INTERVALS` | Days until repeat LDCT by RADS category |
-| `COLPOSCOPY_RESULT_PROBS` | CIN grade conditional on triggering result — PLACEHOLDER |
-| `TREATMENT_ASSIGNMENT` | CIN grade → treatment modality |
-| `LTFU_PROBS` | Drop-out rates at each clinical decision node — PLACEHOLDER |
-| `PROCEDURE_REVENUE` | Revenue per procedure (CPT-referenced) — PLACEHOLDER |
-| `CAPACITIES` | Daily slot counts per procedure type |
-| `FOLLOWUP_DELAY_DAYS` | Days to follow-up appointment by type |
-
-> ⚠️ All probability and revenue values are **PLACEHOLDERS**. Replace with NYP EHR-derived rates and finance data as they become available.
+**Important for established patients:** LTFU from a specific cancer pathway does *not* remove an established patient from the provider pool. They are re-activated after the LTFU event and rescheduled for their next annual visit. They will be screened again at the next visit if they are still eligible. This models the real-world pattern where a patient misses a colposcopy but still shows up for their annual physical the following year.
 
 ---
 
-### `patient.py` — Patient Dataclass
+## Source Files
 
-A single `Patient` dataclass is the shared data contract across all modules. Every module reads from and writes to the same object — no copies, no translation layers.
+### `src/config.py`
+The single source of truth for every tunable value in the simulation. All clinical probabilities (result distributions, LTFU rates, pathway completion rates), revenue rates, provider capacities, scheduling parameters, eligibility criteria, stable-population parameters, and database settings live here. Changing a value in `config.py` propagates everywhere — no other file needs to be touched.
+
+Key stable-population parameters:
+- `SIMULATED_POPULATION = 15_000` — established cycling patient pool size
+- `POPULATION_SCALE_FACTOR = 100` — 1 sim patient = 100 NYC women
+- `ORGANIC_NEW_PATIENT_DAILY_RATE = 10` — first-time visitors entering daily
+- `NEW_PATIENT_DAILY_RATE = 4` — mortality replacement rate (max per day)
+- `ADVANCE_SCHEDULE_YEARS = 5` — years of appointments pre-booked per patient
+- `ANNUAL_VISIT_INTERVAL = 365` — days between established patient visits
+- `MORTALITY_CHECK_DAYS = 30` — mortality sweep frequency
+- `AGE_PRIORITY_THRESHOLD = 40` — age above which drop-in patients get queue priority
+
+---
+
+### `src/patient.py`
+Defines the `Patient` dataclass — the shared data contract between every module. A single `Patient` object is created on arrival and passed through eligibility, screening, follow-up, and exit without copying.
 
 | Field group | Fields |
 |---|---|
@@ -638,51 +662,41 @@ A single `Patient` dataclass is the shared data contract across all modules. Eve
 | Results | `cervical_result`, `lung_result` |
 | Cervical follow-up | `colposcopy_result`, `treatment_type` |
 | Lung follow-up | `lung_referral_placed`, `lung_ldct_scheduled`, `lung_biopsy_result` |
-| Exit | `exit_reason` |
+| Longitudinal tracking | `is_established`, `age_at_entry`, `simulation_entry_day`, `visit_count`, `next_visit_day` |
+| Exit | `exit_day`, `exit_reason` |
 | Log | `event_log` — timestamped list of every event |
 
 Helper methods: `p.log(day, event)`, `p.exit_system(day, reason)`, `p.print_history()`.
 
 ---
 
-### `population.py` — Population Sampler
+### `src/population.py`
+Generates individual `Patient` objects sampled from NYC demographic distributions. The public interface is `sample_patient(patient_id, day_created, destination, patient_type) → Patient`. Also provides:
+- `generate_established_population(n, start_pid, entry_day)` — creates the initial 15,000-patient cohort for warmup
+- `get_mortality_prob(age)` — age-specific annual death probability from US life tables
+- `draw_mortality(p, sweep_days)` — Bernoulli draw scaled to sweep interval: `p_die ≈ annual_rate × (N / 365)`
 
-Generates individual patients from NYC distributions:
-
-```python
-sample_patient(patient_id, day_created, destination, patient_type) -> Patient
-```
-
-Current stub draws from:
-- **Age:** weighted brackets (18% age 21–29, 22% 30–39, 20% 40–49, etc.)
-- **Race:** White 32%, Black 22%, Hispanic 28%, Asian 13%, Other 5%
-- **Insurance:** Commercial 45%, Medicaid 30%, Medicare 15%, Uninsured 10%
-- **Smoking:** 13% current; ~30% of non-smokers are former smokers with 5–40 pack-years
-- **HPV:** 25% positive baseline, adjusted by vaccination by age cohort
-- **Hysterectomy:** prevalence increasing with age (1% at 21–39 → 18% at 60–80)
-
-**To replace:** drop Yutong's code into the function body. No other files change — the function signature is the stable interface.
+**To replace the sampler:** drop new code into the body of `sample_patient()`. No other files change — the function signature is the stable interface.
 
 ---
 
-### `screening.py` — Steps 2–3
+### `src/screening.py`
+Implements Steps 2–3 of the patient journey: eligibility determination, future eligibility estimation, test assignment, and result draws.
 
 | Function | Purpose |
 |---|---|
-| `get_eligible_screenings(p)` | Returns cancer types patient qualifies for (filtered by `ACTIVE_CANCERS`) |
-| `days_until_eligible(p, cancer)` | Days until patient becomes eligible (`0` = now, `>0` = future date, `-1` = never) |
-| `is_due_for_screening(p, cancer, day)` | Checks whether screening interval has elapsed |
-| `get_cervical_age_stratum(age)` | Maps age → `"young"` / `"middle"` / `"older"` |
+| `get_eligible_screenings(p)` | Returns cancer types patient qualifies for right now |
+| `days_until_eligible(p, cancer)` | `0` = eligible now, `>0` = future date, `-1` = never |
+| `is_due_for_screening(p, cancer, day)` | Whether screening interval has elapsed |
 | `assign_screening_test(p, cancer)` | Picks test modality (age-stratified for cervical) |
-| `draw_cervical_result(p, test)` | Multinomial result draw; applies 1.5–1.8× inflation for HPV+ or prior CIN |
-| `draw_lung_rads_result()` | Lung-RADS v2022 category draw |
-| `run_lung_pre_ldct(p, day, metrics)` | Pre-LDCT pathway: referral → scheduling → LTFU nodes |
-| `run_screening_step(p, cancer, day, metrics)` | Full screening event: eligibility → test → result |
-| `handle_unscreened(p, day)` | Reserved: decision node for eligible patients not offered screening (future use) |
+| `draw_cervical_result(p, test)` | Multinomial result draw; 1.5–1.8× inflation for HPV+ or prior CIN |
+| `run_lung_pre_ldct(p, day, metrics)` | Pre-LDCT nodes: referral placed → LDCT scheduled → LTFU |
+| `run_screening_step(p, cancer, day, metrics)` | Full screening event for one cancer |
 
 ---
 
-### `followup.py` — Steps 4–5
+### `src/followup.py`
+Implements Steps 4–5: result routing and clinical follow-up pathways for both cancers.
 
 | Function | Purpose |
 |---|---|
@@ -692,43 +706,14 @@ Current stub draws from:
 | `run_cervical_followup(p, day, metrics)` | Full cervical pipeline orchestrator |
 | `run_lung_followup(p, day, metrics)` | Full lung pipeline: RADS routing → biopsy chain |
 
-LTFU is checked explicitly at every clinical decision node — not as a bulk end-of-pathway draw.
-
 ---
 
-### `metrics.py` — Metrics and Revenue
+### `src/metrics.py`
+Collects and aggregates all simulation outputs. Key additions for longitudinal analysis:
+- `year_checkpoints` — list of per-year snapshots (pool size, cumulative screens, LEEP, lung biopsy, LTFU, mortality, total patient contacts) for time-series visualisation
+- `pool_size_snapshot` — monthly pool size for stability plots
 
-| Function | Purpose |
-|---|---|
-| `initialize_metrics()` | Fresh metrics dict for one run |
-| `record_screening(metrics, p, cancer, result)` | Log a completed screening |
-| `record_exit(metrics, reason)` | Log a patient exit |
-| `compute_rates(metrics)` | Screening rate, abnormal rate, LTFU rate, etc. |
-| `compute_revenue(metrics)` | Realized + foregone revenue by procedure and LTFU node |
-| `print_summary(metrics)` | Formatted clinical summary to stdout |
-| `print_revenue_summary(metrics)` | Formatted revenue summary to stdout |
-| `print_patient_trace(patients, n)` | Event logs for debugging |
-
-#### Revenue Analysis
-
-`compute_revenue(metrics)` returns:
-
-```python
-{
-    "realized_total":        float,   # revenue from completed procedures
-    "foregone_total":        float,   # revenue lost to LTFU / unscreened
-    "realized_by_procedure": dict,    # breakdown by procedure type
-    "foregone_by_node": {
-        "unscreened_cervical":          float,  # eligible but never screened
-        "ltfu_post_abnormal_cervical":  float,  # abnormal but no colposcopy
-        "ltfu_post_colposcopy":         float,  # colposcopy but no treatment
-        "lung_no_ldct":                 float,  # eligible but no LDCT
-        "lung_no_biopsy":               float,  # RADS 4 but no biopsy
-    }
-}
-```
-
-Revenue rates are set in `config.PROCEDURE_REVENUE` (CPT-referenced PLACEHOLDERs — replace with NYP contract rates):
+`compute_revenue(metrics)` returns realized revenue from completed procedures and foregone revenue lost at each LTFU node, broken down by procedure type:
 
 | Procedure | CPT Reference | Placeholder Rate |
 |---|---|---|
@@ -739,106 +724,149 @@ Revenue rates are set in `config.PROCEDURE_REVENUE` (CPT-referenced PLACEHOLDERs
 | LEEP | 57522 | $847 |
 | Cone biopsy | 57520 | $1,250 |
 | Lung biopsy | 32405 | $2,100 |
+| Lung treatment | composite | $18,500 |
 
 ---
 
-### `runner.py` — SimulationRunner
-
-The orchestration layer. Owns the clock, all queues, and the daily tick.
-
-```python
-sim = SimulationRunner(n_days=365, seed=42)
-metrics = sim.run()
-sim.summary()           # clinical funnel summary
-sim.revenue_summary()   # realized vs. foregone revenue
-sim.plot_all()          # 2×2 chart: cervical funnel, lung funnel, RADS dist, revenue
-sim.plot_queues()       # drop-in overflow by provider
-```
-
-**Key internal methods:**
+### `src/db.py`
+SQLite persistence layer. See the [Database Layer](#the-database-layer) section above for full details.
 
 | Method | Purpose |
 |---|---|
-| `_tick(day)` | One full simulation day: follow-ups → arrivals → provider queues |
-| `_generate_arrivals(day)` | Poisson draw; route outpatients to scheduled slots, drop-ins to today |
-| `_route_overflow(overflow, provider, day)` | Re-queue overflow (ER vs. non-ER logic) |
-| `_screen_patient(p, day)` | Eligibility check → screening → result routing → follow-up scheduling |
-| `_run_followup(p, context, day)` | Dispatch to cervical or lung follow-up step |
-| `_cervical_followup_step(p, step, day)` | Consume slot → run colposcopy or treatment |
-| `_lung_result_routing(p, day)` | RADS routing on LDCT day; schedule biopsy if RADS 4 |
-| `_lung_biopsy_step(p, day)` | Consume biopsy slot; re-queue if full |
+| `SimulationDB(db_path)` | Open or create the database; create schema if needed |
+| `flush_patients(patients)` | Batch-insert exited patients into the `patients` table |
+| `flush_events(patients)` | Batch-insert event logs into the `events` table |
+| `get_patient_history(patient_id)` | Full chronological event log for one patient |
+| `get_patient(patient_id)` | Demographic + outcome row for one patient |
+| `summary_stats()` | Quick summary: total flushed, exit reason breakdown, mean age/visits |
+| `count_by_exit_reason()` | `{exit_reason: count}` dict |
+| `query(sql, params)` | Ad-hoc read-only SQL queries for notebook analysis |
+| `reset()` | Drop and recreate all tables (use before each fresh run) |
+| `close()` | Commit and close the connection |
 
 ---
 
-### `scenarios.py` — Co-Scheduling Scenarios *(future)*
+### `src/runner.py`
+The orchestration layer. Owns the clock, all queues, the stable-population pool, and the SQLite connection.
 
-Four scenarios defined — not yet wired to the main runner. Reserved for the co-scheduling improvement analysis phase:
+```python
+sim = SimulationRunner(
+    n_days               = cfg.SIM_DAYS,      # 25,550 days = 70 years
+    seed                 = cfg.RANDOM_SEED,
+    use_stable_population = True,
+    db_path              = "nyp_70yr.db",
+    reset_db             = True,
+)
+metrics = sim.run()
+sim.summary()           # clinical funnel summary
+sim.revenue_summary()   # realized vs. foregone revenue
+sim.db_summary()        # database record counts and exit reason breakdown
+sim.close_db()          # always close after all post-run queries
+```
+
+**Stable-population methods:**
+
+| Method | Purpose |
+|---|---|
+| `_initialize_population()` | Create 15,000 established patients; spread across warmup; pre-book 5 years of visits |
+| `_mortality_sweep(day)` | Age all patients; Bernoulli draw per patient; remove dead; queue replacements |
+| `_reschedule_established(p, day)` | Extend advance-schedule window: book appointment at year N+5 from current day |
+| `_spawn_replacement_entrants(day)` | Create up to 4 new established patients/day to replace mortality exits |
+| `_flush_exited_patients(day, force)` | Batch-write exited patients to SQLite every 30 days |
+
+---
+
+### `src/scenarios.py`
+Defines four co-scheduling scenarios for future comparative analysis — not yet wired to the main runner. Reserved for the ROI analysis phase once clinical probabilities are calibrated against NYP data.
 
 | Scenario | Description |
 |---|---|
 | `baseline_fragmented` | Current state: each provider screens only their domain |
-| `gyn_coordinated` | GYN visits also identify lung-eligible patients and place LDCT referrals |
-| `coordinated_all` | All due screenings bundled into a single encounter |
+| `gyn_coordinated` | GYN visits identify lung-eligible patients and place LDCT referrals |
+| `coordinated_all` | All due screenings bundled into one encounter |
 | `high_access_coordinated` | Full co-scheduling + reduced scheduling friction |
 
-Key levers: `cancer_map`, `co_schedule`, `ltfu_multiplier`, `scheduling_delay_days`, `capacity_multiplier`.
+---
+
+## Notebooks
+
+### `notebooks/04_simulation_runner.ipynb`
+End-to-end simulation notebook. Contains:
+1. **1-year quick test run** — confirms the module stack works end-to-end
+2. **70-year single-patient trace** — follows one patient from age 21 to death or age 91, printing every clinical event; visualised as a colour-coded timeline
+3. **Full 70-year population run** — runs `SimulationRunner` with `use_stable_population=True`; prints clinical and revenue summaries; calls `db_summary()`
+4. **Six-panel comprehensive visualisation:**
+   - Panel 1: Patient Journey Cascade (funnel from provider visit to treatment with LTFU annotated)
+   - Panel 2: Cervical result distribution by age stratum (young vs. middle)
+   - Panel 3: Colposcopy CIN grade distribution + treatment type breakdown
+   - Panel 4: Annual procedure revenue by type over 70 years (+ LTFU lost revenue)
+   - Panel 5: Lung LDCT pathway funnel (eligible → treated, with RADS distribution donut)
+   - Panel 6: Population dynamics, annual screening throughput, and provider overflow
+
+### `notebooks/02_screening.ipynb`
+Tests and validates the screening layer in isolation. Run this to sanity-check `config.py` probability changes before a full simulation run.
+
+### `notebooks/03_results_followup.ipynb`
+Tests and demonstrates the follow-up pathways in isolation. Useful for verifying that LTFU rates and CIN grade distributions match clinical expectations.
+
+### `notebooks/05_metrics_outputs.ipynb`
+Deep-dive analytics on simulation output. Cervical result breakdowns by age stratum, pathway funnels, LTFU rates by node, wait-time distributions, and workflow comparison tables.
+
+### `notebooks/06_scenario_analysis.ipynb`
+Compares co-scheduling scenarios on a shared patient cohort. The eventual ROI deliverable — will be fully meaningful once `scenarios.py` is wired into the runner and LTFU multipliers are calibrated.
 
 ---
 
 ## How to Run
 
-**Option 1 — Full simulation via runner**
+**Full 70-year population simulation**
 
 ```python
 import sys
 sys.path.insert(0, '/path/to/NYP/src')
 
+import config as cfg
 from runner import SimulationRunner
 
-sim = SimulationRunner(n_days=365, seed=42)
-sim.run()
-sim.summary()
-sim.revenue_summary()
-sim.plot_all()
+sim = SimulationRunner(
+    n_days               = cfg.SIM_DAYS,        # 25,550 days = 70 years
+    seed                 = cfg.RANDOM_SEED,
+    use_stable_population = True,
+    db_path              = "nyp_70yr.db",
+    reset_db             = True,               # fresh DB each run
+)
+metrics = sim.run()
+
+sim.summary()           # clinical funnel
+sim.revenue_summary()   # realized vs. foregone revenue
+sim.db_summary()        # database record counts
+
+# Ad-hoc SQL query on the patient database
+rows = sim._db.query("""
+    SELECT exit_reason, COUNT(*) AS n, AVG(age_at_exit) AS mean_age
+    FROM patients GROUP BY exit_reason
+""")
+for row in rows:
+    print(row)
+
+sim.close_db()
 ```
 
-**Option 2 — Manual patient-level loop (for unit testing)**
+**Short run (1 year, no stable population)**
 
 ```python
-import sys
-sys.path.insert(0, '/path/to/NYP/src')
-
-import random
-from population import sample_patient
-from screening import get_eligible_screenings, run_screening_step
-from followup import run_cervical_followup, run_lung_followup
-from metrics import initialize_metrics, print_summary, print_revenue_summary
-
-random.seed(42)
-metrics = initialize_metrics()
-
-for i in range(500):
-    p = sample_patient(i, 0, 'gynecologist', 'outpatient')
-    metrics['n_patients'] += 1
-    for cancer in get_eligible_screenings(p):
-        result = run_screening_step(p, cancer, 0, metrics)
-        if result:
-            if cancer == 'cervical':
-                run_cervical_followup(p, 0, metrics)
-            elif cancer == 'lung':
-                run_lung_followup(p, 0, metrics)
-
-print_summary(metrics)
-print_revenue_summary(metrics)
+sim = SimulationRunner(n_days=365, seed=42)
+metrics = sim.run()
+sim.summary()
 ```
 
-**Option 3 — Jupyter Lab**
+**Jupyter Lab**
 
 ```bash
 jupyter lab --notebook-dir=/path/to/NYP
 ```
 
-Open notebooks from the `notebooks/` folder. Start with `04_simulation_runner.ipynb` for the full end-to-end run.
+Open `notebooks/04_simulation_runner.ipynb` for the full end-to-end run.
 
 ---
 
@@ -854,8 +882,11 @@ All placeholders are marked with `# PLACEHOLDER` in `config.py`.
 | 🟡 Soon | `COLPOSCOPY_RESULT_PROBS` | ASCCP risk table slides |
 | 🟡 Soon | `LTFU_PROBS` | NYP EHR attrition analysis |
 | 🟡 Soon | `LUNG_PATHWAY_PROBS` | NYP LDCT volume / referral data |
+| 🟡 Soon | `PROVIDER_CAPACITY` | NYP scheduling data (currently set to sum to 200/day) |
 | 🟢 Future | `LUNG_RADS_PROBS` | NYP LDCT registry data |
 | 🟢 Future | `CAPACITIES` | NYP scheduling data |
+| 🟢 Future | `ORGANIC_NEW_PATIENT_DAILY_RATE` | NYP patient acquisition data |
+| 🟢 Future | `ANNUAL_MORTALITY_RATE` | NYC-specific mortality data |
 
 ---
 
@@ -866,10 +897,10 @@ All placeholders are marked with `# PLACEHOLDER` in `config.py`.
 | 🔴 Immediate | Drop in Yutong's population sampling code |
 | 🔴 Immediate | Replace all PLACEHOLDER values with NYP EHR + finance data |
 | 🟡 Near-term | Wire `scenarios.py` into the runner for co-scheduling analysis |
-| 🟡 Near-term | Multi-replication runs + variance analysis (`NUM_REPS` in config) |
-| 🟡 Near-term | Build visualizations — cervical funnel, lung funnel, RADS distribution, revenue waterfall |
+| 🟡 Near-term | Multi-replication runs + variance analysis (`NUM_REPS = 10` in config) |
+| 🟡 Near-term | Calibration loop: compare sim output to NYP EHR aggregate statistics |
 | 🟢 Future | Add breast and colon cancer pathways |
-| 🟢 Future | Calibration loop: compare sim output to NYP EHR aggregate statistics |
+| 🟢 Future | Model insurance-stratified LTFU rates |
 
 ---
 
@@ -877,8 +908,9 @@ All placeholders are marked with `# PLACEHOLDER` in `config.py`.
 
 ```
 matplotlib
+sqlite3   (Python standard library — no install needed)
 ```
 
-Install: `pip install matplotlib`
+Install matplotlib: `pip install matplotlib`
 
 All other dependencies (`random`, `dataclasses`, `collections`, `typing`) are Python standard library. The simulation does **not** use SimPy — patient flow is modeled as a direct day-by-day tick loop with explicit queue management, not a coroutine-based event loop.
