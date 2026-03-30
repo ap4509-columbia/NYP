@@ -76,6 +76,53 @@ NYP/
 
 ---
 
+## Source Files
+
+### `src/config.py`
+The single source of truth for every tunable value in the simulation. All clinical probabilities (result distributions, LTFU rates, pathway completion rates), revenue rates, provider capacities, scheduling parameters, and eligibility criteria live here. Changing a value in `config.py` propagates everywhere — no other file needs to be touched. All probability and revenue values are currently marked `# PLACEHOLDER` and must be replaced with NYP EHR and finance data before the simulation produces calibrated output.
+
+### `src/patient.py`
+Defines the `Patient` dataclass — the shared data contract between every module. A single `Patient` object is created on arrival and passed through eligibility, screening, follow-up, and exit without copying. It holds all demographic fields (age, race, insurance), clinical flags (has_cervix, pack_years, hpv_positive, prior_cin), simulation state (active, current_stage), screening history (last screen day per cancer), results (cervical_result, lung_result), follow-up state (colposcopy_result, treatment_type, lung biopsy chain flags), exit reason, and a timestamped event log. Helper methods `p.log()`, `p.exit_system()`, and `p.print_history()` are used throughout.
+
+### `src/population.py`
+Generates individual `Patient` objects sampled from NYC demographic distributions. The public interface is one function: `sample_patient(patient_id, day_created, destination, patient_type) → Patient`. The current stub draws age, race/ethnicity, insurance, smoking history, HPV status, hysterectomy status, and BMI from population-weighted distributions based on NYC data. This is the intended integration point for Yutong's population code — replace the function body without changing the signature and no other file needs to change.
+
+### `src/screening.py`
+Implements Steps 2–3 of the patient journey: eligibility determination, future eligibility estimation, test assignment, and result draws. Key functions: `get_eligible_screenings()` returns which cancers a patient qualifies for right now; `days_until_eligible()` returns how many days until a patient will become eligible (used to schedule return visits for patients who are close but not yet eligible, vs. permanently ineligible patients who exit silently); `assign_screening_test()` picks the test modality (age-stratified for cervical per USPSTF 2018); `draw_cervical_result()` draws a multinomial result with risk-factor inflation for HPV+ and prior CIN history; `run_lung_pre_ldct()` models the two pre-LDCT LTFU nodes (referral placed, LDCT scheduled); `run_screening_step()` orchestrates the full screening event for one cancer.
+
+### `src/followup.py`
+Implements Steps 4–5: result routing and clinical follow-up pathways for both cancers. For cervical, `route_cervical_result()` branches on result category (normal → surveillance; abnormal cytology → colposcopy; HPV+ → 40% 1-year repeat / 60% colposcopy per ASCCP triage); `run_colposcopy()` draws a CIN grade from result-conditional distributions; `run_treatment()` applies the treatment decision rule (CIN1 → surveillance, CIN2/3 → LEEP) with a 10% LTFU check before the procedure. For lung, `run_lung_followup()` handles result communication (10% LTFU), RADS category routing (repeat LDCT intervals for RADS 0–3), and the full biopsy chain for RADS 4 (referral → scheduling → completion → malignancy confirmation → treatment), with an explicit LTFU check at every step.
+
+### `src/metrics.py`
+Collects and aggregates all simulation outputs into a single metrics dictionary. `initialize_metrics()` returns a fresh dict at the start of each run. `record_screening()` and `record_exit()` are called by the runner as events occur. `compute_rates()` derives percentages (screening rate, abnormal rate, colposcopy completion, LTFU rate). `compute_revenue()` calculates realized revenue from completed procedures and foregone revenue lost at each LTFU node, broken down by procedure type and drop-off point. `print_summary()` and `print_revenue_summary()` produce formatted clinical and financial summaries to stdout.
+
+### `src/runner.py`
+The orchestration layer that owns the clock, all queues, and the daily tick. `SimulationRunner` runs the full simulation (`run()`), exposes `summary()`, `revenue_summary()`, `plot_all()`, and `plot_queues()` after the run completes. Internally, `PatientQueues` manages three queue types: outpatient (advance-scheduled, never overfills), drop-in (walk-ins, fills remaining capacity), and follow-up (future-dated procedures with per-procedure slot capacity). Each day, follow-ups are processed before new arrivals so procedure slots are consumed before walk-ins are seen. See the [Queuing Engine](#the-queuing-engine--detailed) section for the full mechanics.
+
+### `src/scenarios.py`
+Defines four co-scheduling scenarios for future comparative analysis: `baseline_fragmented` (current state — each provider screens only their domain), `gyn_coordinated` (GYN visits also identify lung-eligible patients and place LDCT referrals), `coordinated_all` (all due screenings bundled into one encounter), and `high_access_coordinated` (full co-scheduling plus reduced scheduling friction). Each scenario is a config dict with keys for `cancer_map`, `co_schedule`, `ltfu_multiplier`, `scheduling_delay_days`, and `capacity_multiplier`. Not yet wired to the main runner — reserved for the scenario analysis phase once clinical probabilities are calibrated.
+
+---
+
+## Notebooks
+
+### `notebooks/02_screening.ipynb`
+Tests and validates the screening layer (`screening.py`) in isolation. Verifies eligibility logic across age groups and clinical profiles, confirms test modality assignment follows USPSTF age stratification, and runs Monte Carlo sampling (5,000 trials) to validate that result probability distributions match the configured values. A smoke test runs 30 patients through `run_screening_step()` and prints their event logs. Use this notebook to sanity-check `config.py` probability changes before running the full simulation.
+
+### `notebooks/03_results_followup.ipynb`
+Tests and demonstrates the follow-up pathways (`followup.py`) in isolation. Shows stochastic LTFU branching at each decision node (e.g., ASCUS → colposcopy referral with 20% LTFU), draws CIN grade distributions from result-conditional probabilities, and traces complete patient journeys from screening result through colposcopy and treatment. Useful for verifying that LTFU rates and CIN grade distributions match clinical expectations before integrating with the full runner.
+
+### `notebooks/04_simulation_runner.ipynb`
+End-to-end simulation notebook. Runs `SimulationRunner` for a configurable number of days, prints the clinical summary and revenue summary, and calls `plot_all()` to produce the four-panel chart (cervical funnel, lung funnel, Lung-RADS distribution, realized vs. foregone revenue). The primary notebook for running the simulation and viewing top-line results. Start here for a full run.
+
+### `notebooks/05_metrics_outputs.ipynb`
+Deep-dive analytics on simulation output. Loads results from a completed run and produces: cervical result breakdowns by age stratum (young/middle/older), full pathway funnels with drop-off percentages at each step, LTFU rates by node, wait-time distributions by resource, and a workflow comparison table (fragmented vs. coordinated). Also contains a matplotlib bar chart of the cervical result distribution. Use this notebook to diagnose where patients are dropping off and to compare scenarios once `scenarios.py` is wired in.
+
+### `notebooks/06_scenario_analysis.ipynb`
+Compares all four co-scheduling scenarios on a shared, fixed patient cohort to isolate the effect of workflow changes from population sampling noise. Identifies age-clustering opportunities (patients in the 40–50 range eligible for multiple screenings simultaneously), runs all four scenarios on deep copies of the same patients, and produces side-by-side comparison tables for screening rate, LTFU rate, colposcopy completion, and encounter savings. Includes per-scenario cervical funnels and a multi-bar matplotlib plot comparing key rates across scenarios. This notebook is the eventual deliverable for the ROI analysis — it will be fully meaningful once LTFU multipliers and capacity adjustments in `scenarios.py` are calibrated against NYP data.
+
+---
+
 ## How the Simulation Works — End to End
 
 ### Time Model
