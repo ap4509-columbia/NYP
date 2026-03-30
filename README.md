@@ -63,12 +63,17 @@ NYP/
 │   ├── runner.py                 # SimulationRunner — day-by-day orchestration + queue engine
 │   └── scenarios.py              # Co-scheduling scenario definitions (future)
 │
-├── notebooks/                    # Jupyter notebooks
-│   ├── 02_screening.ipynb        # Screening layer demo and tests
-│   ├── 03_results_followup.ipynb # Follow-up pathway demo and tests
-│   ├── 04_simulation_runner.ipynb# Full end-to-end orchestration + 70-year run + visualizations
-│   ├── 05_metrics_outputs.ipynb  # Analysis, funnels, revenue, plots
-│   └── 06_scenario_analysis.ipynb# Co-scheduling comparison (future)
+├── notebooks/                    # Jupyter notebooks (live model — run these)
+│   ├── simulation.ipynb          # Full end-to-end orchestration + 70-year run + visualizations
+│   ├── metrics_outputs.ipynb     # Analysis, funnels, revenue, plots
+│   └── scenario_analysis.ipynb   # Co-scheduling comparison (future)
+│
+├── archive/                      # Archived demo notebooks — not required to run the simulation
+│   ├── 02_screening.ipynb        # Screening layer walkthrough (reference only)
+│   └── 03_results_followup.ipynb # Follow-up pathway walkthrough (reference only)
+│
+├── docs/
+│   └── GLOSSARY.md               # Definitions for all medical terms, acronyms, and CPT codes
 │
 └── reference/                    # Source material — do not modify
     ├── initial_model_NYP_flow_simulation (1).ipynb  # Sophia's arrivals simulation
@@ -790,7 +795,7 @@ Defines four co-scheduling scenarios for future comparative analysis — not yet
 
 ## Notebooks
 
-### `notebooks/04_simulation_runner.ipynb`
+### `notebooks/simulation.ipynb` ← start here
 End-to-end simulation notebook. Contains:
 1. **1-year quick test run** — confirms the module stack works end-to-end
 2. **70-year single-patient trace** — follows one patient from age 21 to death or age 91, printing every clinical event; visualised as a colour-coded timeline
@@ -803,17 +808,23 @@ End-to-end simulation notebook. Contains:
    - Panel 5: Lung LDCT pathway funnel (eligible → treated, with RADS distribution donut)
    - Panel 6: Population dynamics, annual screening throughput, and provider overflow
 
-### `notebooks/02_screening.ipynb`
-Tests and validates the screening layer in isolation. Run this to sanity-check `config.py` probability changes before a full simulation run.
-
-### `notebooks/03_results_followup.ipynb`
-Tests and demonstrates the follow-up pathways in isolation. Useful for verifying that LTFU rates and CIN grade distributions match clinical expectations.
-
-### `notebooks/05_metrics_outputs.ipynb`
+### `notebooks/metrics_outputs.ipynb`
 Deep-dive analytics on simulation output. Cervical result breakdowns by age stratum, pathway funnels, LTFU rates by node, wait-time distributions, and workflow comparison tables.
 
-### `notebooks/06_scenario_analysis.ipynb`
+### `notebooks/scenario_analysis.ipynb`
 Compares co-scheduling scenarios on a shared patient cohort. The eventual ROI deliverable — will be fully meaningful once `scenarios.py` is wired into the runner and LTFU multipliers are calibrated.
+
+---
+
+## Archived Notebooks
+
+These notebooks are kept in `archive/` as reference material. They are **not required** to run the simulation — `simulation.ipynb` and the `src/` modules are fully self-contained.
+
+### `archive/02_screening.ipynb`
+Interactive walkthrough of the screening layer in isolation. Useful for sanity-checking `config.py` probability changes or onboarding new team members to the cervical/lung eligibility logic.
+
+### `archive/03_results_followup.ipynb`
+Interactive walkthrough of the post-screening clinical pathways. Useful for verifying that LTFU rates and CIN grade distributions match clinical expectations independently of the full runner.
 
 ---
 
@@ -866,7 +877,7 @@ sim.summary()
 jupyter lab --notebook-dir=/path/to/NYP
 ```
 
-Open `notebooks/04_simulation_runner.ipynb` for the full end-to-end run.
+Open `notebooks/simulation.ipynb` for the full end-to-end run.
 
 ---
 
