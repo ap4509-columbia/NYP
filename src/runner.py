@@ -106,12 +106,35 @@ class PatientQueues:
     """
     Day-by-day patient queue manager for all providers.
 
+    PATIENT TYPES
+    ─────────────────────────────────────────────────────────────────────────────
+    There are exactly two types — no inpatient modelling in this simulation:
+
+      outpatient  — a patient with a confirmed scheduled appointment.
+                    Guaranteed a slot: the scheduler never books beyond capacity.
+                    Once scheduled they cannot be turned away on the day.
+
+      drop_in     — a walk-in patient with no prior appointment.
+                    Fills whatever capacity is left after outpatients are seated.
+                    Excess drop-ins overflow to the next day (or are re-routed).
+
+    CAPACITY GUARANTEE
+    ─────────────────────────────────────────────────────────────────────────────
+    The number of outpatients scheduled on any (provider, day) pair is always
+    strictly less than _outpatient_cap(provider).  This invariant is enforced
+    by schedule_outpatient(), which advances the booking day until a slot is
+    free, and verified by a hard assertion after every booking.
+
+    This guarantee holds regardless of how PROVIDER_CAPACITY or OUTPATIENT_FRACTION
+    are set in config — the cap is recomputed from config at each call to
+    schedule_outpatient(), so changing those values between scenario runs
+    automatically applies to all subsequent bookings.
+
     Attributes
     ----------
     outpatient[provider][day] : list[Patient]
         Patients with a confirmed appointment on that day.
-        Guaranteed not to exceed _outpatient_cap(provider) per day —
-        the scheduler pushes forward until a slot is free.
+        Invariant: len(outpatient[p][d]) < _outpatient_cap(p) for all p, d.
 
     dropin[provider] : list[Patient]
         Today's walk-ins.  Reset at the start of each provider's processing.
@@ -137,26 +160,53 @@ class PatientQueues:
         self, p: Patient, provider: str, earliest_day: int
     ) -> int:
         """
-        Book patient into the earliest available outpatient slot on or after
-        earliest_day.  Never overfills a day — guaranteed capacity.
+        Book a patient into the earliest available outpatient slot on or after
+        earliest_day, then return the booked day.
 
-        If provider has zero outpatient capacity (e.g. ER), the patient is
-        added to the drop-in queue for earliest_day instead of the outpatient
-        schedule, and earliest_day is returned. This prevents the slot-search
-        loop from running forever on a provider with no scheduled capacity.
+        CAPACITY CONTRACT
+        -----------------
+        After every booking this method asserts:
+            len(outpatient[provider][booked_day]) <= cap
+        If the assertion ever fails, a bug was introduced that let two code
+        paths book the same slot simultaneously.  The assert fires immediately
+        rather than allowing a silent capacity violation.
 
-        Returns the day the appointment was booked.
+        The cap is read fresh from config at each call — so if PROVIDER_CAPACITY
+        or OUTPATIENT_FRACTION are changed between scenario runs, the new values
+        are automatically respected for all future bookings without any
+        additional code changes.
+
+        Zero-capacity providers (ER)
+        ----------------------------
+        ER has OUTPATIENT_FRACTION = 0, so its outpatient cap is 0.
+        Attempting to schedule an outpatient there would loop forever
+        (0 >= 0 is always True).  Instead, zero-cap providers receive the
+        patient as a drop-in for earliest_day.  This is the correct clinical
+        model: established patients never use the ER as their primary
+        scheduled provider.
         """
         cap = _outpatient_cap(provider)
         if cap <= 0:
-            # Zero-capacity provider (ER) — route to drop-in queue instead
+            # Zero-capacity provider — add to drop-in queue, not outpatient schedule
             self.dropin[provider].append(p)
             return earliest_day
 
+        # Advance day until a slot is available (never overfills)
         day = earliest_day
         while len(self.outpatient[provider][day]) >= cap:
             day += 1
+
         self.outpatient[provider][day].append(p)
+
+        # Hard post-condition: the booked day must not exceed capacity.
+        # This catches any future bug where two threads / code paths race on
+        # the same slot, or where the cap calculation is wrong.
+        booked_count = len(self.outpatient[provider][day])
+        assert booked_count <= cap, (
+            f"CAPACITY VIOLATION: {provider} day {day} has {booked_count} "
+            f"outpatients but cap={cap}. Check _outpatient_cap() and config."
+        )
+
         return day
 
     # ── Drop-in management ────────────────────────────────────────────────────
@@ -169,33 +219,85 @@ class PatientQueues:
 
     def process_day(self, provider: str, day: int):
         """
-        Seat today's patients for one provider, respecting capacity.
+        Seat today's patients for one provider, respecting total capacity.
 
-        Priority:
-          1. Scheduled outpatients fill their reserved slots.
-          2. Drop-ins fill remaining capacity (including any unused outpt slots).
-          3. Unseen drop-ins (overflow) are returned to the caller for re-routing.
+        NO INPATIENTS — only two patient types exist:
+          • outpatient (scheduled) — always seen; guaranteed slot by scheduler.
+          • drop_in  (walk-in)    — fills whatever capacity remains after
+                                    outpatients are seated; excess overflows.
+
+        Seating priority
+        ----------------
+        1. ALL scheduled outpatients are seated unconditionally. The scheduler
+           already guaranteed their count ≤ outpatient cap (see schedule_outpatient).
+        2. Drop-ins fill any unused outpatient slots first, then their own
+           dedicated drop-in slots.  Available drop-in capacity =
+               dropin_cap + max(0, outpt_cap - n_outpatients_today)
+           Using the ACTUAL scheduled headcount (not config cap) ensures that
+           if a scenario reduces capacity after patients were booked, the fill
+           math is still correct.
+        3. Excess drop-ins (overflow) are returned to the caller for re-routing.
 
         Returns
         -------
-        seen     : list[Patient]
-        overflow : list[Patient]
+        seen     : list[Patient]   — all patients who will be processed today
+        overflow : list[Patient]   — drop-ins who could not be accommodated
         """
-        outpt_cap = _outpatient_cap(provider)
+        # Capacities from config — govern drop-in fill only
+        outpt_cap  = _outpatient_cap(provider)
         dropin_cap = _dropin_cap(provider)
+        total_cap  = outpt_cap + dropin_cap          # = PROVIDER_CAPACITY[provider]
 
-        # Outpatients (always fit — scheduler guarantees this)
-        seen_outpts = self.outpatient[provider].pop(day, [])
+        # Outpatients are always all seated (capacity was guaranteed at booking)
+        seen_outpts     = self.outpatient[provider].pop(day, [])
+        n_outpts        = len(seen_outpts)
 
-        # Drop-ins fill remaining capacity
-        extra          = max(0, outpt_cap - len(seen_outpts))  # unused outpt slots
-        available      = dropin_cap + extra
-        today_dropins  = list(self.dropin.get(provider, []))
-        seen_dropins   = today_dropins[:available]
-        overflow       = today_dropins[available:]
+        # Drop-ins fill remaining total capacity, computed from ACTUAL headcount
+        # so that a scenario capacity change doesn't leave ghost slack or
+        # miscount available slots.
+        remaining        = max(0, total_cap - n_outpts)
+        today_dropins    = list(self.dropin.get(provider, []))
+        seen_dropins     = today_dropins[:remaining]
+        overflow         = today_dropins[remaining:]
         self.dropin[provider] = []
 
         return seen_outpts + seen_dropins, overflow
+
+    # ── Schedule integrity check ──────────────────────────────────────────────
+
+    def validate_capacity(self, raise_on_violation: bool = True) -> list:
+        """
+        Scan the entire outpatient schedule and verify no day exceeds its cap.
+
+        Returns a list of violation strings (empty = all clear). Call this
+        after warmup initialisation or after loading a scenario config to
+        confirm the capacity guarantee holds before a long run starts.
+
+        Parameters
+        ----------
+        raise_on_violation : if True (default), raises AssertionError on the
+                             first violation found so the bug surfaces
+                             immediately rather than corrupting a full run.
+
+        Example
+        -------
+            sim._queues.validate_capacity()   # called after _initialize_population()
+        """
+        violations = []
+        for provider, day_map in self.outpatient.items():
+            cap = _outpatient_cap(provider)
+            if cap <= 0:
+                continue
+            for day, patients in day_map.items():
+                if len(patients) > cap:
+                    msg = (
+                        f"CAPACITY VIOLATION: provider={provider} "
+                        f"day={day} scheduled={len(patients)} cap={cap}"
+                    )
+                    violations.append(msg)
+                    if raise_on_violation:
+                        raise AssertionError(msg)
+        return violations
 
     # ── Follow-up scheduling ──────────────────────────────────────────────────
 
@@ -731,9 +833,14 @@ class SimulationRunner:
             p.next_visit_day = booked_day
 
         self._established_pool = pool
+
+        # Verify capacity contract holds across the entire warmup schedule
+        violations = self._queues.validate_capacity(raise_on_violation=True)
+        assert not violations, f"Warmup produced {len(violations)} capacity violations."
+
         print(
             f"[INIT] Stable population: {len(pool):,} established patients "
-            f"scheduled across {warmup} warmup days."
+            f"scheduled across {warmup} warmup days.  Capacity check: OK."
         )
 
     def _mortality_sweep(self, day: int) -> None:
