@@ -447,14 +447,19 @@ class SimulationRunner:
         if self.metrics.get("year_checkpoints") is not None:
             last_year = self.n_days // 365
             self.metrics["year_checkpoints"].append({
-                "year":           last_year,
-                "day":            self.n_days,
-                "pool_size":      len(self._established_pool) if self.use_stable_population else None,
-                "cum_cervical":   self.metrics["n_screened"]["cervical"],
-                "cum_lung":       self.metrics["n_screened"]["lung"],
-                "cum_mortality":  self.metrics.get("mortality_count", 0),
-                "cum_colposcopy": self.metrics["n_colposcopy"],
-                "cum_treated":    self.metrics["n_treated"],
+                "year":                last_year,
+                "day":                 self.n_days,
+                "pool_size":           len(self._established_pool) if self.use_stable_population else None,
+                "cum_cervical":        self.metrics["n_screened"]["cervical"],
+                "cum_lung":            self.metrics["n_screened"]["lung"],
+                "cum_colposcopy":      self.metrics["n_colposcopy"],
+                "cum_leep":            self.metrics["n_treatment"].get("leep", 0),
+                "cum_treated":         self.metrics["n_treated"],
+                "cum_ltfu":            self.metrics["n_ltfu"],
+                "cum_lung_biopsy":     self.metrics["lung_biopsy_completed"],
+                "cum_lung_treatment":  self.metrics["lung_treatment_given"],
+                "cum_mortality":       self.metrics.get("mortality_count", 0),
+                "cum_n_patients":      self.metrics["n_patients"],
             })
 
         # Final flush of any remaining exited patients
@@ -621,14 +626,23 @@ class SimulationRunner:
         if day > 0 and day % 365 == 0:
             year = day // 365
             self.metrics["year_checkpoints"].append({
-                "year":           year,
-                "day":            day,
-                "pool_size":      len(self._established_pool) if self.use_stable_population else None,
-                "cum_cervical":   self.metrics["n_screened"]["cervical"],
-                "cum_lung":       self.metrics["n_screened"]["lung"],
-                "cum_mortality":  self.metrics.get("mortality_count", 0),
-                "cum_colposcopy": self.metrics["n_colposcopy"],
-                "cum_treated":    self.metrics["n_treated"],
+                "year":                year,
+                "day":                 day,
+                "pool_size":           len(self._established_pool) if self.use_stable_population else None,
+                # Screening volumes
+                "cum_cervical":        self.metrics["n_screened"]["cervical"],
+                "cum_lung":            self.metrics["n_screened"]["lung"],
+                # Follow-up / treatment
+                "cum_colposcopy":      self.metrics["n_colposcopy"],
+                "cum_leep":            self.metrics["n_treatment"].get("leep", 0),
+                "cum_treated":         self.metrics["n_treated"],
+                "cum_ltfu":            self.metrics["n_ltfu"],
+                # Lung pathway milestones
+                "cum_lung_biopsy":     self.metrics["lung_biopsy_completed"],
+                "cum_lung_treatment":  self.metrics["lung_treatment_given"],
+                # Population exits
+                "cum_mortality":       self.metrics.get("mortality_count", 0),
+                "cum_n_patients":      self.metrics["n_patients"],
             })
 
         # 1. Follow-ups due today

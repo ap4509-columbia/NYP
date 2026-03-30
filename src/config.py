@@ -50,6 +50,8 @@ WORKFLOW_MODE = "fragmented"
 ACTIVE_CANCERS = ["cervical", "lung"]
 
 # ── Arrivals (mirrors Sophia's parameters) ────────────────────────────────────
+# Total daily screening capacity = 200 patients across all providers.
+# PLACEHOLDER — replace with NYP scheduling / capacity data.
 DAILY_PATIENTS = 200
 
 PATIENT_TYPE_PROBS = {"outpatient": 0.70, "drop_in": 0.30}
@@ -64,11 +66,13 @@ DESTINATION_PROBS = {
 OUTPATIENT_SHOW_PROB = 1.00   # raise to model no-shows
 
 # ── Provider Daily Capacities ─────────────────────────────────────────────────
+# Scaled so total = DAILY_PATIENTS = 200. Distribution is proportional to
+# DESTINATION_PROBS. PLACEHOLDER — replace with NYP capacity data.
 PROVIDER_CAPACITY = {
-    "pcp":          40,
-    "gynecologist": 30,
-    "specialist":   20,
-    "er":           25,
+    "pcp":          70,   # 35% of 200
+    "gynecologist": 52,   # 26% of 200
+    "specialist":   35,   # 17% of 200
+    "er":           43,   # 22% of 200
 }
 
 # Fraction of each provider's daily capacity reserved for scheduled outpatients.
