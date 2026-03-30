@@ -65,6 +65,9 @@ OUTPATIENT_LEAD_DAYS = {
 # convert to an outpatient appointment at PCP / Gynecologist / Specialist.
 ER_OVERFLOW_RETRY_PROB = 0.70   # PLACEHOLDER
 
+# Fraction of ER arrivals flagged as critical (return next day for follow-up).
+ER_CRITICAL_PROB = 0.50         # PLACEHOLDER
+
 # ── Age Strata ────────────────────────────────────────────────────────────────
 AGE_STRATA = {
     "young":  (21, 29),
