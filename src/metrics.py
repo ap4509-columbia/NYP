@@ -138,13 +138,36 @@ def compute_rates(metrics: dict) -> dict:
     screening rate, abnormal rate, colposcopy completion rate, treatment
     completion rate, and overall LTFU rate. Uses max(..., 1) denominators to
     avoid division-by-zero in runs where a particular event never occurred.
+
+    Notes on correctness:
+    - "Abnormal" for cervical means any result that triggers a follow-up action:
+      ASCUS, LSIL, ASC-H, HSIL, and HPV_POSITIVE. HPV_NEGATIVE is excluded
+      because it is a normal result (patient does not carry high-risk HPV).
+    - treatment_completion_pct uses only cervical excisional treatments (LEEP /
+      cone biopsy) as the numerator, NOT n_treated, because n_treated also
+      accumulates lung malignancy treatments and would produce a rate > 100%
+      against the cervical-only colposcopy denominator.
     """
     n     = max(metrics["n_patients"], 1)
     cerv  = max(metrics["n_screened"]["cervical"], 1)
     colpo = max(metrics["n_colposcopy"], 1)
 
+    # Abnormal cervical result: any category that requires follow-up action.
+    # HPV_NEGATIVE is explicitly excluded — it is a normal HPV-alone result.
+    # NORMAL is excluded too. Everything else (ASCUS, LSIL, ASC-H, HSIL,
+    # HPV_POSITIVE) triggers either colposcopy or a 1-year repeat.
+    _NORMAL_CERVICAL = {"NORMAL", "HPV_NEGATIVE"}
     total_abnormal = sum(
-        v for k, v in metrics["cervical_results"].items() if k != "NORMAL"
+        v for k, v in metrics["cervical_results"].items()
+        if k not in _NORMAL_CERVICAL
+    )
+
+    # Cervical excisional treatment count (LEEP + cone biopsy).
+    # Used as the numerator for treatment_completion_pct to keep the rate
+    # within [0, 100%] against the colposcopy denominator.
+    cerv_excisional = (
+        metrics["n_treatment"].get("leep", 0)
+        + metrics["n_treatment"].get("cone_biopsy", 0)
     )
 
     return {
@@ -153,7 +176,10 @@ def compute_rates(metrics: dict) -> dict:
         "reschedule_rate_pct":         100 * metrics["n_reschedule"] / max(metrics["n_unscreened"], 1),
         "abnormal_rate_cervical_pct":  100 * total_abnormal / cerv,
         "colposcopy_completion_pct":   100 * metrics["n_colposcopy"] / max(total_abnormal, 1),
-        "treatment_completion_pct":    100 * metrics["n_treated"] / max(colpo, 1),
+        # Fraction of colposcopy patients who went on to excisional treatment.
+        # Patients with CIN1/NORMAL colposcopy result are placed on surveillance
+        # and are correctly excluded from this numerator.
+        "treatment_completion_pct":    100 * cerv_excisional / max(colpo, 1),
         "ltfu_rate_pct":               100 * metrics["n_ltfu"] / n,
     }
 
@@ -373,7 +399,18 @@ def compute_revenue(metrics: dict) -> dict:
 
 
 def print_revenue_summary(metrics: dict) -> None:
-    """Print a formatted revenue summary to stdout."""
+    """
+    Print a formatted revenue summary showing realized vs. foregone procedure revenue.
+
+    Calls compute_revenue() to translate procedure volume counts into dollar amounts
+    using the CPT-based rates in config.PROCEDURE_REVENUE, then prints two sections:
+      - Realized revenue: procedures that actually occurred (screening, colposcopy, LEEP, LDCT, etc.)
+      - Foregone revenue: revenue lost because patients dropped out at LTFU nodes
+
+    Also prints the revenue capture rate (realized / total addressable) so it is
+    immediately clear what fraction of potential revenue was actually collected.
+    All dollar amounts use PLACEHOLDER CPT rates — replace with NYP contract rates.
+    """
     r = compute_revenue(metrics)
 
     print("\n" + "=" * 65)
