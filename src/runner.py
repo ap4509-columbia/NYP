@@ -54,7 +54,7 @@ from screening import (
     get_eligible_screenings,
     assign_screening_test,
     run_screening_step,
-    handle_unscreened,
+    days_until_eligible,
 )
 from followup import (
     route_cervical_result,
@@ -424,11 +424,29 @@ class SimulationRunner:
         self.metrics["n_patients"] += 1
 
         if not eligible:
-            outcome = handle_unscreened(p, day)
             self.metrics["n_unscreened"] += 1
-            if outcome == "reschedule":
-                self.metrics["n_reschedule"]    += 1
-                self.metrics["ltfu_unscreened"] += 1
+
+            # Find the soonest day this patient will become eligible for any
+            # active cancer.  Three cases:
+            #   d > 0  → not yet eligible (e.g. turning 21, approaching 20 pk-yrs,
+            #             not yet 50) → schedule a return visit at that future day.
+            #   d == 0 → already eligible (shouldn't reach here, but guard anyway).
+            #   d < 0  → permanently ineligible (no cervix, aged out, never-smoker,
+            #             quit window closed) → exit silently; no revenue foregone.
+            soonest = -1
+            for cancer in cfg.ACTIVE_CANCERS:
+                d = days_until_eligible(p, cancer)
+                if d > 0 and (soonest < 0 or d < soonest):
+                    soonest = d
+
+            if soonest > 0:
+                self._queues.schedule_outpatient(p, p.destination, day + soonest)
+                self.metrics["n_reschedule"] += 1
+                p.log(day, f"NOT YET ELIGIBLE — return visit scheduled in {soonest} days")
+            else:
+                # Permanently ineligible — exit quietly, no LTFU revenue impact
+                p.exit_system(day, "ineligible")
+                record_exit(self.metrics, "ineligible")
             return
 
         self.metrics["n_eligible_any"] += 1

@@ -225,11 +225,58 @@ def run_screening_step(
     return result
 
 
+# ─── Future Eligibility ───────────────────────────────────────────────────────
+
+def days_until_eligible(p: Patient, cancer: str) -> int:
+    """
+    Days until this patient becomes eligible for the given cancer screening.
+
+    Returns
+    -------
+    0   Already eligible right now.
+    >0  Will become eligible in this many days (approximate, age-based).
+    -1  Permanently ineligible — criteria can never be met.
+    """
+    if cancer == "cervical":
+        e = cfg.ELIGIBILITY["cervical"]
+        if not p.has_cervix:
+            return -1                                    # hysterectomy / no cervix
+        if p.age > e["age_max"]:
+            return -1                                    # aged out of screening
+        if p.age < e["age_min"]:
+            return (e["age_min"] - p.age) * 365         # turns 21 in N days (approx)
+        return 0
+
+    if cancer == "lung":
+        e = cfg.ELIGIBILITY["lung"]
+        if p.age > e["age_max"]:
+            return -1                                    # too old
+        if not p.smoker and p.pack_years == 0:
+            return -1                                    # never-smoker, no path to eligibility
+        if not p.smoker and p.years_since_quit > e["max_years_since_quit"]:
+            return -1                                    # quit window has closed
+
+        days_needed = 0
+        if p.age < e["age_min"]:
+            days_needed = max(days_needed, (e["age_min"] - p.age) * 365)
+        if p.pack_years < e["min_pack_years"]:
+            if not p.smoker:
+                return -1                               # can't accumulate more pack-years
+            packs_needed = e["min_pack_years"] - p.pack_years
+            days_needed = max(days_needed, int(packs_needed * 365))
+        return days_needed if days_needed > 0 else 0
+
+    return -1
+
+
 # ─── Unscreened Pathway ───────────────────────────────────────────────────────
 
 def handle_unscreened(p: Patient, current_day: int) -> str:
     """
-    Decision node for patients who did not receive screening.
+    Decision node for ELIGIBLE patients who were not screened during a visit
+    (e.g. provider did not offer, visit time ran out).
+    Reserved for future use when that scenario is explicitly modelled.
+
     Returns: "reschedule" | "exit"
     """
     if not p.active:
@@ -237,10 +284,10 @@ def handle_unscreened(p: Patient, current_day: int) -> str:
 
     if random.random() < cfg.LTFU_PROBS["unscreened_will_reschedule"]:
         p.willing_to_reschedule = True
-        p.log(current_day, "UNSCREENED — willing to reschedule")
+        p.log(current_day, "UNSCREENED (eligible) — willing to reschedule")
         return "reschedule"
 
     p.willing_to_reschedule = False
     p.exit_system(current_day, "lost_to_followup")
-    p.log(current_day, "UNSCREENED — exits system (will not reschedule)")
+    p.log(current_day, "UNSCREENED (eligible) — exits system (will not reschedule)")
     return "exit"

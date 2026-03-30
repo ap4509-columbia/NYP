@@ -115,9 +115,18 @@ NYC Eligible Women Population
 │  Lung:      age 50–80, ≥20 pack-years,               │
 │             current smoker OR quit ≤15 years ago     │
 │                                                      │
-│  Not eligible / declines → UNSCREENED node:          │
-│    50% willing to reschedule → re-enter queue        │
-│    50% not willing         → EXIT (foregone revenue) │
+│  Not eligible → three outcomes:                      │
+│                                                      │
+│  1. Not yet eligible (turning 21 soon, current       │
+│     smoker approaching 20 pk-yrs, not yet 50)        │
+│     → schedule return visit at eligibility date      │
+│                                                      │
+│  2. Permanently ineligible (no cervix, aged out,     │
+│     never-smoker, quit window closed)                │
+│     → EXIT silently (no revenue impact)              │
+│                                                      │
+│  3. Eligible but screening not offered [future]      │
+│     → 50% reschedule / 50% EXIT (foregone revenue)  │
 └────────────────────────┬─────────────────────────────┘
                          ▼
 ┌──────────────────────────────────────────────────────┐
@@ -469,6 +478,7 @@ Current stub draws from:
 | Function | Purpose |
 |---|---|
 | `get_eligible_screenings(p)` | Returns cancer types patient qualifies for (filtered by `ACTIVE_CANCERS`) |
+| `days_until_eligible(p, cancer)` | Days until patient becomes eligible (`0` = now, `>0` = future date, `-1` = never) |
 | `is_due_for_screening(p, cancer, day)` | Checks whether screening interval has elapsed |
 | `get_cervical_age_stratum(age)` | Maps age → `"young"` / `"middle"` / `"older"` |
 | `assign_screening_test(p, cancer)` | Picks test modality (age-stratified for cervical) |
@@ -476,7 +486,7 @@ Current stub draws from:
 | `draw_lung_rads_result()` | Lung-RADS v2022 category draw |
 | `run_lung_pre_ldct(p, day, metrics)` | Pre-LDCT pathway: referral → scheduling → LTFU nodes |
 | `run_screening_step(p, cancer, day, metrics)` | Full screening event: eligibility → test → result |
-| `handle_unscreened(p, day)` | Decision node: will patient reschedule? |
+| `handle_unscreened(p, day)` | Reserved: decision node for eligible patients not offered screening (future use) |
 
 ---
 
