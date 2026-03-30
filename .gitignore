@@ -5,3 +5,8 @@ src/.ipynb_checkpoints/
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
 reference/.ipynb_checkpoints/
+
+# SQLite databases and WAL/SHM side-files (generated at runtime)
+*.db
+*.db-shm
+*.db-wal
