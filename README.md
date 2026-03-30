@@ -425,6 +425,151 @@ Day N+14: _run_followup() called
 
 ---
 
+## Arrival & Queue Distributions — Design Rationale
+
+Every stochastic element in the arrival and queuing layer was chosen for a specific reason. This section documents each distribution, why it was selected, and what its parameters represent.
+
+---
+
+### Daily Arrivals — Poisson (Normal Approximation)
+
+```python
+def _poisson(lam: float) -> int:
+    return max(0, round(random.gauss(lam, math.sqrt(lam))))
+```
+
+**Distribution:** Normal approximation to Poisson(`λ = 200`).
+
+**Why Poisson:** Patient arrivals at a clinic are the canonical Poisson process — a large number of independent individuals each with a small probability of showing up on any given day. The Poisson distribution is the standard model for count data of this type (unscheduled, memoryless, non-negative integer). For large `λ` (≥ ~30), the Poisson and Normal distributions are nearly identical, so `gauss(λ, √λ)` is used as a computationally simple approximation that avoids implementing a true Poisson sampler.
+
+**Parameters:** `λ = 200` daily patients (PLACEHOLDER — mirrors Sophia's arrival model). This produces a standard deviation of ~14 patients/day (`√200 ≈ 14.1`), meaning on a typical day you'd see anywhere from ~172 to ~228 patients (±2 SD). Replace `DAILY_PATIENTS` with NYP throughput data for the target clinics.
+
+---
+
+### Destination Routing — Categorical (Weighted Discrete)
+
+```python
+DESTINATION_PROBS = {"pcp": 0.35, "gynecologist": 0.25, "specialist": 0.20, "er": 0.20}
+dest = random.choices(destinations, weights=weights)[0]
+```
+
+**Distribution:** Categorical (single draw from a weighted discrete distribution).
+
+**Why Categorical:** Each patient goes to exactly one provider destination. A categorical draw is the natural model — one outcome from a mutually exclusive, exhaustive set of options. The weights encode the relative volume at each entry point.
+
+**Parameters (all PLACEHOLDER):**
+- **PCP 35%:** Primary care is the most common entry point; PCPs see the broadest patient mix and are the most likely to identify screening-eligible patients incidentally during general visits.
+- **Gynecologist 25%:** Second-highest volume; GYN visits are the natural home for cervical screening and the primary co-scheduling target for the coordinated-care scenarios.
+- **Specialist 20%:** Pulmonology, oncology, internal medicine — providers likely to encounter lung-eligible patients (older, smoking history). Lower volume than PCP/GYN.
+- **ER 20%:** Emergency visits; screening is rarely the primary reason but ER patients may be the hardest-to-reach population (uninsured, lack of PCP). High LTFU expected from this channel.
+
+Replace with actual visit-volume proportions from NYP scheduling data.
+
+---
+
+### Patient Type Mix — Bernoulli
+
+```python
+PATIENT_TYPE_PROBS = {"outpatient": 0.70, "drop_in": 0.30}
+ptype = random.choices(types, weights=weights)[0]
+```
+
+**Distribution:** Bernoulli (binary categorical — two outcomes).
+
+**Why Bernoulli:** Each patient is either scheduled in advance or a walk-in. There is no middle ground. A weighted binary draw is the simplest correct model.
+
+**Parameters (PLACEHOLDER):** 70% outpatient / 30% drop-in. This ratio reflects the fact that most clinic visits at an academic medical center are pre-scheduled, but a meaningful fraction are same-day or walk-in (urgent care, ER, patients calling for a same-day slot). The ER is always drop-in regardless of this setting. Replace with NYP patient-type data per clinic.
+
+---
+
+### Outpatient Scheduling Lead Time — Uniform
+
+```python
+OUTPATIENT_LEAD_DAYS = {"pcp": (1, 7), "gynecologist": (7, 21), "specialist": (14, 28)}
+earliest = day + random.randint(lo, hi)
+```
+
+**Distribution:** Discrete Uniform over `[lo, hi]` days.
+
+**Why Uniform:** Lead time depends on scheduling availability, which varies day-to-day based on cancellations and slot releases. Without detailed scheduling data, a uniform distribution over a plausible range is the minimum-assumption model — it says "we know the earliest and latest typical wait, but have no reason to prefer any particular day within that window." It is a deliberate placeholder for a more calibrated distribution (e.g., empirical from NYP scheduling data, or a shifted Geometric if next-available-slot logic were modeled explicitly).
+
+**Parameters (all PLACEHOLDER):**
+- **PCP 1–7 days:** PCPs have high throughput and relatively short waits; patients can often get in within the week.
+- **Gynecologist 7–21 days:** GYN scheduling is tighter; 1–3 weeks is typical for a non-urgent visit.
+- **Specialist 14–28 days:** Specialty appointments have the longest lead times; 2–4 weeks reflects the reality of limited specialist slots.
+
+Replace with NYP scheduling data. If the distribution turns out to be skewed (many short waits, occasional very long waits), a log-normal or empirical distribution would be more appropriate.
+
+---
+
+### Capacity Split — Deterministic Fractions
+
+```python
+OUTPATIENT_FRACTION = {"pcp": 0.75, "gynecologist": 0.73, "specialist": 0.75, "er": 0.00}
+outpatient_slots = int(total_capacity * fraction)
+dropin_slots     = total_capacity - outpatient_slots
+```
+
+**Distribution:** Deterministic (fixed fraction of total daily capacity).
+
+**Why deterministic:** The split between reserved outpatient slots and open drop-in slots is an operational policy decision, not a random variable. A clinic sets this ratio in advance (e.g., "we hold 30 of 40 PCP slots for scheduled patients"). Using a fixed fraction accurately models that policy and makes it easy to test the effect of changing the ratio in scenario analysis.
+
+**Parameters (PLACEHOLDER):**
+- **PCP:** 75% outpatient (30 slots), 25% drop-in (10 slots) — high throughput; enough drop-in capacity for urgent same-day needs.
+- **GYN:** ~73% outpatient (22 slots), ~27% drop-in (8 slots) — slightly higher drop-in share than PCP; GYN sees more urgent gynecologic complaints.
+- **Specialist:** 75% outpatient (15 slots), 25% drop-in (5 slots) — small absolute drop-in capacity reflects that specialist walk-ins are uncommon.
+- **ER:** 0% outpatient — ER is entirely drop-in by design; no advance scheduling.
+
+An important queue property: unused outpatient slots roll over to drop-ins on the same day (a patient who cancels their GYN slot frees it for a walk-in). This is implemented in `process_day()` via `extra = max(0, outpt_cap - len(seen_outpts))`.
+
+---
+
+### ER Overflow Routing — Bernoulli
+
+```python
+ER_OVERFLOW_RETRY_PROB = 0.70
+if random.random() < ER_OVERFLOW_RETRY_PROB:
+    re-queue for ER tomorrow
+else:
+    schedule outpatient at random non-ER provider
+```
+
+**Distribution:** Bernoulli(`p = 0.70`).
+
+**Why Bernoulli:** When an ER patient cannot be seen today (capacity full), they face a binary decision: return to the ER tomorrow, or accept a scheduled outpatient appointment elsewhere. A Bernoulli draw captures this binary choice. The probability `p` encodes the relative likelihood of each path.
+
+**Parameters (PLACEHOLDER):** 70% retry ER / 30% convert to outpatient. This reflects the intuition that most ER overflow patients have urgent or undifferentiated complaints that keep them in the ED pathway, while a minority are willing and able to wait for a scheduled appointment at a less acute setting. The 30% conversion rate is a key lever in scenario analysis — if it increases, more patients enter the scheduled system with better continuity-of-care, which is favorable for screening follow-through.
+
+**Non-ER overflow** (PCP, GYN, Specialist) is deterministic: every overflow patient re-queues for the same provider tomorrow. There is no Bernoulli draw because these patients have an established relationship with a specific provider and a scheduled appointment — leaving that queue for a different provider would break continuity.
+
+---
+
+### Follow-Up Scheduling Delays — Fixed (Deterministic)
+
+```python
+FOLLOWUP_DELAY_DAYS = {
+    "colposcopy":  30,   # abnormal result → colposcopy appointment
+    "leep":        14,   # colposcopy → LEEP procedure
+    "cone_biopsy": 21,   # colposcopy → cone biopsy
+    "lung_biopsy": 14,   # RADS 4 → biopsy
+}
+due_day = current_day + FOLLOWUP_DELAY_DAYS[step]
+```
+
+**Distribution:** Deterministic (fixed offset from the triggering event).
+
+**Why deterministic:** These delays represent standard scheduling targets — the number of days a provider aims for between an abnormal result and the next procedure. Using a fixed value rather than a random draw makes the model easier to interpret and to calibrate: you can directly compare the simulated delay to NYP's actual scheduling data and adjust the single number. If scheduling data shows high variance (e.g., colposcopy wait times range 14–60 days depending on clinic load), this can be replaced with a Uniform or log-normal draw.
+
+**Parameters (all PLACEHOLDER):**
+- **Colposcopy 30 days:** ASCCP guidance suggests colposcopy within 4 weeks of an abnormal result; 30 days is the modeled target.
+- **LEEP 14 days:** Treatment follows colposcopy quickly for CIN2/3; 2 weeks is the standard scheduling target post-diagnosis.
+- **Cone biopsy 21 days:** Slightly longer than LEEP due to OR scheduling complexity.
+- **Lung biopsy 14 days:** ACR and NCCN guidelines recommend timely workup for RADS 4 findings; 14 days is the modeled target.
+
+These delays are a primary lever in co-scheduling scenario analysis — the `gyn_coordinated` and `coordinated_all` scenarios will reduce these values to model the effect of streamlined same-system care.
+
+---
+
 ## LTFU — Loss to Follow-Up
 
 LTFU is checked explicitly at every clinical decision node, not applied as a bulk end-of-pathway probability. This design means the simulation can tell you exactly *where* patients drop off and what the downstream revenue impact of each node is.
