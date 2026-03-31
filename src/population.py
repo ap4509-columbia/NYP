@@ -224,6 +224,8 @@ def draw_mortality(p: "Patient", sweep_days: int = cfg.MORTALITY_CHECK_DAYS) -> 
     True  → patient dies; caller should call p.exit_system(day, "mortality")
     False → patient survives this interval
     """
+    if p.age >= 100:
+        return True   # hard cap — no patient survives past age 100
     annual_prob   = get_mortality_prob(p.age)
     interval_prob = annual_prob * (sweep_days / 365.0)
     return random.random() < interval_prob
