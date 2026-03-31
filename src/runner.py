@@ -796,12 +796,16 @@ class SimulationRunner:
                 self.metrics["n_reschedule"] += 1
                 p.log(day, f"NOT YET ELIGIBLE — return visit scheduled in {soonest} days")
             elif p.is_established:
-                # Established patients who are permanently ineligible for cancer
-                # screening (e.g. post-hysterectomy, aged out of all pathways)
-                # still return annually — they just receive no screening tests.
-                # Do NOT exit_system; simply reschedule the annual visit.
-                p.log(day, "INELIGIBLE for all cancers — established patient continues cycling")
-                self._reschedule_established(p, day)
+                # Permanently ineligible established patients (aged out of all
+                # screenings, no cervix, quit window closed) exit the pool and
+                # trigger a replacement younger entrant. This models the real
+                # inflow of women newly entering the eligible age range,
+                # keeping the pool's age distribution realistic over 70 years.
+                p.log(day, "INELIGIBLE for all cancers — exiting pool, replacement queued")
+                p.exit_system(day, "ineligible")
+                record_exit(self.metrics, "ineligible")
+                self._flush_buffer.append(p)
+                self._pending_new_entries += 1
             else:
                 # One-time / new patient permanently ineligible → exit silently;
                 # no LTFU revenue impact because no screening was warranted.
@@ -957,6 +961,11 @@ class SimulationRunner:
             # 1. Age the patient (integer years elapsed since pool entry)
             years_elapsed = (day - p.simulation_entry_day) // 365
             p.age = p.age_at_entry + years_elapsed
+
+            # Skip patients already exited between sweeps (e.g. aged out in _screen_patient)
+            if not p.active:
+                self._flush_buffer.append(p)
+                continue
 
             # 2. Update time-varying attributes that affect screening eligibility
             if p.smoker:
