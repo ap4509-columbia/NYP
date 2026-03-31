@@ -46,7 +46,8 @@ def initialize_metrics() -> dict:
     return {
         # ── Volume ────────────────────────────────────────────────────────────
         "n_patients":     0,
-        "n_eligible_any": 0,
+        "n_eligible_any": 0,   # eligible for ≥1 cancer (any)
+        "n_eligible":     defaultdict(int),  # cancer → eligible count (per-cancer)
         "n_unscreened":   0,
         "n_reschedule":   0,
 
@@ -359,7 +360,10 @@ def compute_revenue(metrics: dict) -> dict:
     # Each node: patients who dropped out × revenue of the missed procedure
     # (+ a conservative estimate of one downstream procedure where applicable).
 
-    cervical_eligible  = metrics["n_eligible_any"]
+    # Use per-cancer eligible count so lung-only-eligible patients do not
+    # inflate the cervical denominator.  n_eligible_any would overstate foregone
+    # cervical revenue whenever lung-only patients exist.
+    cervical_eligible  = metrics["n_eligible"].get("cervical", 0)
     cervical_screened  = metrics["n_screened"].get("cervical", 0)
     avg_cerv_screen    = (rev["cytology"] + rev["hpv_alone"]) / 2
 

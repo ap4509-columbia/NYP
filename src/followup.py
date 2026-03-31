@@ -376,7 +376,11 @@ def run_lung_followup(
             p.log(current_day, "LUNG biopsy: not completed — LTFU")
             p.exit_system(current_day, "lost_to_followup")
             if metrics is not None:
-                metrics["ltfu_post_colposcopy"] += 1
+                # Use ltfu_post_abnormal (shared lung/cervical LTFU bucket).
+                # Previously incremented ltfu_post_colposcopy — a cervical-only
+                # metric — which contaminated the cervical LTFU breakdown and the
+                # foregone LEEP revenue calculation.
+                metrics["ltfu_post_abnormal"] += 1
             return "exit"
         if metrics is not None:
             metrics["lung_biopsy_completed"] += 1

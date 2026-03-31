@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS events (
     patient_id  INTEGER,
     day         INTEGER,
     event       TEXT,
+    UNIQUE(patient_id, day, event),
     FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
 );
 """
@@ -104,8 +105,10 @@ class SimulationDB:
         counts  = db.count_by_exit_reason()    # quick summary query
         db.close()                             # commit + close connection
 
-    All flush methods use INSERT OR IGNORE so re-running on an existing
+    Both flush methods use INSERT OR IGNORE so re-running on an existing
     database (e.g. after a crash) does not produce duplicate rows.
+    Idempotency for events requires the UNIQUE(patient_id, day, event)
+    constraint defined in the schema.
     """
 
     def __init__(self, db_path: Optional[str] = None):
@@ -214,8 +217,12 @@ class SimulationDB:
             for p in patients
             for day, event in p.event_log
         ]
+        # INSERT OR IGNORE so that re-flushing the same patient (e.g. after a
+        # crash) does not produce duplicate event rows.  Requires the UNIQUE
+        # constraint on (patient_id, day, event) defined in the schema above.
         self.conn.executemany(
-            "INSERT INTO events (patient_id, day, event) VALUES (?,?,?)", rows
+            "INSERT OR IGNORE INTO events (patient_id, day, event) VALUES (?,?,?)",
+            rows,
         )
         self.conn.commit()
 

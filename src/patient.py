@@ -46,8 +46,14 @@ class Patient:
 
     # ── Screening history (simulation day of last screen; -1 = never) ─────────
     # Compared against today's day in is_due_for_screening() to enforce intervals
-    last_cervical_screen_day: int = -1
-    last_lung_screen_day:     int = -1
+    last_cervical_screen_day:     int           = -1
+    last_lung_screen_day:         int           = -1
+    # Test modality used at the last cervical screening visit.  Stored so that
+    # is_due_for_screening() can apply the correct interval (cytology → 3 yrs,
+    # hpv_alone → 5 yrs) without making a new random draw.  Without this field
+    # the interval check is non-deterministic: two calls on the same day could
+    # return different answers because assign_screening_test() uses random.choice.
+    last_cervical_screening_test: Optional[str] = None  # "cytology" | "hpv_alone"
 
     # ── Most recent test results ───────────────────────────────────────────────
     # Cytology:  NORMAL | ASCUS | LSIL | ASC-H | HSIL

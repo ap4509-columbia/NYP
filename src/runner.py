@@ -56,6 +56,8 @@ from screening import (
     assign_screening_test,
     run_screening_step,
     days_until_eligible,
+    draw_cervical_result,
+    draw_lung_rads_result,
 )
 from followup import (
     route_cervical_result,
@@ -830,6 +832,8 @@ class SimulationRunner:
             return
 
         self.metrics["n_eligible_any"] += 1
+        for c in eligible:
+            self.metrics["n_eligible"][c] += 1
 
         for cancer in eligible:
             if not p.active:
@@ -871,11 +875,8 @@ class SimulationRunner:
             self.metrics["wait_times"]["screening_seen"].append(p.wait_days)
 
             # ── Schedule follow-up ─────────────────────────────────────────────
-            if cancer == "cervical" and result not in ("NORMAL", "HPV_NEGATIVE"):
-                due = day + cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
-                self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "colposcopy"}, due
-                )
+            if cancer == "cervical":
+                self._route_cervical_followup(p, result, day)
 
             elif cancer == "lung":
                 # Result routing (communication + RADS classification) happens
@@ -1175,10 +1176,49 @@ class SimulationRunner:
         if cancer == "cervical":
             self._cervical_followup_step(p, step, day)
         elif cancer == "lung":
-            self._lung_biopsy_step(p, day)
+            if step == "biopsy":
+                self._lung_biopsy_step(p, day)
+            elif step == "repeat_ldct":
+                self._lung_repeat_ldct_step(p, day)
 
         if p.exit_reason:
             record_exit(self.metrics, p.exit_reason)
+
+    def _route_cervical_followup(self, p: Patient, result: str, day: int) -> None:
+        """
+        Schedule the correct cervical follow-up action based on screening result.
+
+        Normal results need no follow-up. Abnormal cytology results (ASCUS,
+        LSIL, ASC-H, HSIL) are referred directly to colposcopy. HPV_POSITIVE
+        results use the ASCCP triage split: ~40% low-risk managed with a 1-year
+        repeat cytology, ~60% referred to immediate colposcopy.
+
+        Previously all non-normal results (including HPV_POSITIVE) were sent
+        directly to colposcopy, bypassing the one_year_repeat path entirely.
+        """
+        if result in ("NORMAL", "HPV_NEGATIVE"):
+            return  # routine surveillance — no follow-up needed
+
+        if result == "HPV_POSITIVE":
+            # ASCCP triage split for HPV-positive result.
+            # PLACEHOLDER split (40/60) — replace with NYP risk-table values.
+            if random.random() < 0.40:
+                p.log(day, "ROUTE HPV_POSITIVE → 1-year repeat cytology (low-risk mgmt)")
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "one_year_repeat"}, day + 365
+                )
+            else:
+                p.log(day, "ROUTE HPV_POSITIVE → colposcopy")
+                due = day + cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "colposcopy"}, due
+                )
+        else:
+            # ASCUS / LSIL / ASC-H / HSIL → colposcopy
+            due = day + cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "colposcopy"}, due
+            )
 
     def _cervical_followup_step(
         self, p: Patient, step: str, day: int
@@ -1187,9 +1227,33 @@ class SimulationRunner:
         Execute one cervical follow-up step and schedule the next if needed.
 
         Steps in order:
-          colposcopy → (leep | cone_biopsy | surveillance)
+          one_year_repeat → (colposcopy if still abnormal)
+          colposcopy      → (leep | cone_biopsy | surveillance)
+          leep / cone_biopsy → procedure slot consumed; treatment recorded by run_treatment
         """
-        if step == "colposcopy":
+        if step == "one_year_repeat":
+            # 1-year repeat cytology for HPV+ low-risk path.
+            # Runs cytology regardless of the standard 3-year interval because
+            # this appointment was explicitly scheduled by the HPV+ routing above.
+            if not self._queues.consume_slot("cytology", day):
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "one_year_repeat"}, day + 1
+                )
+                return
+
+            # Force cytology — HPV-alone is not appropriate for the 1-year follow-up
+            test                           = "cytology"
+            result                         = draw_cervical_result(p, test)
+            p.cervical_result              = result
+            p.last_cervical_screen_day     = day
+            p.last_cervical_screening_test = test
+            p.log(day, f"ONE-YEAR REPEAT CYTOLOGY → {result}")
+            record_screening(self.metrics, p, "cervical", result)
+            self.metrics["wait_times"]["screening_seen"].append(day - p.day_created)
+            # Route the new cytology result: normal → done; abnormal → colposcopy
+            self._route_cervical_followup(p, result, day)
+
+        elif step == "colposcopy":
             if not self._queues.consume_slot("colposcopy", day):
                 # No slot today — push to tomorrow
                 self._queues.schedule_followup(
@@ -1223,14 +1287,34 @@ class SimulationRunner:
     def _lung_result_routing(self, p: Patient, day: int) -> None:
         """
         Run Lung-RADS routing on LDCT result day.
-        For RADS 4 patients still active after routing, schedule biopsy.
-        """
-        run_lung_followup(p, day, self.metrics)
 
-        if p.active and p.lung_result in ("RADS_4A", "RADS_4B_4X"):
+        RADS 4A/4B/4X — schedule biopsy follow-up.
+        RADS 0/1/2/3  — schedule a repeat LDCT at the clinically correct interval
+                         (1–3 months for RADS 0, 6 months for RADS 3, 12 months
+                         for RADS 1/2) from cfg.LUNG_RADS_REPEAT_INTERVALS.
+
+        Previously the return value of run_lung_followup was discarded, so RADS
+        0/1/2/3 patients were never scheduled for their follow-up scan.  The
+        annual visit cycle would bring them back in 12 months, which is wrong
+        for RADS 0 (needs 1-3 months) and RADS 3 (needs 6 months).
+        """
+        disposition = run_lung_followup(p, day, self.metrics)
+
+        if not p.active:
+            if p.exit_reason:
+                record_exit(self.metrics, p.exit_reason)
+            return
+
+        if p.lung_result in ("RADS_4A", "RADS_4B_4X"):
             due = day + cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
             self._queues.schedule_followup(
                 p, {"cancer": "lung", "step": "biopsy"}, due
+            )
+        elif disposition in ("repeat_ldct_1_3mo", "repeat_ldct_6mo", "repeat_ldct_12mo"):
+            # Schedule the repeat scan at the Lung-RADS–specified interval.
+            repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(p.lung_result, 365)
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "repeat_ldct"}, day + repeat_days
             )
 
         if p.exit_reason:
@@ -1248,6 +1332,35 @@ class SimulationRunner:
             return
         self.metrics["wait_times"]["lung_biopsy"].append(day - p.day_created)
 
+    def _lung_repeat_ldct_step(self, p: Patient, day: int) -> None:
+        """
+        Process a Lung-RADS–mandated follow-up LDCT (RADS 0/1/2/3 path).
+
+        This bypasses the standard screening interval check.  A RADS 3 patient
+        needs a repeat in 6 months; is_due_for_screening would block that because
+        the LDCT interval is 12 months.  We draw the result directly, update the
+        patient, then call _lung_result_routing to handle the new result (which
+        may schedule another repeat or escalate to biopsy).
+
+        Consumes an LDCT procedure slot; if none is available today, pushes to
+        the next day rather than losing the appointment.
+        """
+        if not self._queues.consume_slot("ldct", day):
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "repeat_ldct"}, day + 1
+            )
+            return
+
+        result                 = draw_lung_rads_result()
+        p.lung_result          = result
+        p.last_lung_screen_day = day
+        p.log(day, f"LUNG REPEAT LDCT → {result}")
+        self.metrics["lung_rads_distribution"][result] += 1
+        record_screening(self.metrics, p, "lung", result)
+        self.metrics["wait_times"]["screening_seen"].append(day - p.day_created)
+        # Re-route the new result (may schedule biopsy or another repeat)
+        self._lung_result_routing(p, day)
+
     # =========================================================================
     # Plot helpers
     # =========================================================================
@@ -1259,11 +1372,13 @@ class SimulationRunner:
             if k not in ("NORMAL", "HPV_NEGATIVE")
         )
         steps = [
-            ("Eligible",        m["n_eligible_any"]),
-            ("Screened",        m["n_screened"].get("cervical", 0)),
-            ("Abnormal result", total_abnormal),
-            ("Colposcopy",      m["n_colposcopy"]),
-            ("Treated",         m["n_treated"]),
+            # Use per-cancer cervical count so lung-only-eligible patients
+            # don't inflate the funnel's top bar.
+            ("Eligible (cervical)", m["n_eligible"].get("cervical", m["n_eligible_any"])),
+            ("Screened",            m["n_screened"].get("cervical", 0)),
+            ("Abnormal result",     total_abnormal),
+            ("Colposcopy",          m["n_colposcopy"]),
+            ("Treated",             m["n_treated"]),
         ]
         _funnel_bar(ax, steps, "#4472C4", "Cervical Screening Funnel")
 

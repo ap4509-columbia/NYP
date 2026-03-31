@@ -96,18 +96,31 @@ def is_due_for_screening(p: Patient, cancer: str, current_day: int) -> bool:
     Return True if enough time has passed since this patient's last screen.
 
     A patient is always due if they have never been screened (last_day = -1).
-    Otherwise, the interval between screens depends on the assigned test type:
-    cytology → 3 years, HPV-alone → 5 years, LDCT → 1 year. These are defined
-    in config.SCREENING_INTERVALS_DAYS.
+    Otherwise, the interval depends on the test modality used at the last visit:
+      cytology  → 3 years   HPV-alone → 5 years   LDCT → 1 year
 
-    This check prevents the simulation from over-screening a patient who was
-    recently seen at a different visit within the same interval window.
+    For cervical cancer the modality is read from p.last_cervical_screening_test
+    (written by run_screening_step at the time of the actual screening).  This
+    makes the check deterministic: using assign_screening_test() here would call
+    random.choice() again and could return a different test than the one that was
+    actually performed, giving different — and wrong — interval decisions across
+    calls on the same day.
+
+    Falls back to cytology (the shorter 3-year interval) if no test has been
+    recorded yet, which guarantees we never delay a patient beyond their due date.
     """
     last_day = getattr(p, _LAST_SCREEN_FIELD[cancer], -1)
     if last_day < 0:
         return True  # never screened — always due
-    test     = assign_screening_test(p, cancer)
-    interval = cfg.SCREENING_INTERVALS_DAYS.get(test, 365)
+
+    if cancer == "cervical":
+        # Use the test that was actually performed — not a fresh random draw.
+        last_test = getattr(p, "last_cervical_screening_test", None) or "cytology"
+        interval  = cfg.SCREENING_INTERVALS_DAYS.get(last_test, 365 * 3)
+    else:
+        test     = assign_screening_test(p, cancer)
+        interval = cfg.SCREENING_INTERVALS_DAYS.get(test, 365)
+
     return (current_day - last_day) >= interval
 
 
@@ -303,9 +316,10 @@ def run_screening_step(
     p.log(current_day, f"SCREEN {cancer} via {test}")
 
     if cancer == "cervical":
-        result                     = draw_cervical_result(p, test)
-        p.cervical_result          = result
-        p.last_cervical_screen_day = current_day
+        result                        = draw_cervical_result(p, test)
+        p.cervical_result             = result
+        p.last_cervical_screen_day    = current_day
+        p.last_cervical_screening_test = test   # persist for deterministic interval check
 
     elif cancer == "lung":
         # Lung requires referral + scheduling before the scan can happen

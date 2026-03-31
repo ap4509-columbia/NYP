@@ -203,14 +203,25 @@ def run_encounter(
         isinstance(co_schedule, list)
         and set(eligible_here).issubset(set(co_schedule))
     ):
-        # Single LTFU draw for the whole bundle
-        if adjusted_ltfu(cfg.LTFU_PROBS["unscreened_will_reschedule"], scenario):
-            # Patient doesn't show / drops out before the bundled appointment
-            outcome = handle_unscreened(p, current_day)
+        # Single LTFU draw for the whole bundle.
+        #
+        # Two bugs were present here:
+        #   1. The outer draw used unscreened_will_reschedule (the STAY probability)
+        #      as the drop-out probability — logically inverted.  Using it directly
+        #      in adjusted_ltfu meant that a HIGH reschedule probability produced
+        #      MORE drop-outs.  Fixed: use (1 - reschedule_prob) as the drop-out prob.
+        #
+        #   2. When adjusted_ltfu fired, handle_unscreened was called — making a
+        #      second independent Bernoulli draw on the same question.  The outer
+        #      draw had already decided "drop out"; the inner draw could contradict
+        #      it by returning "reschedule".  Fixed: handle the drop-out inline
+        #      without a second draw.
+        ltfu_prob = 1.0 - cfg.LTFU_PROBS["unscreened_will_reschedule"]
+        if adjusted_ltfu(ltfu_prob, scenario):
+            # Patient no-shows / drops out before the bundled appointment.
             metrics["n_unscreened"] += 1
-            if outcome == "reschedule":
-                metrics["n_reschedule"] += 1
-                metrics["ltfu_unscreened"] += 1
+            metrics["ltfu_unscreened"] += 1
+            p.log(current_day, f"ENCOUNTER {provider} — patient no-show (bundle LTFU)")
             metrics["scenario_encounters_saved"] = (
                 metrics.get("scenario_encounters_saved", 0) + len(eligible_here) - 1
             )
