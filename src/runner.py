@@ -951,12 +951,31 @@ class SimulationRunner:
         survivors   = []
         death_count = 0
 
+        year_fraction = sweep_days / 365.0
+
         for p in self._established_pool:
             # 1. Age the patient (integer years elapsed since pool entry)
             years_elapsed = (day - p.simulation_entry_day) // 365
             p.age = p.age_at_entry + years_elapsed
 
-            # 2. Mortality draw
+            # 2. Update time-varying attributes that affect screening eligibility
+            if p.smoker:
+                # Accumulate pack-years (1 pack-year per year of smoking)
+                p.pack_years += year_fraction
+                # Smoking cessation draw
+                if random.random() < cfg.ANNUAL_SMOKING_CESSATION_PROB * year_fraction:
+                    p.smoker          = False
+                    p.years_since_quit = 0.0
+            elif p.pack_years > 0:
+                # Former smoker — advance years-since-quit; lose lung eligibility after 15 yrs
+                p.years_since_quit += year_fraction
+
+            # HPV clearance — affects cervical result probabilities
+            if p.hpv_positive:
+                if random.random() < cfg.ANNUAL_HPV_CLEARANCE_PROB * year_fraction:
+                    p.hpv_positive = False
+
+            # 3. Mortality draw
             if draw_mortality(p, sweep_days=sweep_days):
                 p.exit_system(day, "mortality")
                 record_exit(self.metrics, "mortality")

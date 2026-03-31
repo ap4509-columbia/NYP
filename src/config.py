@@ -337,6 +337,12 @@ WARMUP_DAYS            = 365           # spread initial cohort across first full
 # ── Mortality sweep cadence ───────────────────────────────────────────────────
 MORTALITY_CHECK_DAYS   = 30            # run mortality Bernoulli draws every N days
 
+# ── Annual patient attribute transition rates (PLACEHOLDER) ──────────────────
+# Applied each mortality sweep (scaled to sweep interval).
+# All values are annual probabilities — replace with NYP / literature values.
+ANNUAL_SMOKING_CESSATION_PROB = 0.05   # prob a current smoker quits in a given year
+ANNUAL_HPV_CLEARANCE_PROB     = 0.30   # prob HPV-positive patient clears in a given year
+
 # ── Age-specific annual mortality rates for US women (PLACEHOLDER) ────────────
 # Source: CDC WONDER / NCHS Life Tables (women, all causes, approximate).
 # PLACEHOLDER — replace with NYC-specific mortality data if available.
