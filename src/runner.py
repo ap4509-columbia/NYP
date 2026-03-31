@@ -252,12 +252,17 @@ class PatientQueues:
 
         # Outpatients are always all seated (capacity was guaranteed at booking)
         seen_outpts     = self.outpatient[provider].pop(day, [])
-        n_outpts        = len(seen_outpts)
 
-        # Drop-ins fill remaining total capacity, computed from ACTUAL headcount
-        # so that a scenario capacity change doesn't leave ghost slack or
-        # miscount available slots.
-        remaining     = max(0, total_cap - n_outpts)
+        # Count only ACTIVE outpatients for the drop-in capacity calculation.
+        # schedule_outpatient() also counts only active patients when checking
+        # the cap, so a dead patient whose slot was "refilled" by a replacement
+        # entrant must not reduce the available drop-in headroom.  Using the
+        # raw len() would double-count those slots and incorrectly zero out
+        # drop-in capacity on mortality-sweep days.
+        n_active_outpts = sum(1 for q in seen_outpts if q.active)
+
+        # Drop-ins fill remaining total capacity, computed from ACTIVE headcount.
+        remaining     = max(0, total_cap - n_active_outpts)
 
         # NYP MODEL ASSUMPTION — age-based drop-in priority (cfg.AGE_PRIORITY_THRESHOLD)
         # Women aged 40+ are sorted to the front of the drop-in queue before the
@@ -739,8 +744,19 @@ class SimulationRunner:
                 if random.random() < cfg.ER_OVERFLOW_RETRY_PROB:
                     self._queues.add_dropin(p, "er")
                 else:
-                    alt     = random.choice(_NON_ER)
-                    lo, hi  = cfg.OUTPATIENT_LEAD_DAYS.get(alt, (1, 7))
+                    # Route to a non-ER provider weighted by DESTINATION_PROBS
+                    # (excluding ER's share, redistributed proportionally).
+                    # Previously used uniform random.choice — fixed to match the
+                    # population-level provider distribution.
+                    non_er_probs = {
+                        k: v for k, v in cfg.DESTINATION_PROBS.items()
+                        if k != "er"
+                    }
+                    alt      = random.choices(
+                        list(non_er_probs.keys()),
+                        weights=list(non_er_probs.values()),
+                    )[0]
+                    lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(alt, (1, 7))
                     earliest = day + random.randint(lo, hi)
                     self._queues.schedule_outpatient(p, alt, earliest)
             else:
@@ -822,9 +838,20 @@ class SimulationRunner:
             result = run_screening_step(p, cancer, day, self.metrics)
 
             if result is None:
-                # Patient LTFU inside run_screening_step (lung pre-LDCT nodes).
-                # Established patients: LTFU from a cancer pathway does not remove
-                # them from the provider system — they cycle back next year.
+                # Two distinct cases when run_screening_step returns None:
+                #
+                # A) LTFU (p.exit_reason is set) — patient was lost from a
+                #    clinical pathway (e.g. lung referral not placed, LDCT
+                #    not scheduled). Established patients are re-activated so
+                #    the annual cycle continues; non-established exit for good.
+                #
+                # B) Skip (p.exit_reason is None) — patient was either not
+                #    yet due (interval not met) or ineligible for this specific
+                #    cancer. This is the common case: a cytology patient visits
+                #    every year but is only due every 3 years. We must NOT
+                #    return here — we continue the for-loop so any remaining
+                #    cancer types are checked, and the reschedule at the bottom
+                #    of _screen_patient still runs.
                 if p.exit_reason:
                     record_exit(self.metrics, p.exit_reason)
                     if p.is_established:
@@ -836,7 +863,9 @@ class SimulationRunner:
                         self._reschedule_established(p, day)
                     else:
                         return   # non-established exits permanently
-                return
+                    return       # LTFU handled — skip remaining cancers today
+                # Case B: no exit_reason → simple skip; continue to next cancer
+                continue
 
             record_screening(self.metrics, p, cancer, result)
             self.metrics["wait_times"]["screening_seen"].append(p.wait_days)
@@ -877,8 +906,25 @@ class SimulationRunner:
             p.age_at_entry         = p.age
             p.simulation_entry_day = day
             self._established_pool.append(p)
-            self._reschedule_established(p, day)
-            p.log(day, "FIRST VISIT COMPLETE — joined established cycling pool")
+
+            # Book the full ADVANCE_SCHEDULE_YEARS window from scratch, mirroring
+            # _spawn_replacement_entrants. _reschedule_established only extends
+            # the FAR END of an existing window (years 1–N already booked), so
+            # calling it here would only add year-5 and leave years 1–4 unbooked —
+            # the patient would then go 5 years without a visit.
+            first_visit   = day + cfg.ANNUAL_VISIT_INTERVAL
+            first_booked  = self._queues.schedule_outpatient(p, p.destination, first_visit)
+            p.next_visit_day = first_booked
+            for yr in range(1, cfg.ADVANCE_SCHEDULE_YEARS):
+                self._queues.schedule_outpatient(
+                    p, p.destination, first_booked + yr * cfg.ANNUAL_VISIT_INTERVAL
+                )
+            p.log(
+                day,
+                f"FIRST VISIT COMPLETE — joined established cycling pool; "
+                f"scheduled years 1–{cfg.ADVANCE_SCHEDULE_YEARS} "
+                f"(next visit day {first_booked})"
+            )
 
     # =========================================================================
     # Stable population management
