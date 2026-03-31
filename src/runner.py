@@ -28,6 +28,12 @@
 # scheduling lead time.  For drop-ins it grows each time they overflow.
 # These are recorded per resource in metrics["wait_times"].
 #
+# PENDING: actual scheduling wait time distributions (e.g. days-to-colposcopy,
+# days-to-LEEP) are not yet modelled.  Currently follow-up appointments are
+# placed at a fixed offset (cfg.FOLLOWUP_DELAY_DAYS).  Replace with
+# empirical or literature-derived wait-time distributions once NYP
+# scheduling data is available.
+#
 # Follow-up scheduling
 # --------------------
 # After a screening event, follow-up appointments (colposcopy, LEEP, biopsy)
