@@ -403,8 +403,6 @@ def run_lung_followup(
             # Malignancy confirmed but patient did not receive treatment
             p.exit_system(current_day, "untreated")
             p.log(current_day, "LUNG: malignancy confirmed but no treatment given")
-            if metrics is not None:
-                metrics["n_untreated"] += 1
             return "lung_untreated"
 
         # Treatment successfully given

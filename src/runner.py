@@ -1317,9 +1317,6 @@ class SimulationRunner:
                 p, {"cancer": "lung", "step": "repeat_ldct"}, day + repeat_days
             )
 
-        if p.exit_reason:
-            record_exit(self.metrics, p.exit_reason)
-
     def _lung_biopsy_step(self, p: Patient, day: int) -> None:
         """
         Process a lung biopsy appointment.
@@ -1358,8 +1355,20 @@ class SimulationRunner:
         self.metrics["lung_rads_distribution"][result] += 1
         record_screening(self.metrics, p, "lung", result)
         self.metrics["wait_times"]["screening_seen"].append(day - p.day_created)
-        # Re-route the new result (may schedule biopsy or another repeat)
-        self._lung_result_routing(p, day)
+        # Re-route the new result inline — do NOT call record_exit here because
+        # _run_followup is the single caller of record_exit for all follow-up steps.
+        disposition = run_lung_followup(p, day, self.metrics)
+        if p.active:
+            if p.lung_result in ("RADS_4A", "RADS_4B_4X"):
+                due = day + cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
+                self._queues.schedule_followup(
+                    p, {"cancer": "lung", "step": "biopsy"}, due
+                )
+            elif disposition in ("repeat_ldct_1_3mo", "repeat_ldct_6mo", "repeat_ldct_12mo"):
+                repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(p.lung_result, 365)
+                self._queues.schedule_followup(
+                    p, {"cancer": "lung", "step": "repeat_ldct"}, day + repeat_days
+                )
 
     # =========================================================================
     # Plot helpers
