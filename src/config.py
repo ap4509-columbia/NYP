@@ -206,6 +206,30 @@ LTFU_PROBS = {
     "unscreened_will_reschedule":   0.50,
 }
 
+# ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────
+# When a cervical screening returns HPV_POSITIVE, the ASCCP risk table drives
+# whether the patient is managed with a 1-year repeat cytology (lower-risk) or
+# referred immediately to colposcopy (higher-risk).
+# PLACEHOLDER — replace with NYP risk-stratified HPV management data.
+HPV_POSITIVE_COLPOSCOPY_PROB = 0.60   # probability HPV+ → immediate colposcopy
+                                       # (1 - this) → 1-year repeat cytology
+
+# ── Risk Multipliers for Cervical Result Draws ────────────────────────────────
+# Applied in screening.draw_cervical_result() via _adjust_probs().
+# Multiplies the base-rate probability of abnormal categories for high-risk patients.
+# PLACEHOLDER — calibrate against NYP cytology lab data.
+RISK_MULT_HPV_POSITIVE_CYTOLOGY = 1.5   # inflate all abnormal cytology if HPV+
+RISK_MULT_HPV_POSITIVE_HPV_TEST = 2.0   # inflate HPV_POSITIVE result if prior HPV+
+RISK_MULT_PRIOR_CIN_HIGHGRADE   = 1.8   # inflate ASC-H / HSIL if prior CIN2/CIN3
+
+# ── Colposcopy Result Fallback Distribution ───────────────────────────────────
+# Used when the triggering cytology result does not match any key in
+# COLPOSCOPY_RESULT_PROBS (e.g. unexpected result category).
+# PLACEHOLDER — replace with ASCCP risk table values.
+COLPOSCOPY_RESULT_PROBS_DEFAULT = {
+    "NORMAL": 0.50, "CIN1": 0.25, "CIN2": 0.15, "CIN3": 0.10,
+}
+
 # ── Colposcopy Result Probabilities ───────────────────────────────────────────
 # PLACEHOLDER — to be powered by ASCCP risk tables
 COLPOSCOPY_RESULT_PROBS = {

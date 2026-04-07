@@ -465,6 +465,9 @@ class SimulationRunner:
                 "pool_size":           len(self._established_pool) if self.use_stable_population else None,
                 "cum_cervical":        self.metrics["n_screened"]["cervical"],
                 "cum_lung":            self.metrics["n_screened"]["lung"],
+                "cum_cytology":        self.metrics["n_screened_by_test"]["cytology"],
+                "cum_hpv_alone":       self.metrics["n_screened_by_test"]["hpv_alone"],
+                "cum_ldct":            self.metrics["n_screened_by_test"]["ldct"],
                 "cum_colposcopy":      self.metrics["n_colposcopy"],
                 "cum_leep":            self.metrics["n_treatment"].get("leep", 0),
                 "cum_treated":         self.metrics["n_treated"],
@@ -642,9 +645,12 @@ class SimulationRunner:
                 "year":                year,
                 "day":                 day,
                 "pool_size":           len(self._established_pool) if self.use_stable_population else None,
-                # Screening volumes
+                # Screening volumes — overall and by first-stage test modality
                 "cum_cervical":        self.metrics["n_screened"]["cervical"],
                 "cum_lung":            self.metrics["n_screened"]["lung"],
+                "cum_cytology":        self.metrics["n_screened_by_test"]["cytology"],
+                "cum_hpv_alone":       self.metrics["n_screened_by_test"]["hpv_alone"],
+                "cum_ldct":            self.metrics["n_screened_by_test"]["ldct"],
                 # Follow-up / treatment
                 "cum_colposcopy":      self.metrics["n_colposcopy"],
                 "cum_leep":            self.metrics["n_treatment"].get("leep", 0),
@@ -1206,9 +1212,8 @@ class SimulationRunner:
             return  # routine surveillance — no follow-up needed
 
         if result == "HPV_POSITIVE":
-            # ASCCP triage split for HPV-positive result.
-            # PLACEHOLDER split (40/60) — replace with NYP risk-table values.
-            if random.random() < 0.40:
+            # ASCCP triage split — controlled by config.HPV_POSITIVE_COLPOSCOPY_PROB.
+            if random.random() >= cfg.HPV_POSITIVE_COLPOSCOPY_PROB:
                 p.log(day, "ROUTE HPV_POSITIVE → 1-year repeat cytology (low-risk mgmt)")
                 self._queues.schedule_followup(
                     p, {"cancer": "cervical", "step": "one_year_repeat"}, day + 365

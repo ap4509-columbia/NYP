@@ -52,7 +52,8 @@ def initialize_metrics() -> dict:
         "n_reschedule":   0,
 
         # ── Screenings ────────────────────────────────────────────────────────
-        "n_screened": defaultdict(int),                            # cancer → count
+        "n_screened":        defaultdict(int),                     # cancer → count
+        "n_screened_by_test": defaultdict(int),                    # test modality → count (cytology / hpv_alone / ldct)
 
         # ── Cervical results ──────────────────────────────────────────────────
         "cervical_results": defaultdict(int),                      # result → count
@@ -104,7 +105,7 @@ def initialize_metrics() -> dict:
 
 
 def record_screening(
-    metrics: dict, p: Patient, cancer: str, result: str
+    metrics: dict, p: Patient, cancer: str, result: str, test: str = ""
 ) -> None:
     """
     Record a completed screening event in the metrics dict.
@@ -113,9 +114,22 @@ def record_screening(
     also tallies the result category and the age-stratum breakdown. The stratum
     breakdown is used to verify that the simulation's result distribution matches
     expected rates for young vs. middle-aged women separately.
+
+    The optional `test` parameter (e.g. "cytology", "hpv_alone", "ldct") is used
+    to track first-stage screening volume by modality — the primary USPSTF metric.
+    Falls back to the patient's last recorded test if not explicitly provided.
     """
     from screening import get_cervical_age_stratum   # local import to avoid circularity
     metrics["n_screened"][cancer] += 1
+
+    # Track by test modality — infer from patient if not supplied
+    if not test and cancer == "cervical":
+        test = getattr(p, "last_cervical_screening_test", "") or "cytology"
+    elif not test and cancer == "lung":
+        test = "ldct"
+    if test:
+        metrics["n_screened_by_test"][test] += 1
+
     if cancer == "cervical":
         metrics["cervical_results"][result] += 1
         stratum = get_cervical_age_stratum(p.age)

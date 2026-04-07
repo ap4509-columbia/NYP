@@ -121,9 +121,9 @@ def route_cervical_result(
             p.exit_system(current_day, "lost_to_followup")
             p.log(current_day, "LTFU after HPV_POSITIVE — no follow-up")
             return "exit"
-        # ~40% low-risk: repeat cytology in 1 year instead of immediate colposcopy
-        # ~60% higher-risk: referred directly to colposcopy (PLACEHOLDER split)
-        if random.random() < 0.40:
+        # HPV+ triage: route to 1-year repeat cytology (lower-risk) vs colposcopy.
+        # Split is controlled by config.HPV_POSITIVE_COLPOSCOPY_PROB (PLACEHOLDER).
+        if random.random() >= cfg.HPV_POSITIVE_COLPOSCOPY_PROB:
             p.log(current_day, "ROUTE HPV_POSITIVE → 1-year repeat cytology (low-risk mgmt)")
             return "one_year_repeat"
         p.log(current_day, "ROUTE HPV_POSITIVE → colposcopy")
@@ -144,7 +144,7 @@ def draw_colposcopy_result(p: Patient) -> str:
     """
     key   = f"from_{p.cervical_result}"   # e.g. "from_HSIL", "from_HPV_POSITIVE"
     probs = cfg.COLPOSCOPY_RESULT_PROBS.get(
-        key, {"NORMAL": 0.50, "CIN1": 0.25, "CIN2": 0.15, "CIN3": 0.10}
+        key, cfg.COLPOSCOPY_RESULT_PROBS_DEFAULT
     )
     return random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
 

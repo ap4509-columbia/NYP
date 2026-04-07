@@ -200,24 +200,39 @@ def draw_cervical_result(p: Patient, test: str) -> str:
         probs = dict(cfg.CERVICAL_RESULT_PROBS["middle_hpv"])
         if p.hpv_positive:
             # Known HPV carrier → higher chance of testing positive
-            probs = _adjust_probs(probs, inflate_keys=["HPV_POSITIVE"], factor=2.0)
+            probs = _adjust_probs(
+                probs, inflate_keys=["HPV_POSITIVE"],
+                factor=cfg.RISK_MULT_HPV_POSITIVE_HPV_TEST,
+            )
 
     elif stratum == "young":
         # Age 21–29: cytology only (USPSTF does not recommend HPV testing under 30)
         probs = dict(cfg.CERVICAL_RESULT_PROBS["young"])
         if p.hpv_positive:
-            probs = _adjust_probs(probs, inflate_keys=["ASCUS", "LSIL", "ASC-H", "HSIL"], factor=1.5)
+            probs = _adjust_probs(
+                probs, inflate_keys=["ASCUS", "LSIL", "ASC-H", "HSIL"],
+                factor=cfg.RISK_MULT_HPV_POSITIVE_CYTOLOGY,
+            )
         if p.prior_cin in ("CIN2", "CIN3"):
             # History of high-grade CIN raises risk of HSIL recurrence
-            probs = _adjust_probs(probs, inflate_keys=["ASC-H", "HSIL"], factor=1.8)
+            probs = _adjust_probs(
+                probs, inflate_keys=["ASC-H", "HSIL"],
+                factor=cfg.RISK_MULT_PRIOR_CIN_HIGHGRADE,
+            )
 
     else:
         # Age 30–65: cytology (middle stratum base rates)
         probs = dict(cfg.CERVICAL_RESULT_PROBS["middle_cytology"])
         if p.hpv_positive:
-            probs = _adjust_probs(probs, inflate_keys=["ASCUS", "LSIL", "ASC-H", "HSIL"], factor=1.5)
+            probs = _adjust_probs(
+                probs, inflate_keys=["ASCUS", "LSIL", "ASC-H", "HSIL"],
+                factor=cfg.RISK_MULT_HPV_POSITIVE_CYTOLOGY,
+            )
         if p.prior_cin in ("CIN2", "CIN3"):
-            probs = _adjust_probs(probs, inflate_keys=["ASC-H", "HSIL"], factor=1.8)
+            probs = _adjust_probs(
+                probs, inflate_keys=["ASC-H", "HSIL"],
+                factor=cfg.RISK_MULT_PRIOR_CIN_HIGHGRADE,
+            )
 
     return random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
 
