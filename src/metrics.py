@@ -51,6 +51,16 @@ def initialize_metrics() -> dict:
         "n_unscreened":   0,
         "n_reschedule":   0,
 
+        # ── Entry / Arrival breakdown ─────────────────────────────────────────
+        # destination: "pcp" | "gynecologist" | "specialist" | "er"
+        # patient_type: "outpatient" | "drop_in"
+        "entries_by_destination": defaultdict(int),   # provider destination → count
+        "entries_by_type":        defaultdict(int),   # patient_type → count
+
+        # ── Exit / Retention breakdown ────────────────────────────────────────
+        "exits_by_reason":    defaultdict(int),   # exit_reason string → count
+        "days_in_system":     [],                 # list of ints (retention days per patient)
+
         # ── Screenings ────────────────────────────────────────────────────────
         "n_screened":        defaultdict(int),                     # cancer → count
         "n_screened_by_test": defaultdict(int),                    # test modality → count (cytology / hpv_alone / ldct)
@@ -136,7 +146,7 @@ def record_screening(
         metrics["cervical_by_age_stratum"][stratum][result] += 1
 
 
-def record_exit(metrics: dict, reason: str) -> None:
+def record_exit(metrics: dict, reason: str, patient=None, current_day: int = 0) -> None:
     """
     Record a patient's exit from the system and classify it into an outcome bucket.
 
@@ -144,14 +154,24 @@ def record_exit(metrics: dict, reason: str) -> None:
     voluntary departure without treatment, or LTFU. The reason string comes from
     patient.exit_reason (set by patient.exit_system()) and maps to one of three
     outcome counters: treated, untreated, or lost_to_followup.
+
+    Optional patient and current_day are used to record retention duration
+    (days from patient creation to exit) in metrics["days_in_system"].
     """
     metrics["n_exited"] += 1
+    metrics["exits_by_reason"][reason] += 1
+
     if reason == "treated":
         metrics["n_treated"] += 1
     elif reason == "untreated":
         metrics["n_untreated"] += 1
     elif reason == "lost_to_followup":
         metrics["n_ltfu"] += 1
+
+    if patient is not None and current_day > 0:
+        retention = current_day - getattr(patient, "day_created", current_day)
+        if retention >= 0:
+            metrics["days_in_system"].append(retention)
 
 
 def compute_rates(metrics: dict) -> dict:

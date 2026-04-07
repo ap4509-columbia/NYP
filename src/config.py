@@ -33,7 +33,8 @@
 # before the model is used for operational or planning decisions.
 # =============================================================================
 
-RANDOM_SEED = 42
+RANDOM_SEED = None   # None = non-deterministic (different result each run).
+                     # Set to an integer (e.g. 42) to reproduce a specific run.
 
 # ── Simulation Horizon ────────────────────────────────────────────────────────
 SIM_YEARS      = 70                      # full 70-year longitudinal horizon

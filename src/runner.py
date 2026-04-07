@@ -800,6 +800,8 @@ class SimulationRunner:
 
         eligible = get_eligible_screenings(p)
         self.metrics["n_patients"] += 1
+        self.metrics["entries_by_destination"][p.destination] += 1
+        self.metrics["entries_by_type"][p.patient_type] += 1
 
         # Track total provider contacts for longitudinal analysis
         if self.use_stable_population:
@@ -1046,7 +1048,7 @@ class SimulationRunner:
             # 3. Mortality draw
             if draw_mortality(p, sweep_days=sweep_days):
                 p.exit_system(day, "mortality")
-                record_exit(self.metrics, "mortality")
+                record_exit(self.metrics, "mortality", patient=p, current_day=day)
                 self._flush_buffer.append(p)
                 death_count += 1
             else:
@@ -1194,7 +1196,7 @@ class SimulationRunner:
                 self._lung_repeat_ldct_step(p, day)
 
         if p.exit_reason:
-            record_exit(self.metrics, p.exit_reason)
+            record_exit(self.metrics, p.exit_reason, patient=p, current_day=day)
 
     def _route_cervical_followup(self, p: Patient, result: str, day: int) -> None:
         """
@@ -1313,7 +1315,7 @@ class SimulationRunner:
 
         if not p.active:
             if p.exit_reason:
-                record_exit(self.metrics, p.exit_reason)
+                record_exit(self.metrics, p.exit_reason, patient=p, current_day=day)
             return
 
         if p.lung_result in ("RADS_4A", "RADS_4B_4X"):
