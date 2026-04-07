@@ -194,8 +194,21 @@ def compute_rates(metrics: dict) -> dict:
         + metrics["n_treatment"].get("cone_biopsy", 0)
     )
 
+    n_cytol    = metrics["n_screened_by_test"]["cytology"]
+    n_hpv      = metrics["n_screened_by_test"]["hpv_alone"]
+    n_ldct     = metrics["n_screened_by_test"]["ldct"]
+    total_cerv = max(n_cytol + n_hpv, 1)
+
     return {
+        # ── First-stage screening uptake (primary USPSTF metric) ───────────
+        "n_cytology":                  n_cytol,
+        "n_hpv_alone":                 n_hpv,
+        "n_ldct":                      n_ldct,
+        "cytology_pct_of_cerv":        100 * n_cytol / total_cerv,
+        "hpv_alone_pct_of_cerv":       100 * n_hpv   / total_cerv,
         "screening_rate_cervical_pct": 100 * metrics["n_screened"]["cervical"] / n,
+        "screening_rate_lung_pct":     100 * metrics["n_screened"]["lung"] / max(metrics["lung_eligible"], 1),
+        # ── Downstream clinical rates (validation / secondary) ─────────────
         "unscreened_pct":              100 * metrics["n_unscreened"] / n,
         "reschedule_rate_pct":         100 * metrics["n_reschedule"] / max(metrics["n_unscreened"], 1),
         "abnormal_rate_cervical_pct":  100 * total_abnormal / cerv,
