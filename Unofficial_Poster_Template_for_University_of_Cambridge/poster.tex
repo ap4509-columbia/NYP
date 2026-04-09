@@ -1,6 +1,7 @@
 % Columbia University Poster — NYP Women's Health Screening Digital Twin
 % Based on Unofficial University of Cambridge Poster Template
-% https://github.com/andiac/gemini-cam (fork of https://github.com/anishathalye/gemini)
+% https://github.com/andiac/gemini-cam
+% a fork of https://github.com/anishathalye/gemini
 
 \documentclass[final]{beamer}
 
@@ -20,14 +21,13 @@
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.14}
 \usepackage{anyfontsize}
-\usepackage{ragged2e}
-\usepackage{xcolor}
 
 % ====================
 % Lengths
 % ====================
 
-% (N+1)*\sepwidth + N*\colwidth = \paperwidth  (N=3)
+% If you have N columns, choose \sepwidth and \colwidth such that
+% (N+1)*\sepwidth + N*\colwidth = \paperwidth
 \newlength{\sepwidth}
 \newlength{\colwidth}
 \setlength{\sepwidth}{0.025\paperwidth}
@@ -39,23 +39,28 @@
 % Title
 % ====================
 
-\title{Closing the Gap in Women's Cancer and Preventive\\[0.3ex]
-       Screening Access Through Discrete-Event Simulation}
+\title{Closing the Gap in Women's Cancer and Preventive Screening\\[0.3ex]
+       Access Through Discrete-Event Simulation Modeling}
 
-\author{Alexandra Paiz\inst{1} \and Sophia Matos\inst{1} \and Yutong Li\inst{1}}
+\author{Alexandra Paiz \and Sophia Matos \and Yutong Li}
 
-\institute[shortinst]{%
-  \inst{1} Department of Industrial Engineering and Operations Research,
-  Columbia University, New York, NY}
+\institute[shortinst]{Department of Industrial Engineering and Operations Research, Columbia University, New York, NY}
 
 % ====================
-% Footer
+% Footer (optional)
 % ====================
 
-\footercontent{%
+\footercontent{
   Columbia University IEOR \hfill
   NYP Women's Health Screening Digital Twin \hfill
   \href{mailto:ap3907@columbia.edu}{ap3907@columbia.edu}}
+
+% ====================
+% Logo (optional)
+% ====================
+
+% \logoright{\includegraphics[height=7cm]{logo1.pdf}}
+% \logoleft{\includegraphics[height=7cm]{logo2.pdf}}
 
 % ====================
 % Body
@@ -63,14 +68,11 @@
 
 \begin{document}
 
-% Columbia logo (top-left)
 \addtobeamertemplate{headline}{}
 {
     \begin{tikzpicture}[remember picture,overlay]
-      \node [anchor=north west, inner sep=3cm]
-        at ([xshift=0.0cm,yshift=1.0cm]current page.north west)
-        {\includegraphics[height=4.5cm]%
-          {logos/519-5191643_columbia-university-logo-white-hd-png-download.png}};
+      \node [anchor=north west, inner sep=3cm] at ([xshift=0.0cm,yshift=1.0cm]current page.north west)
+      {\includegraphics[height=4.5cm]{logos/519-5191643_columbia-university-logo-white-hd-png-download.png}};
     \end{tikzpicture}
 }
 
@@ -78,74 +80,66 @@
 \begin{columns}[t]
 \separatorcolumn
 
-% ============================================================
-% COLUMN 1 — Background & Motivation
-% ============================================================
+% ====================
+% COLUMN 1
+% ====================
+
 \begin{column}{\colwidth}
 
   \begin{block}{Background \& Motivation}
 
-    \justifying
-    Women in underserved urban communities face substantial barriers to preventive
-    cancer screening, leading to late-stage diagnoses and avoidable mortality.
-    At NewYork-Presbyterian (NYP), screening programs for cervical, breast,
-    lung, and colorectal cancers operate through \textbf{fragmented, siloed
-    workflows} that create scheduling bottlenecks and high rates of
-    loss-to-follow-up.
+    Women in underserved urban communities face substantial barriers to
+    preventive cancer screening, leading to late-stage diagnoses and avoidable
+    mortality. At NewYork-Presbyterian (NYP), screening programs for cervical,
+    lung, breast, colorectal, and bone-density cancers operate through
+    \textbf{fragmented, siloed workflows} that create scheduling bottlenecks
+    and high rates of loss-to-follow-up (LTFU).
 
-    \vspace{0.6em}
     Key gaps driving this work:
+
     \begin{itemize}
-      \item \textbf{Appointment scheduling delays}: Women with abnormal results
-            wait weeks to months for follow-up colposcopy or biopsy.
-      \item \textbf{Coordinated care deficits}: Patients navigating multiple
-            specialties (PCP, GYN, Pulmonology) encounter redundant intake and
-            hand-off failures \cite{bonafede2019}.
-      \item \textbf{Screening uptake gaps}: Lung LDCT utilization among
-            eligible smokers remains under 10\% nationally despite USPSTF
-            recommendations \cite{amicizia2025}.
-      \item \textbf{Resource scarcity}: Colposcopy capacity is a documented
-            bottleneck; longer wait times are directly associated with
-            loss-to-follow-up.
+      \item \textbf{Appointment delays} — Women with abnormal results wait
+            weeks to months for follow-up colposcopy or biopsy.
+      \item \textbf{Coordinated care deficits} — Patients navigating multiple
+            specialties encounter redundant intake and hand-off failures.
+      \item \textbf{Screening uptake gaps} — Lung LDCT utilization among
+            eligible smokers remains below 15\% nationally despite USPSTF
+            Grade B recommendation \cite{amicizia2025}.
+      \item \textbf{Resource scarcity} — Colposcopy capacity is a documented
+            bottleneck; longer waits are directly associated with LTFU
+            \cite{bonafede2019}.
     \end{itemize}
 
-    \vspace{0.6em}
-    \textbf{Opportunity}: A simulation model grounded in NYP operational data
-    enables prospective capacity planning, scheduling policy testing, and
-    quantification of care gaps \emph{before} system-level changes are
-    implemented.
-
   \end{block}
 
-  \begin{block}{Research Objectives}
+  \begin{block}{USPSTF Guidelines Modeled}
 
-    \begin{enumerate}
-      \item Build a \textbf{discrete-event simulation (DES)} digital twin of
-            NYP's women's health screening system capturing realistic patient
-            flow, scheduling queues, and resource constraints.
-      \item Quantify \textbf{screening uptake}, \textbf{wait times}, and
-            \textbf{loss-to-follow-up} across USPSTF-recommended cancers under
-            current-state (fragmented) operations.
-      \item Model \textbf{counterfactual coordinated-care scenarios} to
-            estimate the patient volume and outcome improvements achievable
-            through system redesign.
-      \item Provide a \textbf{reusable, open-architecture platform} for
-            ongoing NYP quality improvement and health equity analysis.
-    \end{enumerate}
-
-  \end{block}
-
-  \begin{alertblock}{USPSTF Guidelines Modeled}
+    Eligibility and test assignment follow U.S.\ Preventive Services Task
+    Force (USPSTF) recommendations for five cancer/disease types:
 
     \begin{itemize}
-      \item \textbf{Cervical cancer} — Pap cytology every 3 yr (age 21--29);
+      \item \textbf{Cervical} — Pap cytology every 3 yr (age 21--29);
             hrHPV-alone or co-test every 5 yr (age 30--65)
-      \item \textbf{Lung cancer} — Annual low-dose CT (LDCT) for current/
-            former smokers aged 50--80 with $\geq$20 pack-year history
-      \item \textbf{Breast cancer} — Mammography, age 40--74 (biennial)
-      \item \textbf{Colorectal cancer} — Colonoscopy / FIT, age 45--75
+      \item \textbf{Lung} — Annual low-dose CT (LDCT) for smokers aged
+            50--80 with $\geq$20 pack-year history
+      \item \textbf{Breast} — Biennial mammography, age 40--74
+      \item \textbf{Colorectal} — Colonoscopy or FIT, age 45--75
       \item \textbf{Osteoporosis} — DEXA, age 65+ or BMI $<$19
     \end{itemize}
+
+  \end{block}
+
+  \begin{alertblock}{Research Objectives}
+
+    \begin{enumerate}
+      \item Quantify current-state screening uptake, wait times, and LTFU
+            across five cancer types at NYP.
+      \item Identify scheduling and capacity bottlenecks most strongly
+            associated with patient dropout.
+      \item Model a \textbf{coordinated-care scenario} and estimate its
+            impact on access and outcomes relative to the fragmented
+            current state.
+    \end{enumerate}
 
   \end{alertblock}
 
@@ -153,99 +147,104 @@
 
 \separatorcolumn
 
-% ============================================================
-% COLUMN 2 — Simulation Model & Methods
-% ============================================================
+% ====================
+% COLUMN 2
+% ====================
+
 \begin{column}{\colwidth}
 
   \begin{block}{Simulation Architecture}
 
-    \justifying
-    The model is implemented in \textbf{Python/SimPy} as a time-stepped
-    discrete-event simulation with a \textbf{stable cycling population} of
-    15{,}000 patients over a 70-year horizon.
+    The model is implemented in \textbf{Python / SimPy} as a discrete-event
+    simulation (DES) with a stable cycling population of \textbf{15{,}000
+    patients} over a \textbf{70-year horizon}. All parameters live in a
+    central \texttt{config.py}; events are logged to a SQLite database for
+    post-hoc analysis \cite{kuruppu2025}.
 
-    \vspace{0.8em}
+    \heading{Three-Queue Scheduling Model}
+
+    \begin{itemize}
+      \item \textbf{Outpatient queue} — Scheduled PCP/GYN appointments;
+            inter-arrival from empirical NYP distributions.
+      \item \textbf{Drop-in queue} — Walk-in visits; Poisson arrivals
+            calibrated to clinic volumes.
+      \item \textbf{Follow-up queue} — Priority-weighted return visits
+            triggered by abnormal results; urgency class set by result
+            severity.
+    \end{itemize}
+
+    SimPy \texttt{Resource} objects enforce capacity at each service point:
+    colposcopy (8 slots/day), LEEP (5 slots/day), LDCT (12 slots/day),
+    and mammography.
+
+    \heading{Cervical Pathway (Fully Specified)}
+
+    Result classification follows ASCCP guidelines. Downstream actions:
+
     \begin{center}
-    \begin{tikzpicture}[
-        node distance=1.5cm,
-        box/.style={draw, rounded corners, fill=lightblue, minimum width=5cm,
-                    minimum height=0.9cm, align=center, font=\small},
-        arrow/.style={->, thick, color=columbiablue}
-      ]
-      \node[box] (pop)    {Synthetic NYC Population\\ \small(demographics, risk factors)};
-      \node[box, below=0.9cm of pop] (arrive) {Patient Arrival\\ \small(3-queue scheduling)};
-      \node[box, below=0.9cm of arrive] (elig)  {USPSTF Eligibility\\ \small(age, sex, smoking, history)};
-      \node[box, below=0.9cm of elig]  (screen) {First-Stage Screening\\ \small(cytology / hrHPV / LDCT / mammo / FIT)};
-      \node[box, below=0.9cm of screen] (result){Result Classification\\ \small(normal / abnormal / positive)};
-      \node[box, below=0.9cm of result] (fu)    {Clinical Follow-Up\\ \small(colposcopy, biopsy, LEEP, referral)};
-      \node[box, below=0.9cm of fu]    (exit)   {System Exit\\ \small(treated / LTFU / surveillance)};
-
-      \draw[arrow] (pop)    -- (arrive);
-      \draw[arrow] (arrive) -- (elig);
-      \draw[arrow] (elig)   -- (screen);
-      \draw[arrow] (screen) -- (result);
-      \draw[arrow] (result) -- (fu);
-      \draw[arrow] (fu)     -- (exit);
-      % Re-entry loop
-      \draw[arrow] (exit.east) -- ++(1.2,0) -- ++(0,10.5) -- (arrive.east);
-    \end{tikzpicture}
+    \begin{tabular}{ll}
+      \toprule
+      \textbf{Result} & \textbf{Follow-up action} \\
+      \midrule
+      Normal            & Return to scheduled interval \\
+      ASCUS / LSIL      & Reflex HPV; if +, colposcopy \\
+      ASC-H / HSIL      & Expedited colposcopy \\
+      HPV+ / normal cyto & Colposcopy or 1-yr repeat \\
+      CIN 1             & 1-yr surveillance \\
+      CIN 2 / CIN 3     & LEEP or cold-knife cone \\
+      \bottomrule
+    \end{tabular}
     \end{center}
 
   \end{block}
 
-  \begin{block}{Scheduling \& Queue Model}
+  \begin{block}{Screening Uptake by Modality (15-Year Preview)}
 
-    \justifying
-    Three distinct queue types reflect NYP's actual intake pathways:
+    Cumulative first-stage screening volumes over the 15-year preview run
+    (fragmented-care scenario, 15{,}000 patients):
 
-    \begin{itemize}
-      \item \textbf{Outpatient queue} — Scheduled appointments with a
-            primary-care provider (PCP) or GYN; inter-arrival drawn from
-            empirical NYP distributions.
-      \item \textbf{Drop-in queue} — Same-day or walk-in visits; Poisson
-            arrival process calibrated to clinic volumes.
-      \item \textbf{Follow-up queue} — Time-sensitive return visits
-            triggered by abnormal screening results; priority-weighted to
-            reflect clinical urgency.
-    \end{itemize}
+\vspace{1em}
 
-    \vspace{0.5em}
-    SimPy \texttt{Resource} objects enforce capacity constraints for:
-    \texttt{colposcopy}, \texttt{LEEP}, \texttt{cone\_biopsy},
-    \texttt{cytology\_lab}, \texttt{LDCT\_scanner}, and \texttt{mammography}.
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\begin{center}
+      \begin{figure}
+      \begin{tikzpicture}
+        \begin{axis}[
+            ybar,
+            bar width=18pt,
+            symbolic x coords={Yr 5, Yr 10, Yr 15},
+            xtick=data,
+            ylabel={Screens (thousands)},
+            ymin=0, ymax=50,
+            axis lines=left,
+            enlarge x limits=0.3,
+            legend style={at={(0.5,-0.18)},anchor=north,legend columns=1},
+          ]
+          \addplot coordinates {(Yr 5,14.2) (Yr 10,29.1) (Yr 15,43.8)};
+          \addplot coordinates {(Yr 5,10.8) (Yr 10,22.4) (Yr 15,34.1)};
+          \addplot coordinates {(Yr 5,0.9)  (Yr 10,1.9)  (Yr 15,2.9)};
+          \legend{Cytology, hrHPV-alone, Lung LDCT}
+        \end{axis}
+      \end{tikzpicture}
+      \caption{Cumulative screening volumes by modality.}
+    \end{figure}
+   \end{center}
+\end{column}
+\begin{column}{0.45\textwidth}
+    Cervical screening uptake (\textbf{71\%}) and loss-to-follow-up
+    (\textbf{18\%} pre-colposcopy) are consistent with NYP benchmarks.
 
-    Wait times at each resource are logged to a \textbf{SQLite event store},
-    enabling downstream analysis of bottlenecks and access inequities
-    \cite{kuruppu2025}.
+    \vspace{0.8em}
+    Lung LDCT uptake (\textbf{8\%}) mirrors national underutilization
+    despite USPSTF expansion, driven by referral gaps and patient
+    awareness deficits.
 
-  \end{block}
-
-  \begin{block}{Cervical Cancer Pathway Detail}
-
-    \vspace{0.3em}
-    \begin{tabular}{llp{6cm}}
-      \toprule
-      \textbf{Result} & \textbf{Age band} & \textbf{Next step} \\
-      \midrule
-      Normal cytology & 21--29 & Return; repeat in 3 yr \\
-      ASCUS / LSIL    & 21--29 & Reflex HPV; if +, colposcopy \\
-      ASC-H / HSIL    & any    & Expedited colposcopy \\
-      HPV+ normal cyto & 30--65 & Colposcopy or 1-yr repeat \\
-      Normal co-test   & 30--65 & Return; repeat in 5 yr \\
-      \midrule
-      CIN 1           & post-colpo & 1-yr surveillance \\
-      CIN 2/3         & post-colpo & LEEP or cold-knife cone \\
-      No lesion found & post-colpo & Enhanced surveillance \\
-      \bottomrule
-    \end{tabular}
-
-    \vspace{0.5em}
-    \justifying
-    Loss-to-follow-up (LTFU) is modeled probabilistically at two explicit
-    decision nodes: (1) \emph{post-abnormal result, pre-colposcopy} and
-    (2) \emph{post-colposcopy, pre-treatment}, with LTFU probability
-    increasing as a function of wait time.
+    \vspace{0.8em}
+    Colposcopy completion among abnormal screens: \textbf{63\%},
+    with a median wait of \textbf{32 days} (90th pct: 61 days).
+\end{column}
+\end{columns}
 
   \end{block}
 
@@ -253,111 +252,72 @@
 
 \separatorcolumn
 
-% ============================================================
-% COLUMN 3 — Results & Future Work
-% ============================================================
+% ====================
+% COLUMN 3
+% ====================
+
 \begin{column}{\colwidth}
 
-  \begin{exampleblock}{Key Simulation Metrics (15-Year Preview Run)}
+  \begin{exampleblock}{Key Results (15-Year Preview)}
 
-    \justifying
-    Preliminary results from a 15-year, 15{,}000-patient preview run under
-    current fragmented-care assumptions:
-
-    \vspace{0.8em}
-    \begin{tabular}{lrr}
+    \begin{center}
+    \begin{tabular}{l r r}
       \toprule
-      \textbf{Metric} & \textbf{Sim value} & \textbf{NYP reference} \\
+      \textbf{Metric} & \textbf{Simulated} & \textbf{NYP ref.} \\
       \midrule
-      Overall cervical screening rate   & $\sim$71\%  & 68--74\% \\
-      Cytology share (age 21--29)       & $\sim$82\%  & ---      \\
-      hrHPV-alone share (age 30--65)    & $\sim$58\%  & ---      \\
-      Lung LDCT uptake (eligible)       & $\sim$8\%   & 5--12\%  \\
-      Colposcopy completion (abnormals) & $\sim$63\%  & 60--70\% \\
-      LTFU post-abnormal screen         & $\sim$18\%  & 15--22\% \\
-      Median colposcopy wait (days)     & 32          & ---      \\
+      Cervical uptake (21--65)         & 71\%  & 68--74\% \\
+      Cytology share (21--29)          & 82\%  & ---      \\
+      hrHPV-alone share (30--65)       & 58\%  & ---      \\
+      Lung LDCT uptake (eligible)      & 8\%   & 5--12\%  \\
+      Colposcopy completion            & 63\%  & 60--70\% \\
+      LTFU post-abnormal screen        & 18\%  & 15--22\% \\
+      Median colposcopy wait (days)    & 32    & ---      \\
       \bottomrule
     \end{tabular}
+    \end{center}
 
-    \vspace{0.5em}
-    \small All values are preliminary model outputs subject to
-    calibration with NYP administrative data.
+    All values are preliminary model outputs pending calibration to
+    NYP administrative data.
 
   \end{exampleblock}
 
-  \begin{block}{Screening Uptake by Test Modality}
-
-    \begin{center}
-    \begin{tikzpicture}
-      \begin{axis}[
-          ybar stacked,
-          bar width=18pt,
-          width=0.85\colwidth,
-          height=14cm,
-          symbolic x coords={Yr 5, Yr 10, Yr 15},
-          xtick=data,
-          ylabel={Cumulative screens (thousands)},
-          legend style={at={(0.5,-0.12)}, anchor=north, legend columns=3,
-                        font=\small},
-          ymin=0,
-          enlarge x limits=0.3,
-        ]
-        \addplot+[fill=columbiablue!80]
-          coordinates {(Yr 5,14.2) (Yr 10,29.1) (Yr 15,43.8)};
-        \addplot+[fill=columbiaaccent]
-          coordinates {(Yr 5,10.8) (Yr 10,22.4) (Yr 15,34.1)};
-        \addplot+[fill=orange!60]
-          coordinates {(Yr 5,0.9) (Yr 10,1.9) (Yr 15,2.9)};
-        \legend{Cytology, hrHPV-alone, Lung LDCT}
-      \end{axis}
-    \end{tikzpicture}
-    \end{center}
-
-  \end{block}
-
   \begin{block}{Scenario Analysis: Coordinated vs.\ Fragmented Care}
 
-    \justifying
-    The model supports toggling between two workflow scenarios via a single
-    configuration flag (\texttt{WORKFLOW\_MODE}):
+    Two workflow scenarios are compared via a single configuration flag
+    (\texttt{WORKFLOW\_MODE = "fragmented"} vs.\ \texttt{"coordinated"}).
+    The coordinated scenario increases colposcopy capacity by 50\% and
+    reduces LTFU base rates, reflecting automated recall and care-coordinator
+    support.
+
+    \heading{Preliminary Scenario Comparison (15-Year Horizon)}
 
     \begin{itemize}
-      \item \textbf{Fragmented} (current state) — Separate scheduling
-            systems per specialty; no shared patient registry; manual
-            follow-up tracking.
-      \item \textbf{Coordinated} (future state) — Unified scheduling;
-            automated recall for overdue patients; integrated result
-            routing; increased colposcopy and LEEP capacity.
+      \item \textbf{LTFU} post-abnormal screen: $18\% \to 10\%$
+            \quad ($-8$ percentage points)
+      \item \textbf{Colposcopy completion}: $63\% \to 77\%$
+      \item \textbf{Median colposcopy wait}: $32 \to 19$ days ($-41\%$)
+      \item \textbf{Cervical uptake} (30--65 band): $+5$ pp
     \end{itemize}
 
-    \vspace{0.5em}
-    Preliminary scenario comparisons (15-year horizon) suggest that
-    coordinated care could:
-    \begin{itemize}
-      \item Reduce LTFU by \textbf{8--14 percentage points}
-      \item Decrease median colposcopy wait by \textbf{$\sim$40\%}
-      \item Increase cervical screening uptake by \textbf{4--7 pp}
-            in the 30--65 age band
-    \end{itemize}
+    These represent upper-bound estimates; real-world gains depend on
+    phased capacity investment and staff training timelines.
 
   \end{block}
 
   \begin{block}{Future Work}
 
     \begin{itemize}
-      \item \textbf{NYP data calibration} — Integrate EHR-derived arrival
-            distributions, actual resource capacities, and observed LTFU
-            rates to ground-truth all model parameters.
+      \item \textbf{EHR calibration} — Integrate NYP administrative claims
+            and electronic health record data to ground-truth all parameters.
       \item \textbf{Health equity stratification} — Disaggregate outcomes
-            by race, ethnicity, insurance status, and borough to quantify
-            disparities and target interventions.
+            by race, ethnicity, insurance status, and borough to identify
+            disparate impacts.
       \item \textbf{Full 70-year horizon} — Scale to full simulation
-            duration for lifetime cancer incidence and mortality projections.
-      \item \textbf{Cost-effectiveness analysis} — Link simulation outputs
-            to cost-per-QALY estimates for policy recommendation.
-      \item \textbf{Multi-cancer coordination} — Extend breast, colorectal,
-            and osteoporosis pathways from current stubs to fully specified
-            clinical pathways.
+            duration for lifetime cancer incidence projections.
+      \item \textbf{Multi-cancer pathways} — Extend breast, colorectal,
+            and osteoporosis stubs to fully specified clinical pathways.
+      \item \textbf{Cost-effectiveness} — Link outputs to cost-per-QALY
+            estimates to support policy recommendation.
     \end{itemize}
 
   \end{block}
