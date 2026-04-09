@@ -157,8 +157,16 @@ def assign_screening_test(p: Patient, cancer: str) -> str:
         options = cfg.SCREENING_TESTS["cervical"].get(stratum, [])
         if not options:
             return "ineligible"
-        # For middle stratum, randomly pick cytology or HPV-alone each visit
-        return random.choice(options)
+        if stratum == "young":
+            return "cytology"
+        if stratum == "middle":
+            # Age 30–65: weighted 3-way choice per academic center practice patterns
+            # Source: AiP Parameters PDF — co-test 0.55, cytology 0.35, hpv_alone 0.10
+            options = list(cfg.TEST_TYPE_PROBS_30_65.keys())
+            weights = list(cfg.TEST_TYPE_PROBS_30_65.values())
+            return random.choices(options, weights=weights, k=1)[0]
+        # older stratum has no options (empty list handled above), so fallthrough returns ineligible
+        return "ineligible"
 
     options = cfg.SCREENING_TESTS.get(cancer, [])
     return options[0] if options else "ineligible"
@@ -194,6 +202,23 @@ def draw_cervical_result(p: Patient, test: str) -> str:
     These multipliers are PLACEHOLDERS — calibrate against NYP data.
     """
     stratum = get_cervical_age_stratum(p.age)
+
+    if test == "co_test":
+        # Co-test: use middle-stratum cytology probabilities
+        # In practice co-test returns both HPV and cytology; for routing we use the cytology result
+        # Source: AiP Parameters PDF — co-test is dominant modality at academic centers for 30–65
+        probs = dict(cfg.CERVICAL_RESULT_PROBS["middle_cytology"])
+        if p.hpv_positive:
+            probs = _adjust_probs(
+                probs, inflate_keys=["ASCUS", "LSIL", "ASC-H", "HSIL"],
+                factor=cfg.RISK_MULT_HPV_POSITIVE_CYTOLOGY,
+            )
+        if p.prior_cin in ("CIN2", "CIN3"):
+            probs = _adjust_probs(
+                probs, inflate_keys=["ASC-H", "HSIL"],
+                factor=cfg.RISK_MULT_PRIOR_CIN_HIGHGRADE,
+            )
+        return random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
 
     if test == "hpv_alone":
         # HPV-alone test: binary result, no Pap categories
@@ -286,9 +311,20 @@ def run_lung_pre_ldct(
         return False
 
     p.lung_ldct_scheduled = True
-    p.log(current_day, "LUNG: LDCT scheduled and completed")
+    p.log(current_day, "LUNG: LDCT scheduled")
     if metrics is not None:
         metrics["lung_ldct_scheduled"] += 1
+
+    # Step 3: Did the patient actually complete the scan? (appointment completion rate)
+    # Source: AiP Parameters PDF; ASCO abstracts/197367 — P(completed | ordered) = 61.2%
+    # This is layered on top of referral+scheduling steps above
+    if random.random() > cfg.LUNG_TEST_COMPLETION_PROB:
+        p.log(current_day, "LUNG: LDCT ordered and scheduled but not completed — LTFU")
+        p.exit_system(current_day, "lost_to_followup")
+        return False
+
+    p.log(current_day, "LUNG: LDCT completed")
+    if metrics is not None:
         metrics["lung_ldct_completed"] += 1
 
     return True

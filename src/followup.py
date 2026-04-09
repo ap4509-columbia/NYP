@@ -62,6 +62,8 @@ def check_ltfu_post_colposcopy(p: Patient, metrics: Optional[dict] = None) -> bo
     Probability driven by config: LTFU_PROBS['post_colposcopy_to_treatment'].
     Returns True if the patient is lost (did not complete treatment).
     """
+    # Source: AiP Parameters PDF — "50% Treated, 50% Exit" for CIN2/3 post-colposcopy
+    # Config: LTFU_PROBS["post_colposcopy_to_treatment"] = 0.50
     lost = random.random() < cfg.LTFU_PROBS["post_colposcopy_to_treatment"]
     if lost and metrics is not None:
         metrics["ltfu_post_colposcopy"] += 1
@@ -165,6 +167,9 @@ def run_colposcopy(
     """
     p.current_stage     = "followup"
     cin                 = draw_colposcopy_result(p)
+    # If colposcopy sample is insufficient, patient loops back for repeat colposcopy
+    # Source: AiP Parameters PDF — "Patients with insufficient information to diagnose loop back"
+    # INSUFFICIENT is included in COLPOSCOPY_RESULT_PROBS_DEFAULT with prob 0.07
     p.colposcopy_result = cin
     p.log(current_day, f"COLPOSCOPY → {cin}")
 
@@ -330,6 +335,16 @@ def run_lung_followup(
         if not _lung_result_communicated(p, current_day, metrics):
             return "exit"  # result never reached the patient
 
+        # Apply Lung-RADS specific follow-up adherence
+        # Source: ASCO JCO 2021.39.15_suppl.10540
+        if rads in cfg.LUNG_RADS_ADHERENCE:
+            if random.random() > cfg.LUNG_RADS_ADHERENCE[rads]:
+                p.log(current_day, f"LUNG {rads}: non-adherent to follow-up schedule — LTFU")
+                p.exit_system(current_day, "lost_to_followup")
+                if metrics is not None:
+                    metrics["ltfu_post_abnormal"] += 1
+                return "exit"
+
         repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(rads, 365)
         if rads == "RADS_0":
             # Incomplete scan — must repeat sooner (1–3 months) to get a valid result
@@ -348,6 +363,16 @@ def run_lung_followup(
     if rads in _LUNG_RADS_BIOPSY:
         if not _lung_result_communicated(p, current_day, metrics):
             return "exit"
+
+        # Apply Lung-RADS specific follow-up adherence
+        # Source: ASCO JCO 2021.39.15_suppl.10540
+        if rads in cfg.LUNG_RADS_ADHERENCE:
+            if random.random() > cfg.LUNG_RADS_ADHERENCE[rads]:
+                p.log(current_day, f"LUNG {rads}: non-adherent to follow-up schedule — LTFU")
+                p.exit_system(current_day, "lost_to_followup")
+                if metrics is not None:
+                    metrics["ltfu_post_abnormal"] += 1
+                return "exit"
 
         # Node 1: Was a biopsy referral placed by the provider?
         if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_referral_made"]:

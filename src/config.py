@@ -64,7 +64,57 @@ DESTINATION_PROBS = {
     "er":           0.20,
 }
 
+# Outpatient routing: PCP vs GYN (Source: AiP Parameters PDF; NYP operational data)
+DESTINATION_PROBS_OUTPATIENT = {
+    "pcp":          0.852,   # Source: AiP Parameters PDF
+    "gynecologist": 0.148,   # Source: AiP Parameters PDF
+    "specialist":   0.00,    # Source: AiP Parameters PDF
+    "er":           0.00,    # Source: AiP Parameters PDF
+}
+# Arrival type split (Source: NYP Facts & Figures — 2.5M outpatient + 620K ER annually; https://www.nyp.org/about/facts-and-figures)
+ARRIVAL_TYPE_PROBS = {
+    "outpatient": 0.80,
+    "er":         0.20,
+}
+
 OUTPATIENT_SHOW_PROB = 1.00   # raise to model no-shows
+
+# No-show rates by provider type
+# PCP: Kheirkhah et al. (2016, BMC Health Services Research)
+# GYN: Percac-Lima et al. (2010); Engelstad et al. (2001)
+# Specialist/ER: ASSUMPTION — no published NYC-specific data
+NO_SHOW_PROB = {
+    "pcp":          0.23,   # Kheirkhah et al. 2016, BMC Health Services Research
+    "gynecologist": 0.26,   # Percac-Lima et al. 2010; Engelstad et al. 2001
+    "specialist":   0.20,   # ASSUMPTION — placeholder
+    "er":           0.00,   # ER has no scheduled appointments
+}
+
+# Post-no-show disposition probabilities: what happens to a patient who misses their appointment
+# Source: Hwang et al. (2015, J Health Care Poor Underserved); AiP Parameters PDF
+NOT_SEEN_PROBS = {
+    "pcp": {
+        "reschedule": 0.50,   # Source: AiP Parameters PDF (Hwang et al. 2015)
+        "exit":       0.15,   # Source: AiP Parameters PDF
+        "wait":       0.35,   # Source: AiP Parameters PDF
+    },
+    "gynecologist": {
+        "reschedule": 0.40,   # Source: AiP Parameters PDF (Hwang et al. 2015)
+        "exit":       0.20,   # Source: AiP Parameters PDF
+        "wait":       0.40,   # Source: AiP Parameters PDF
+    },
+}
+
+# Cumulative exit probability by number of missed appointments (no-shows)
+# Source: AiP Parameters PDF — "15% exit after 1st no-show, 30% after 2nd, 60–80% after 3rd, rest after 4th"
+NOSHOW_CUMULATIVE_EXIT_PROB = [0.15, 0.30, 0.70, 1.00]  # after 1st, 2nd, 3rd, 4th no-show
+
+# Outreach scenario: with active navigation vs without
+# Source: AiP Parameters PDF — Cochrane reviews; Everett et al. 2011
+OUTREACH_PROBS = {
+    "with_navigation":    {"reschedule": 0.60, "exit": 0.10, "wait": 0.30},
+    "without_outreach":   {"reschedule": 0.35, "exit": 0.25, "wait": 0.40},
+}
 
 # ── Provider Daily Capacities ─────────────────────────────────────────────────
 # Scaled so total = DAILY_PATIENTS = 200. Distribution is proportional to
@@ -114,13 +164,75 @@ ELIGIBILITY = {
     "lung":     {"age_min": 50, "age_max": 80, "min_pack_years": 20, "max_years_since_quit": 15},
 }
 
+# P(patient aged 50–80 meets USPSTF lung eligibility: ≥20 pack-years, current/quit <15yr)
+# Source: CDC BRFSS NYC smoking data; Fedewa et al. 2022
+# NYC smoking prevalence ~12% vs national ~14%; eligible subset ~40% of ever-smokers age 50–80
+# Sensitivity range: 0.04–0.07
+LUNG_ELIGIBLE_BASE_PROB = 0.055   # Source: CDC BRFSS; Fedewa et al. 2022; AiP Parameters PDF
+
+# Screening initiation rates — hybrid per-visit probability model
+# Formula: P(screen at visit k) = min(P_base + (k-1) * P_increment, P_cap)
+# Source: AiP Parameters PDF, Section 2
+
+# Base per-visit screening initiation probability by setting
+# Cervical PCP: Kepka et al. Prev Med 2014; Stange et al. Ann Fam Med 2003; NYP Epic BPA adds ~10-15pp (Huy et al. 2013)
+# Cervical GYN: Sawaya et al. Ann Intern Med 2019 — well-woman visit, cervical screening is integral
+# Lung PCP: Fedewa et al. JAMA Intern Med 2022; Mazzone et al. Chest 2021 — SDM bottleneck
+SCREENING_INITIATION_BASE = {
+    "cervical_pcp": 0.55,   # Source: Kepka et al. Prev Med 2014; Stange et al. Ann Fam Med 2003; Huy et al. 2013; AiP Parameters PDF
+    "cervical_gyn": 0.85,   # Source: Sawaya et al. Ann Intern Med 2019; AiP Parameters PDF
+    "lung_pcp":     0.12,   # Source: Fedewa et al. JAMA Intern Med 2022; Mazzone et al. Chest 2021; AiP Parameters PDF
+}
+# Sensitivity ranges from AiP Parameters PDF:
+#   cervical_pcp: 40–65%; cervical_gyn: 75–92%; lung_pcp: 8–18%
+
+# Escalation per additional eligible visit where screening was not performed
+# ASSUMPTION — no published per-visit escalation rate; chosen to reach ~calibration target over 1.5 visits (cervical)
+SCREENING_INITIATION_INCREMENT = {
+    "cervical": 0.05,   # ASSUMPTION
+    "lung":     0.03,   # ASSUMPTION
+}
+
+# Maximum per-visit initiation probability (cap)
+# ASSUMPTION — prevents unrealistic 100% eventual uptake
+SCREENING_INITIATION_CAP = {
+    "cervical": 0.95,   # ASSUMPTION
+    "lung":     0.50,   # ASSUMPTION — SDM completes in only 30–50% of encounters (Mazzone et al. Chest 2021)
+}
+
+# "Never screener" fraction — patients who will never screen regardless of visit count
+# Source: AiP Parameters PDF — "~10–15% for cervical, ~60–70% for lung"
+NEVER_SCREENER_FRAC = {
+    "cervical": 0.125,   # Source: AiP Parameters PDF (midpoint of 10–15%)
+    "lung":     0.65,    # Source: AiP Parameters PDF (midpoint of 60–70%)
+}
+
+# Calibration targets from AiP Parameters PDF:
+# Cervical: model should yield ~73–83% of women up-to-date over a 3-year interval (NHIS/BRFSS)
+# Lung: annual rate ~20% (15–25%) at academic centers with dedicated programs (Fedewa et al. 2022)
+# Visits before initiation: cervical ~1.5 (range 1–3); lung ~4 (range 2–6)
+# Source: Triplette et al. JAMA Netw Open 2022 (lung visits before LDCT ordered)
+SCREENING_VISITS_BEFORE_INITIATION = {
+    "cervical": 1.5,   # Source: AiP Parameters PDF; Kepka et al. 2014
+    "lung":     4.0,   # Source: AiP Parameters PDF; Triplette et al. JAMA Netw Open 2022
+}
+
+# Cervical test type selection for ages 30–65
+# Co-test dominant at academic centers; primary HPV emerging post-2024 USPSTF draft
+# Source: AiP Parameters PDF
+TEST_TYPE_PROBS_30_65 = {
+    "co_test":   0.55,   # HPV + cytology; dominant at academic centers for 30–65; Source: AiP Parameters PDF
+    "cytology":  0.35,   # cytology alone; also used by some providers 30–65; Source: AiP Parameters PDF
+    "hpv_alone": 0.10,   # primary HPV alone; emerging but minority practice; Source: AiP Parameters PDF
+}
+
 # ── Screening Test Modalities ─────────────────────────────────────────────────
-# Cervical: age-stratified per USPSTF guidelines (no co-testing in base case)
+# Cervical: age-stratified per USPSTF guidelines
 SCREENING_TESTS = {
     "cervical": {
-        "young":  ["cytology"],              # age 21–29: cytology only (every 3 yrs)
-        "middle": ["cytology", "hpv_alone"], # age 30–65: cytology (3 yrs) or HPV-alone (5 yrs)
-        "older":  [],                         # age 65+ with adequate prior screening: do not screen
+        "young":  ["cytology"],                          # age 21–29: cytology only (USPSTF)
+        "middle": ["cytology", "hpv_alone", "co_test"],  # age 30–65: weighted by TEST_TYPE_PROBS_30_65
+        "older":  [],                                     # age 65+ with adequate prior screening: do not screen
     },
     "lung": ["ldct"],
 }
@@ -129,8 +241,21 @@ SCREENING_TESTS = {
 SCREENING_INTERVALS_DAYS = {
     "cytology":  365 * 3,
     "hpv_alone": 365 * 5,
+    "co_test":   365 * 3,   # co-test interval same as cytology per USPSTF; ASSUMPTION
     "ldct":      365 * 1,
 }
+
+# P(cervical test completed | test ordered at visit) — test happens in-office during PCP/GYN visit
+# Source: AiP Parameters PDF (Google Doc reference); note this is NOT the population-level uptake rate
+# Population-level: 72.5% of eligible women complete cervical screening (PMC8390589)
+# Per-visit: 97.1% complete once ordered — different denominator
+CERVICAL_TEST_COMPLETION_PROB = 0.97108   # Source: AiP Parameters PDF (Google Doc)
+
+# P(LDCT completed | ordered)
+# Source: ASCO abstracts/presentations/197367; AiP Parameters PDF
+# Absolute completion rate = 71.9% after follow-up (same source)
+LUNG_TEST_COMPLETION_PROB    = 0.612         # Source: ASCO abstracts/197367; AiP Parameters PDF
+LUNG_TEST_COMPLETION_ABSOLUTE = 0.719        # absolute completion after follow-up; same source
 
 # ── Cervical Result Probabilities ─────────────────────────────────────────────
 # PLACEHOLDER — replace with NYP EHR rates / ASCCP risk table values
@@ -163,15 +288,48 @@ CERVICAL_RESULT_PROBS = {
     },
 }
 
+# ── Lab/Result Turnaround Times ──────────────────────────────────────────────
+# Lab/result turnaround times (calendar days)
+# Source: AiP Parameters PDF
+TURNAROUND_DAYS = {
+    "cytology":               7,    # Pap cytology alone; Source: AiP Parameters PDF
+    "co_test":               10,    # HPV co-testing; Source: AiP Parameters PDF
+    "hpv_alone":              5,    # Primary HPV alone; Source: AiP Parameters PDF
+    "notification_normal":   10,    # Total days to patient notification (normal); Source: AiP Parameters PDF
+    "notification_abnormal": 14,    # Total days to patient notification (abnormal); Source: AiP Parameters PDF
+    "ldct_notification":      5,    # LDCT result to patient notification; Source: AiP Parameters PDF
+    "ldct_to_workup":        21,    # Positive LDCT result to diagnostic workup; Source: AiP Parameters PDF
+}
+
 # ── Lung-RADS Result Distribution (v2022) ────────────────────────────────────
-# PLACEHOLDER — calibrate to NYP LDCT volume data.
+# Lung-RADS result distribution (overall, across all LDCT scans)
+# Overall: negative=83%, positive=17%; Source: PMC10331628; AiP Parameters PDF
+# Among positive: RADS 3=60%, 4A=27%, 4B=13%; Source: Pinsky et al. 2015 (NLST/Lung-RADS)
+# RADS 0 (incomplete): 0.01 — ASSUMPTION (unchanged from prior estimate)
+# RADS 1/2 (negative/benign): 0.83 total, split 0.35/0.65 of negative — ASSUMPTION
 LUNG_RADS_PROBS = {
-    "RADS_0":    0.01,    # Incomplete
-    "RADS_1":    0.27,    # Negative
-    "RADS_2":    0.49,    # Benign appearance
-    "RADS_3":    0.11,    # Probably benign
-    "RADS_4A":   0.08,    # Suspicious
-    "RADS_4B_4X": 0.04,   # Very suspicious
+    "RADS_0":    0.010,   # incomplete scan; ASSUMPTION (prior estimate retained)
+    "RADS_1":    0.291,   # negative; Source: PMC10331628 (83% negative, split ASSUMPTION)
+    "RADS_2":    0.529,   # benign appearance; Source: PMC10331628 (split ASSUMPTION)
+    "RADS_3":    0.102,   # probably benign; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.60)
+    "RADS_4A":   0.046,   # suspicious; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.27)
+    "RADS_4B_4X": 0.022,  # very suspicious; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.13)
+}
+
+# Malignancy rate by Lung-RADS category (among patients in that category)
+# Source: Pinsky et al. 2015 (NLST/Lung-RADS); McKee et al. 2015; ACR Lung-RADS v1.1; Hammer et al. 2020
+LUNG_RADS_MALIGNANCY_RATE = {
+    "RADS_3":    0.03,   # Source: Pinsky et al. 2015; McKee et al. 2015
+    "RADS_4A":   0.08,   # Source: ACR Lung-RADS v1.1; Hammer et al. 2020
+    "RADS_4B_4X": 0.35,  # Source: Pinsky et al. 2015; ACR Lung-RADS v1.1
+}
+
+# Follow-up adherence by Lung-RADS category
+# Source: ASCO JCO 2021 (ascopubs.org/doi/10.1200/JCO.2021.39.15_suppl.10540)
+LUNG_RADS_ADHERENCE = {
+    "RADS_3":    0.671,   # Source: ASCO JCO 2021.39.15_suppl.10540
+    "RADS_4A":   0.664,   # Source: ASCO JCO 2021.39.15_suppl.10540
+    "RADS_4B_4X": 0.782,  # Source: ASCO JCO 2021.39.15_suppl.10540
 }
 
 # ── Lung Pathway Step Probabilities ──────────────────────────────────────────
@@ -188,6 +346,10 @@ LUNG_PATHWAY_PROBS = {
     "treatment_given":          0.92,
 }
 
+# P(follow-up completed | positive LDCT) treated by NYP: ~50%
+# Source: AiP Parameters PDF (Yiye Zhang, Weill Cornell)
+LUNG_NYP_TREATMENT_RATE = 0.50   # Source: AiP Parameters PDF
+
 # ── Lung-RADS Repeat Intervals (days) ────────────────────────────────────────
 LUNG_RADS_REPEAT_INTERVALS = {
     "RADS_0": 60,    # 1–3 months
@@ -198,13 +360,63 @@ LUNG_RADS_REPEAT_INTERVALS = {
 }
 
 # ── Loss-to-Follow-Up Probabilities ──────────────────────────────────────────
-# PLACEHOLDER — replace with NYP EHR-derived attrition rates
 LTFU_PROBS = {
     # Cervical
-    "post_abnormal_to_colposcopy":  0.20,
-    "post_colposcopy_to_treatment": 0.10,
-    # General
-    "unscreened_will_reschedule":   0.50,
+    # P(colposcopy completed | abnormal result): 75.3% within 12 months; Source: PMC9808794
+    # Note: marked "Most likely irrelevant to NYP" in AiP PDF — use with caution
+    "post_abnormal_to_colposcopy":  0.247,   # 1 - 0.753; Source: PMC9808794 (pmc.ncbi.nlm.nih.gov/articles/PMC9808794/)
+
+    # CIN2/3: 50% exit post-colposcopy before treatment; Source: AiP Parameters PDF
+    "post_colposcopy_to_treatment": 0.50,    # Source: AiP Parameters PDF ("50% Exit")
+
+    # Unscreened re-engagement: yes_schedule default = 0.40
+    # Source: AiP Parameters PDF; Cochrane reviews; Everett et al. 2011
+    # Outreach modality ranges: letter ~15–20%, phone ~30–40%, in-person ~40–55%
+    "unscreened_will_reschedule":   0.40,    # Source: AiP Parameters PDF (Everett et al. 2011)
+}
+
+# Fate of patients who decline outreach / don't reschedule
+# Source: NHIS/BRFSS longitudinal data; AiP Parameters PDF
+# "40–60% eventually screen within 5 years due to life events"
+UNSCREENED_FATE = {
+    "may_return_later": 0.60,   # Source: NHIS/BRFSS; AiP Parameters PDF
+    "exit_system":      0.40,   # Source: AiP Parameters PDF
+}
+
+# Scenario overrides for outreach testing
+# Source: AiP Parameters PDF
+UNSCREENED_REENTRY_SCENARIOS = {
+    "robust_navigation": 0.55,   # yes_schedule; Source: AiP Parameters PDF
+    "minimal_outreach":  0.25,   # yes_schedule; Source: AiP Parameters PDF
+}
+
+# Re-entry delay after outreach acceptance
+REENTRY_DELAY_DAYS = 30   # Source: AiP Parameters PDF
+
+# Overdue grace period before patient is flagged as non-adherent
+# Source: AiP Parameters PDF
+# Rationale: EHR BPAs typically fire at 1–3 months past due; CMS quality measure uses 12-month interval
+OVERDUE_GRACE_DAYS = {
+    "cervical_3yr": 90,    # Source: AiP Parameters PDF (EHR BPA fire window)
+    "cervical_5yr": 180,   # Source: AiP Parameters PDF (longer interval tolerates drift)
+    "lung":         90,    # Source: AiP Parameters PDF (CMS quality measure)
+}
+
+# Daily probability of spontaneous re-entry from overdue pool
+# Source: AiP Parameters PDF; NHIS/BRFSS longitudinal data
+# Implied median return: cervical ~18 months, lung ~12 months
+# Sensitivity: cervical 0.0007–0.0025; lung 0.0010–0.0035
+DAILY_REENTRY_PROB = {
+    "cervical": 0.0013,   # Source: AiP Parameters PDF
+    "lung":     0.0019,   # Source: AiP Parameters PDF
+}
+
+# Maximum days overdue before patient permanently exits (without active re-entry)
+# Source: AiP Parameters PDF
+MAX_OVERDUE_DAYS = {
+    "cervical_3yr": 1095,   # 3 years; Source: AiP Parameters PDF
+    "cervical_5yr": 1825,   # 5 years; Source: AiP Parameters PDF
+    "lung":          730,   # 2 years; Source: AiP Parameters PDF
 }
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────
@@ -226,9 +438,15 @@ RISK_MULT_PRIOR_CIN_HIGHGRADE   = 1.8   # inflate ASC-H / HSIL if prior CIN2/CIN
 # ── Colposcopy Result Fallback Distribution ───────────────────────────────────
 # Used when the triggering cytology result does not match any key in
 # COLPOSCOPY_RESULT_PROBS (e.g. unexpected result category).
-# PLACEHOLDER — replace with ASCCP risk table values.
+# Colposcopy finding distribution (aggregate, all triggers combined)
+# Source: AiP Parameters PDF
+# Note: CIN2 and CIN3 split from combined high_grade (0.30) is ASSUMPTION — use 50/50
 COLPOSCOPY_RESULT_PROBS_DEFAULT = {
-    "NORMAL": 0.50, "CIN1": 0.25, "CIN2": 0.15, "CIN3": 0.10,
+    "NORMAL":       0.35,   # resolved_normal; Source: AiP Parameters PDF
+    "CIN1":         0.28,   # low_grade; Source: AiP Parameters PDF
+    "CIN2":         0.15,   # high_grade split (50% of 0.30); Source: AiP Parameters PDF; split ASSUMPTION
+    "CIN3":         0.15,   # high_grade split (50% of 0.30); Source: AiP Parameters PDF; split ASSUMPTION
+    "INSUFFICIENT": 0.07,   # insufficient sample; Source: AiP Parameters PDF
 }
 
 # ── Colposcopy Result Probabilities ───────────────────────────────────────────
@@ -249,6 +467,18 @@ TREATMENT_ASSIGNMENT = {
     "CIN3":   "leep",
 }
 
+# CIN2/3 treatment outcome split
+# Source: AiP Parameters PDF — "50% Treated, 50% Exit"
+CIN23_TREATMENT_RATE = 0.50   # P(treated | CIN2/3 diagnosed); Source: AiP Parameters PDF
+
+# CIN1 surveillance parameters
+# Source: ASCCP 2019 (High confidence); Castle et al. 2009; Ostor 1993; ALTS trial; Cox et al. 2003
+CIN1_SURVEILLANCE_INTERVAL_DAYS  = 365    # 12-month follow-up interval; Source: ASCCP 2019
+CIN1_MAX_CLEAN_VISITS_BEFORE_ROUTINE = 2  # consecutive clean visits before returning to routine; Source: ASCCP 2019
+CIN1_RESOLUTION_PROB_PER_VISIT    = 0.40  # Source: Castle et al. 2009; Ostor 1993
+CIN1_ESCALATION_PROB_PER_VISIT    = 0.07  # escalation to CIN2/3; Source: ALTS trial; Cox et al. 2003
+CIN1_PERSISTENCE_PROB_PER_VISIT   = 0.53  # calculated: 1 - 0.40 - 0.07; Source: AiP Parameters PDF
+
 # ── Post-Treatment / Post-Negative Re-entry Delays (days) ─────────────────────
 POST_TREATMENT_DELAY_DAYS = {
     "cervical": 180,
@@ -266,7 +496,15 @@ CAPACITIES = {
 }
 
 # ── Unscreened Re-entry Delay (days) ──────────────────────────────────────────
-RESCHEDULE_DELAY_DAYS = 90
+# Reschedule delay by provider type
+# Source: AiP Parameters PDF
+RESCHEDULE_DELAY_DAYS = {
+    "pcp":          28,   # Source: AiP Parameters PDF
+    "gynecologist": 38,   # Source: AiP Parameters PDF
+    "specialist":   30,   # ASSUMPTION
+    "er":            7,   # ASSUMPTION
+    "default":      30,   # ASSUMPTION — fallback if provider not specified
+}
 
 # ── Inter-Step Scheduling Delays (days) ───────────────────────────────────────
 # Time between referral and the next appointment at each step.
@@ -274,11 +512,19 @@ RESCHEDULE_DELAY_DAYS = 90
 # (coordinated care reduces these delays).
 # PLACEHOLDER — replace with NYP scheduling data.
 FOLLOWUP_DELAY_DAYS = {
-    "colposcopy":     30,    # abnormal result → colposcopy appointment
-    "leep":           14,    # colposcopy → LEEP procedure
-    "cone_biopsy":    21,    # colposcopy → cone biopsy procedure
-    "lung_biopsy":    14,    # RADS 4 → CT-guided biopsy
-    "lung_treatment": 21,    # malignancy confirmed → treatment start
+    "colposcopy":        50,    # default: abnormal result → colposcopy; Source: AiP Parameters PDF (was 30 — ASSUMPTION)
+    "colposcopy_hsil":   32,    # HSIL-expedited colposcopy; Source: AiP Parameters PDF
+    "leep":              14,    # colposcopy → LEEP; ASSUMPTION
+    "cone_biopsy":       21,    # colposcopy → cone biopsy; ASSUMPTION
+    "lung_biopsy":       21,    # RADS 4 → diagnostic workup; Source: AiP Parameters PDF
+    "lung_treatment":    21,    # malignancy confirmed → treatment start; ASSUMPTION
+}
+
+# Time-to-colposcopy guidelines by result severity
+# Source: 2019 ASCCP Risk-Based Management Consensus Guidelines (Perkins et al., J Low Genit Tract Dis 2020)
+ABNORMAL_FOLLOWUP_DAYS = {
+    "ASCUS_LSIL": 90,    # within 3 months; Source: ASCCP 2019 (Perkins et al. 2020)
+    "HSIL_ASCH":  30,    # expedited, within 1 month; Source: ASCCP 2019 (Perkins et al. 2020)
 }
 
 # =============================================================================
@@ -384,6 +630,41 @@ ANNUAL_MORTALITY_RATE = {
 # ── Database persistence ──────────────────────────────────────────────────────
 DB_PATH           = "nyp_simulation.db"  # SQLite file path (relative to working dir)
 DB_FLUSH_INTERVAL = 30                   # flush exited patients to SQLite every N days
+
+# ── Post-Treatment Surveillance Schedules ────────────────────────────────────
+# Cervical post-CIN2/3 treatment surveillance schedule
+# Source: Katki et al. 2013, JNCI; AiP Parameters PDF
+# Format: list of (max_year, interval_months) — apply in order
+POST_TREATMENT_SURVEILLANCE_CERVICAL = [
+    (2,  6),    # Years 1–2: every 6 months (4 visits); Source: Katki et al. 2013, JNCI
+    (5,  12),   # Years 3–5: every 12 months (3 visits); Source: Katki et al. 2013
+    (25, 36),   # Years 6–25: every 36 months (~7 visits); Source: Katki et al. 2013
+]
+POST_TREATMENT_ACTIVE_YEARS_CERVICAL = 10   # practical active duration; Source: Katki et al. 2013, JNCI
+
+# Lung cancer post-treatment surveillance schedule
+# Source: NCCN NSCLC Survivorship; ASCO (Schneider et al. 2020); AiP Parameters PDF
+POST_TREATMENT_SURVEILLANCE_LUNG = [
+    (2,  6),    # Years 1–2: every 6 months; Source: NCCN NSCLC Survivorship
+    (5,  12),   # Years 3–5: every 12 months; Source: NCCN; ASCO Schneider et al. 2020
+    (999, 12),  # Year 6+: every 12 months if fit; Source: NCCN
+]
+POST_TREATMENT_ACTIVE_YEARS_LUNG = 5   # standard of care; Source: AiP Parameters PDF
+
+# Untreated patient re-engagement probabilities
+# Source: AiP Parameters PDF
+UNTREATED_REENGAGEMENT = {
+    "cervical_cin23": {
+        "reengage":        0.70,   # Source: AiP Parameters PDF; sensitivity 0.55–0.85
+        "remain_overdue":  0.20,   # Source: AiP Parameters PDF; sensitivity 0.10–0.25
+        "exit":            0.10,   # Source: AiP Parameters PDF; sensitivity 0.05–0.20
+    },
+    "lung": {
+        "reengage":        0.55,   # Source: AiP Parameters PDF; sensitivity 0.35–0.70
+        "remain_overdue":  0.15,   # Source: AiP Parameters PDF; sensitivity 0.05–0.20
+        "exit":            0.30,   # Source: AiP Parameters PDF; sensitivity 0.15–0.40
+    },
+}
 
 # ── Procedure Revenue (per event, USD) ────────────────────────────────────────
 # PLACEHOLDER — replace with NYP finance / contract rates.
