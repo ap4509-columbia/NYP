@@ -42,6 +42,11 @@ DAYS_PER_YEAR  = 365
 SIM_DAYS       = SIM_YEARS * DAYS_PER_YEAR   # = 25,550 days
 NUM_REPS       = 10       # number of replications for variance analysis
 
+# Skip weekends — hospital screenings and appointments only occur Monday–Friday.
+# Day 0 of the simulation is treated as Monday (day % 7: 0=Mon … 4=Fri, 5=Sat, 6=Sun).
+# Source: AiP Parameters PDF — "skip_weekends: true"
+SKIP_WEEKENDS  = True
+
 # ── Workflow Mode ─────────────────────────────────────────────────────────────
 # "fragmented"  = current state (separate appointments per specialty)
 # "coordinated" = future state (bundled multi-screening program)

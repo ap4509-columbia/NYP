@@ -625,7 +625,18 @@ class SimulationRunner:
             1. Process follow-up appointments due today.
             2. Generate new patient arrivals → route to queues.
             3. For each provider: seat patients, route overflow, screen seen.
+
+        Weekends (day % 7 in {5, 6}) are skipped when cfg.SKIP_WEEKENDS is True —
+        the hospital does not perform screenings or appointments on Saturdays/Sundays.
+        Day 0 is treated as Monday. Mortality sweeps and DB flushes still run on
+        weekends so background processes are unaffected.
+        Source: AiP Parameters PDF — "skip_weekends: true"
         """
+        # ── Weekend skip ──────────────────────────────────────────────────────
+        # Only the clinical steps (arrivals + provider queues) are suppressed.
+        # Background maintenance (mortality, DB flush, year checkpoint) still runs.
+        is_weekend = cfg.SKIP_WEEKENDS and (day % 7 >= 5)  # 5=Saturday, 6=Sunday
+
         if self.use_stable_population:
             # Mortality sweep — runs every MORTALITY_CHECK_DAYS
             if (day - self._last_mortality_day) >= cfg.MORTALITY_CHECK_DAYS:
@@ -664,25 +675,27 @@ class SimulationRunner:
                 "cum_n_patients":      self.metrics["n_patients"],
             })
 
-        # 1. Follow-ups due today
-        for p, context in self._queues.get_due_followups(day):
-            self._run_followup(p, context, day)
+        # Clinical steps — skipped on weekends (no hospital screenings/appointments)
+        if not is_weekend:
+            # 1. Follow-ups due today
+            for p, context in self._queues.get_due_followups(day):
+                self._run_followup(p, context, day)
 
-        # 2. New arrivals
-        self._generate_arrivals(day)
+            # 2. New arrivals
+            self._generate_arrivals(day)
 
-        # 3. Provider queues
-        for provider in _ALL_PROVIDERS:
-            seen, overflow = self._queues.process_day(provider, day)
+            # 3. Provider queues
+            for provider in _ALL_PROVIDERS:
+                seen, overflow = self._queues.process_day(provider, day)
 
-            self.metrics.setdefault("overflow", defaultdict(int))
-            self.metrics["overflow"][provider] += len(overflow)
+                self.metrics.setdefault("overflow", defaultdict(int))
+                self.metrics["overflow"][provider] += len(overflow)
 
-            self._route_overflow(overflow, provider, day)
+                self._route_overflow(overflow, provider, day)
 
-            for p in seen:
-                p.wait_days = day - p.day_created
-                self._screen_patient(p, day)
+                for p in seen:
+                    p.wait_days = day - p.day_created
+                    self._screen_patient(p, day)
 
     # =========================================================================
     # Arrivals
