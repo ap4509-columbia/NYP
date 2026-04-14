@@ -733,19 +733,25 @@ Non-established patients who hit LTFU exit permanently.
 
 ## 13. Loss-to-Follow-Up (LTFU)
 
-### Queue LTFU (Daily Geometric Hazard)
+### Queue LTFU (Geometric Waiting-Time Model)
 
 **Function:** `_check_queue_ltfu(p, day, referral_day, queue_type, procedure)` — called each day a patient is retrying for a procedure slot.
 
-When a patient is waiting in a procedure queue (overflow, retrying daily), each day they face a small probability of abandoning:
+When a patient is waiting in a procedure queue (overflow, retrying daily), each day an independent **Bernoulli trial** is drawn:
 
-| Queue Type | Daily Hazard | Config Key | Median Survival in Queue |
-|---|---|---|---|
-| Primary screening | 0.002 | `LTFU_PROBS["queue_primary_daily"]` | ~346 days |
-| Secondary (colposcopy/biopsy) | 0.005 | `LTFU_PROBS["queue_secondary_daily"]` | ~139 days |
-| Treatment (LEEP/cone) | 0.003 | `LTFU_PROBS["queue_treatment_daily"]` | ~231 days |
+```python
+random.random() < LTFU_PROBS[f"queue_{queue_type}_daily"]
+```
 
-Queue LTFU is the **sole dropout mechanism** from procedure queues. Median survival = ln(2) / daily_prob.
+The number of days until abandonment therefore follows a **geometric waiting-time distribution**, Geometric(p) — the discrete analog of the Exponential. Because the Geometric distribution is **memoryless**, the probability of abandoning on any given day does not depend on how long the patient has already waited.
+
+| Queue Type | Daily Hazard (*p*) | Config Key | Mean (1/*p*) | Median ⌈ln 0.5 / ln(1−*p*)⌉ |
+|---|---|---|---|---|
+| Primary screening | 0.002 | `LTFU_PROBS["queue_primary_daily"]` | 500 days | ~346 days |
+| Secondary (colposcopy/biopsy) | 0.005 | `LTFU_PROBS["queue_secondary_daily"]` | 200 days | ~139 days |
+| Treatment (LEEP/cone) | 0.003 | `LTFU_PROBS["queue_treatment_daily"]` | 333 days | ~231 days |
+
+Queue LTFU is the **sole dropout mechanism** from procedure queues. There is no single up-front draw — it is a geometric waiting-time process: a daily coin flip each time `_check_queue_ltfu()` is called during the retry loop.
 
 When queue LTFU fires:
 1. Wait time recorded in `metrics["wait_times_abandoned"][procedure]`
