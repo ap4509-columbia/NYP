@@ -93,16 +93,6 @@ PROVIDER_CAPACITY = {
     "er":           43,   # PLACEHOLDER — 22% of 200
 }
 
-# NOTE: OUTPATIENT_FRACTION is no longer used for capacity enforcement
-# (provider routing is proportional, not capacity-constrained).
-# Kept for reference / future scenario analysis.
-OUTPATIENT_FRACTION = {
-    "pcp":          0.75,   # PLACEHOLDER
-    "gynecologist": 0.73,   # PLACEHOLDER
-    "specialist":   0.75,   # PLACEHOLDER
-    "er":           0.00,   # ER is entirely drop-in
-}
-
 # Scheduling lead time for new outpatient appointments (uniform lo–hi days ahead).
 # PLACEHOLDER — replace with NYP scheduling data.
 OUTPATIENT_LEAD_DAYS = {
@@ -110,10 +100,6 @@ OUTPATIENT_LEAD_DAYS = {
     "gynecologist": (7,  21),
     "specialist":   (14, 28),
 }
-
-# NOTE: ER_OVERFLOW_RETRY_PROB is no longer used — provider routing is
-# proportional, overflow happens at procedure slots not providers.
-ER_OVERFLOW_RETRY_PROB = 0.70   # UNUSED
 
 # Fraction of ER arrivals flagged as critical (return next day for follow-up).
 ER_CRITICAL_PROB = 0.50         # PLACEHOLDER
@@ -578,11 +564,6 @@ ARRIVAL_SOURCES = {
         "routing":    "outpatient",
     },
 }
-
-# ── NYP MODEL ASSUMPTION: Age-based drop-in queue priority ───────────────────
-# NOTE: AGE_PRIORITY_THRESHOLD is no longer used — provider-level queueing
-# was removed; overflow now happens at procedure slots.
-AGE_PRIORITY_THRESHOLD = 40           # UNUSED
 
 # ── Visit scheduling ──────────────────────────────────────────────────────────
 ANNUAL_VISIT_INTERVAL  = 365           # days between established patient visits
