@@ -42,7 +42,6 @@ class Patient:
     # ── Simulation state ──────────────────────────────────────────────────────
     active:                bool = True       # False once the patient exits the system
     current_stage:         str  = "arrived"  # tracks where in the pathway the patient is
-    willing_to_reschedule: bool = True       # used by handle_unscreened to decide LTFU vs. retry
     # ── Screening history (simulation day of last screen; -1 = never) ─────────
     # Compared against today's day in is_due_for_screening() to enforce intervals
     last_cervical_screen_day:     int           = -1

@@ -311,11 +311,6 @@ LTFU_PROBS = {
     "queue_primary_daily":   0.002,    # PLACEHOLDER — primary screening retry queue
     "queue_secondary_daily": 0.005,    # PLACEHOLDER — colposcopy / lung biopsy retry queue
     "queue_treatment_daily": 0.003,    # PLACEHOLDER — LEEP / cone biopsy retry queue
-
-    # Unscreened re-engagement: yes_schedule default = 0.40
-    # Source: AiP Parameters PDF; Cochrane reviews; Everett et al. 2011
-    # Outreach modality ranges: letter ~15–20%, phone ~30–40%, in-person ~40–55%
-    "unscreened_will_reschedule":   0.40,    # Source: AiP Parameters PDF (Everett et al. 2011)
 }
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────

@@ -1,38 +1,34 @@
 # =============================================================================
 # scenarios.py
-# Scenario definitions and co-scheduling logic for improvement analysis.
+# Scenario definitions for coordinated vs. fragmented workflow comparison.
 # =============================================================================
 # The central question: how much does co-scheduling (bundling cervical and
 # lung screenings into fewer patient encounters) improve throughput, reduce
-# loss-to-follow-up, and increase detected cancers?
+# queue-based LTFU, and increase detected cancers?
 #
 # Two workflow models:
 #
 #   FRAGMENTED (current state)
 #     Each provider covers only their relevant cancer types.
 #     A patient needing both cervical and lung screening must make separate
-#     appointments. Each encounter carries independent LTFU risk.
+#     appointments, each competing for procedure slots independently.
 #
 #   COORDINATED (future state / co-scheduling)
 #     On first contact, all due eligible screenings are identified together.
 #     A single coordinated encounter handles all of them.
-#     One LTFU draw per encounter — not per screening.
+#     Reduces total encounters and queue exposure.
+#
+# NOTE: LTFU in the main simulation is handled exclusively by the queue-based
+# geometric waiting-time hazard in runner.py (_check_queue_ltfu). This module
+# defines scenario parameters (capacity multipliers, scheduling delays) that
+# the runner uses when running scenario comparisons.
 # =============================================================================
 
-import random
-import copy
-from typing import List, Optional, Dict
+from typing import List, Dict
 
 import config as cfg
 from patient import Patient
-from screening import (
-    get_eligible_screenings,
-    is_due_for_screening,
-    run_screening_step,
-    handle_unscreened,
-)
-from followup import run_cervical_followup, run_lung_followup
-from metrics import initialize_metrics, record_screening, record_exit
+from screening import get_eligible_screenings, is_due_for_screening
 
 
 # ─── Provider → Cancer Mapping (Fragmented Mode) ──────────────────────────────
@@ -55,8 +51,9 @@ COORDINATED_CANCER_MAP = {
 
 # ─── Scenario Definitions ────────────────────────────────────────────────────
 # Each scenario overrides specific config values and scheduling behaviour.
-# "ltfu_multiplier" scales all LTFU_PROBS relative to baseline.
-# "scheduling_delay_days" is additional delay before a bundled appointment.
+# These parameters are consumed by the runner when executing scenario runs.
+# LTFU is always queue-based (geometric waiting-time); scenarios modify
+# capacity and scheduling delays, which indirectly affect queue LTFU rates.
 
 SCENARIOS: Dict[str, dict] = {
 
@@ -64,12 +61,11 @@ SCENARIOS: Dict[str, dict] = {
         "label":                "Baseline — Fragmented",
         "description":          (
             "Current state. Each provider screens only their domain cancers. "
-            "Patients needing multiple screenings must make separate appointments. "
-            "Each encounter has independent LTFU risk."
+            "Patients needing multiple screenings must make separate appointments, "
+            "each competing for procedure slots independently."
         ),
         "cancer_map":           PROVIDER_CANCER_MAP,
         "co_schedule":          False,   # one cancer per encounter
-        "ltfu_multiplier":      1.0,     # baseline
         "scheduling_delay_days": 30,     # avg days to get a follow-up slot
         "capacity_multiplier":  1.0,
     },
@@ -86,7 +82,6 @@ SCENARIOS: Dict[str, dict] = {
             "gynecologist": ["cervical", "lung"],
         },
         "co_schedule":          ["cervical", "lung"],
-        "ltfu_multiplier":      0.80,
         "scheduling_delay_days": 21,
         "capacity_multiplier":  1.1,
     },
@@ -95,12 +90,11 @@ SCENARIOS: Dict[str, dict] = {
         "label":                "Full Co-Scheduling",
         "description":          (
             "All due eligible screenings are identified on first contact and "
-            "bundled into a single coordinated encounter. One LTFU draw per patient "
-            "instead of one per screening. Represents the full programme vision."
+            "bundled into a single coordinated encounter. Reduces total encounters "
+            "and queue exposure. Represents the full programme vision."
         ),
         "cancer_map":           COORDINATED_CANCER_MAP,
         "co_schedule":          True,    # all eligible cancers per encounter
-        "ltfu_multiplier":      0.55,    # substantially fewer drop-out points
         "scheduling_delay_days": 10,
         "capacity_multiplier":  1.25,    # need more screening capacity per slot
     },
@@ -114,7 +108,6 @@ SCENARIOS: Dict[str, dict] = {
         ),
         "cancer_map":           COORDINATED_CANCER_MAP,
         "co_schedule":          True,
-        "ltfu_multiplier":      0.30,    # near-elimination of access-related LTFU
         "scheduling_delay_days": 3,
         "capacity_multiplier":  1.4,
     },
@@ -145,192 +138,6 @@ def count_encounters_needed(
     ):
         return 1   # all handled in one encounter
     return len(eligible)   # fragmented: one encounter per cancer
-
-
-# ─── Adjusted LTFU Draw ───────────────────────────────────────────────────────
-
-def adjusted_ltfu(base_prob: float, scenario: dict) -> bool:
-    """Draw LTFU with scenario-specific multiplier applied."""
-    adjusted = min(base_prob * scenario["ltfu_multiplier"], 1.0)
-    return random.random() < adjusted
-
-
-# ─── Core Encounter Logic ─────────────────────────────────────────────────────
-
-def run_encounter(
-    p: Patient,
-    provider: str,
-    current_day: int,
-    metrics: dict,
-    scenario: dict,
-) -> None:
-    """
-    Simulate one provider encounter under the given scenario.
-
-    In fragmented mode:
-      - Only screens for cancers within this provider's domain.
-      - Each cancer is an independent LTFU risk.
-
-    In coordinated mode:
-      - Screens for ALL eligible due cancers in one encounter.
-      - One shared LTFU draw determines whether the patient stays or leaves.
-
-    Updates patient object and metrics in place.
-    """
-    metrics["n_patients"] += 1
-
-    cancer_map       = scenario["cancer_map"]
-    co_schedule      = scenario["co_schedule"]
-    provider_cancers = cancer_map.get(provider, [])
-
-    # Cancers this patient is eligible for AND within provider scope AND due
-    eligible_here = [
-        c for c in get_eligible_screenings(p)
-        if c in provider_cancers
-        and is_due_for_screening(p, c, current_day)
-    ]
-
-    if not eligible_here:
-        metrics["n_unscreened"] += 1
-        # Patient seen but no screening due — no LTFU risk, just a visit
-        p.log(current_day, f"ENCOUNTER {provider} — no screenings due")
-        return
-
-    metrics["n_eligible_any"] += 1
-
-    # ── Coordinated / co-scheduled encounter ─────────────────────────────────
-    if co_schedule is True or (
-        isinstance(co_schedule, list)
-        and set(eligible_here).issubset(set(co_schedule))
-    ):
-        # Single LTFU draw for the whole bundle.
-        #
-        # Two bugs were present here:
-        #   1. The outer draw used unscreened_will_reschedule (the STAY probability)
-        #      as the drop-out probability — logically inverted.  Using it directly
-        #      in adjusted_ltfu meant that a HIGH reschedule probability produced
-        #      MORE drop-outs.  Fixed: use (1 - reschedule_prob) as the drop-out prob.
-        #
-        #   2. When adjusted_ltfu fired, handle_unscreened was called — making a
-        #      second independent Bernoulli draw on the same question.  The outer
-        #      draw had already decided "drop out"; the inner draw could contradict
-        #      it by returning "reschedule".  Fixed: handle the drop-out inline
-        #      without a second draw.
-        ltfu_prob = 1.0 - cfg.LTFU_PROBS["unscreened_will_reschedule"]
-        if adjusted_ltfu(ltfu_prob, scenario):
-            # Patient no-shows / drops out before the bundled appointment.
-            metrics["n_unscreened"] += 1
-            metrics["ltfu_unscreened"] += 1
-            p.log(current_day, f"ENCOUNTER {provider} — patient no-show (bundle LTFU)")
-            metrics["scenario_encounters_saved"] = (
-                metrics.get("scenario_encounters_saved", 0) + len(eligible_here) - 1
-            )
-            return
-
-        # All screenings happen in one encounter
-        metrics["scenario_encounters_saved"] = (
-            metrics.get("scenario_encounters_saved", 0) + len(eligible_here) - 1
-        )
-        for cancer in eligible_here:
-            _screen_and_followup(p, cancer, current_day, metrics, scenario)
-
-    # ── Fragmented encounter ──────────────────────────────────────────────────
-    else:
-        # Each cancer is an independent encounter with its own LTFU risk
-        for cancer in eligible_here:
-            if not p.active:
-                break
-            # Independent no-show / decline check per screening
-            if adjusted_ltfu(1 - cfg.LTFU_PROBS["unscreened_will_reschedule"], scenario):
-                # Patient misses this screening encounter
-                metrics["n_unscreened"] += 1
-                p.log(current_day, f"MISSED {cancer} screening encounter (fragmented LTFU)")
-                continue
-            _screen_and_followup(p, cancer, current_day, metrics, scenario)
-
-
-def _screen_and_followup(
-    p: Patient, cancer: str, current_day: int, metrics: dict, scenario: dict
-) -> None:
-    """Run one screening + follow-up for a specific cancer (shared helper)."""
-    result = run_screening_step(p, cancer, current_day, metrics)
-    if result is None:
-        return
-
-    record_screening(metrics, p, cancer, result)
-
-    if cancer == "cervical":
-        run_cervical_followup(p, current_day, metrics)
-    elif cancer == "lung":
-        run_lung_followup(p, current_day, metrics)
-
-    if p.exit_reason:
-        record_exit(metrics, p.exit_reason)
-
-
-# ─── Scenario Runner ──────────────────────────────────────────────────────────
-
-def run_scenario(
-    scenario_name: str,
-    patients: List[Patient],
-    providers: List[str],
-    sim_day: int = 0,
-    seed: int = cfg.RANDOM_SEED,
-) -> dict:
-    """
-    Run one scenario over a pre-generated patient cohort.
-
-    Parameters
-    ----------
-    scenario_name : key from SCENARIOS dict
-    patients      : list of Patient objects (from population.sample_patient)
-    providers     : provider assignment for each patient (same order as patients)
-    sim_day       : simulation day (for interval/due-date checks)
-    seed          : random seed
-
-    Returns
-    -------
-    metrics dict with all tracked outcomes + scenario metadata
-    """
-    assert scenario_name in SCENARIOS, (
-        f"Unknown scenario '{scenario_name}'. Choose from: {list(SCENARIOS.keys())}"
-    )
-    assert len(patients) == len(providers), "patients and providers must have equal length"
-
-    scenario = SCENARIOS[scenario_name]
-    random.seed(seed)
-
-    metrics = initialize_metrics()
-    metrics["scenario_name"]  = scenario_name
-    metrics["scenario_label"] = scenario["label"]
-    metrics["scenario_encounters_saved"] = 0
-
-    # Deep-copy patients so each scenario gets a clean slate
-    fresh_patients = [copy.deepcopy(p) for p in patients]
-
-    for p, provider in zip(fresh_patients, providers):
-        run_encounter(p, provider, sim_day, metrics, scenario)
-
-    return metrics
-
-
-# ─── Multi-Scenario Comparison ────────────────────────────────────────────────
-
-def compare_scenarios(
-    scenario_names: List[str],
-    patients: List[Patient],
-    providers: List[str],
-    sim_day: int = 0,
-    seed: int = cfg.RANDOM_SEED,
-) -> Dict[str, dict]:
-    """
-    Run multiple scenarios over the same patient cohort and return all metrics.
-    Patients are deep-copied for each scenario so results are independent.
-    """
-    return {
-        name: run_scenario(name, patients, providers, sim_day, seed)
-        for name in scenario_names
-    }
 
 
 # ─── Age-Clustering Analysis ──────────────────────────────────────────────────

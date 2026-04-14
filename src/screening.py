@@ -421,29 +421,3 @@ def days_until_eligible(p: Patient, cancer: str) -> int:
         return days_needed if days_needed > 0 else 0
 
     return -1  # unknown cancer type
-
-
-# ─── Unscreened Pathway ───────────────────────────────────────────────────────
-
-def handle_unscreened(p: Patient, current_day: int) -> str:
-    """
-    Decision node for ELIGIBLE patients who were not offered screening during a visit
-    (e.g. provider ran out of time, patient declined).
-
-    Reserved for future use when that specific scenario is modelled explicitly.
-    The current runner uses days_until_eligible() instead to route ineligible patients.
-
-    Returns: "reschedule" | "exit"
-    """
-    if not p.active:
-        return "exit"
-
-    if random.random() < cfg.LTFU_PROBS["unscreened_will_reschedule"]:
-        p.willing_to_reschedule = True
-        p.log(current_day, "UNSCREENED (eligible) — willing to reschedule")
-        return "reschedule"
-
-    p.willing_to_reschedule = False
-    p.exit_system(current_day, "lost_to_followup")
-    p.log(current_day, "UNSCREENED (eligible) — exits system (will not reschedule)")
-    return "exit"
