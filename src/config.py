@@ -313,12 +313,13 @@ LTFU_PROBS = {
     "queue_treatment_daily": 0.003,    # PLACEHOLDER — LEEP / cone biopsy retry queue
 
     # ── Reschedule probability ──────────────────────────────────────────────
-    # When a patient's screening slot is full, this is the probability they
-    # reschedule for the next available day (re-enter queue). Patients who
-    # do not reschedule simply do not return for that appointment.
-    # Applied at primary and secondary screening queue overflow.
-    "reschedule_primary":    0.10,     # PLACEHOLDER — P(reschedule | primary screening slot full)
-    "reschedule_secondary":  0.10,     # PLACEHOLDER — P(reschedule | secondary screening slot full)
+    # P(patient cannot make it today and reschedules to the next day).
+    # Checked BEFORE attempting to consume a procedure slot. If the patient
+    # does NOT reschedule (90%), they proceed to their appointment normally.
+    # This is NOT an LTFU mechanism — rescheduled patients simply shift by
+    # one day. LTFU comes only from the geometric waiting-time hazard.
+    "reschedule_primary":    0.10,     # PLACEHOLDER — P(patient reschedules | primary screening)
+    "reschedule_secondary":  0.10,     # PLACEHOLDER — P(patient reschedules | secondary screening)
 }
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────

@@ -863,19 +863,27 @@ class SimulationRunner:
             # Primary screenings compete for slots — PCP/GYN/Specialist are
             # processed before ER, so scheduled patients get priority.
             test = assign_screening_test(p, cancer)
+
+            # Reschedule check: patient may not be able to make it today
+            # (10% PLACEHOLDER). If so, re-enter queue for next day.
+            if random.random() < cfg.LTFU_PROBS.get("reschedule_primary", 0.10):
+                orig_ref = day - p.wait_days if p.wait_days > 0 else day
+                self._queues.schedule_followup(
+                    p, {"cancer": cancer, "step": "screening_retry",
+                         "referral_day": orig_ref}, day + 1
+                )
+                p.log(day, f"RESCHEDULE {test} — patient unavailable, moved to day {day + 1}")
+                continue
+
             self._day_screening_demand += 1
             if not self._queues.consume_slot(test, day):
                 self._day_screening_overflow += 1
-                # Check if patient will reschedule
-                if random.random() < cfg.LTFU_PROBS.get("reschedule_primary", 1.0):
-                    orig_ref = day - p.wait_days if p.wait_days > 0 else day
-                    self._queues.schedule_followup(
-                        p, {"cancer": cancer, "step": "screening_retry",
-                             "referral_day": orig_ref}, day + 1
-                    )
-                    p.log(day, f"NO SLOT for {test} — rescheduled to day {day + 1}")
-                else:
-                    p.log(day, f"NO SLOT for {test} — did not reschedule")
+                orig_ref = day - p.wait_days if p.wait_days > 0 else day
+                self._queues.schedule_followup(
+                    p, {"cancer": cancer, "step": "screening_retry",
+                         "referral_day": orig_ref}, day + 1
+                )
+                p.log(day, f"NO SLOT for {test} — rescheduled to day {day + 1}")
                 continue
 
             self._day_screening_supply += 1
@@ -1343,16 +1351,21 @@ class SimulationRunner:
             if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "cytology"):
                 return
             # 1-year repeat cytology for HPV+ low-risk path.
+            # Reschedule check: patient may not make it today
+            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "one_year_repeat",
+                         "referral_day": referral_day}, day + 1
+                )
+                p.log(day, "RESCHEDULE cytology repeat — patient unavailable, moved to next day")
+                return
             self._day_secondary_demand += 1
             if not self._queues.consume_slot("cytology", day):
                 self._day_secondary_overflow += 1
-                if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 1.0):
-                    self._queues.schedule_followup(
-                        p, {"cancer": "cervical", "step": "one_year_repeat",
-                             "referral_day": referral_day}, day + 1
-                    )
-                else:
-                    p.log(day, "NO SLOT for cytology repeat — did not reschedule")
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "one_year_repeat",
+                         "referral_day": referral_day}, day + 1
+                )
                 return
             self._day_secondary_supply += 1
 
@@ -1374,16 +1387,21 @@ class SimulationRunner:
             # Queue LTFU check for secondary retry
             if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "colposcopy"):
                 return
+            # Reschedule check: patient may not make it today
+            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "colposcopy",
+                         "referral_day": referral_day}, day + 1
+                )
+                p.log(day, "RESCHEDULE colposcopy — patient unavailable, moved to next day")
+                return
             self._day_secondary_demand += 1
             if not self._queues.consume_slot("colposcopy", day):
                 self._day_secondary_overflow += 1
-                if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 1.0):
-                    self._queues.schedule_followup(
-                        p, {"cancer": "cervical", "step": "colposcopy",
-                             "referral_day": referral_day}, day + 1
-                    )
-                else:
-                    p.log(day, "NO SLOT for colposcopy — did not reschedule")
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "colposcopy",
+                         "referral_day": referral_day}, day + 1
+                )
                 return
             self._day_secondary_supply += 1
 
@@ -1483,18 +1501,25 @@ class SimulationRunner:
         if not p.active:
             return
 
+        # Reschedule check: patient may not make it today
+        if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "cin1_surveillance",
+                     "referral_day": referral_day, "clean_count": clean_count},
+                day + 1
+            )
+            p.log(day, "RESCHEDULE cytology (CIN1 surveillance) — patient unavailable, moved to next day")
+            return
+
         # Consume a cytology slot for the surveillance visit
         self._day_secondary_demand += 1
         if not self._queues.consume_slot("cytology", day):
             self._day_secondary_overflow += 1
-            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 1.0):
-                self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "cin1_surveillance",
-                         "referral_day": referral_day, "clean_count": clean_count},
-                    day + 1
-                )
-            else:
-                p.log(day, "NO SLOT for cytology (CIN1 surveillance) — did not reschedule")
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "cin1_surveillance",
+                     "referral_day": referral_day, "clean_count": clean_count},
+                day + 1
+            )
             return
         self._day_secondary_supply += 1
 
@@ -1559,19 +1584,27 @@ class SimulationRunner:
             p.current_stage = "routine"
             return
 
+        # Reschedule check: patient may not make it today
+        if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "post_treatment_surveillance",
+                     "referral_day": day, "treatment_day": treatment_day,
+                     "visit_number": visit_number},
+                day + 1
+            )
+            p.log(day, "RESCHEDULE cytology (post-treatment surveillance) — patient unavailable, moved to next day")
+            return
+
         # Consume a cytology slot for the surveillance co-test
         self._day_secondary_demand += 1
         if not self._queues.consume_slot("cytology", day):
             self._day_secondary_overflow += 1
-            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 1.0):
-                self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "post_treatment_surveillance",
-                         "referral_day": day, "treatment_day": treatment_day,
-                         "visit_number": visit_number},
-                    day + 1
-                )
-            else:
-                p.log(day, "NO SLOT for cytology (post-treatment surveillance) — did not reschedule")
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "post_treatment_surveillance",
+                     "referral_day": day, "treatment_day": treatment_day,
+                     "visit_number": visit_number},
+                day + 1
+            )
             return
         self._day_secondary_supply += 1
 
@@ -1732,16 +1765,21 @@ class SimulationRunner:
         # Queue LTFU check for secondary retry
         if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "lung_biopsy"):
             return
+        # Reschedule check: patient may not make it today
+        if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "biopsy",
+                     "referral_day": referral_day}, day + 1
+            )
+            p.log(day, "RESCHEDULE lung biopsy — patient unavailable, moved to next day")
+            return
         self._day_secondary_demand += 1
         if not self._queues.consume_slot("lung_biopsy", day):
             self._day_secondary_overflow += 1
-            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 1.0):
-                self._queues.schedule_followup(
-                    p, {"cancer": "lung", "step": "biopsy",
-                         "referral_day": referral_day}, day + 1
-                )
-            else:
-                p.log(day, "NO SLOT for lung biopsy — did not reschedule")
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "biopsy",
+                     "referral_day": referral_day}, day + 1
+            )
             return
         self._day_secondary_supply += 1
         scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
@@ -1758,14 +1796,19 @@ class SimulationRunner:
         Bypasses the standard screening interval check.  Consumes an LDCT
         procedure slot; if none available today, pushes to next day (FIFO).
         """
+        # Reschedule check: patient may not make it today
+        if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "repeat_ldct",
+                     "referral_day": referral_day}, day + 1
+            )
+            p.log(day, "RESCHEDULE LDCT (repeat) — patient unavailable, moved to next day")
+            return
         if not self._queues.consume_slot("ldct", day):
-            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 1.0):
-                self._queues.schedule_followup(
-                    p, {"cancer": "lung", "step": "repeat_ldct",
-                         "referral_day": referral_day}, day + 1
-                )
-            else:
-                p.log(day, "NO SLOT for LDCT (repeat) — did not reschedule")
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "repeat_ldct",
+                     "referral_day": referral_day}, day + 1
+            )
             return
 
         result                 = draw_lung_rads_result()
