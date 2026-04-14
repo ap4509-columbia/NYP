@@ -314,11 +314,11 @@ LTFU_PROBS = {
 
     # ── Reschedule probability ──────────────────────────────────────────────
     # When a patient's screening slot is full, this is the probability they
-    # reschedule for the next available day. Currently set to 1.0 (all
-    # patients reschedule). Adjust downward to model no-show attrition.
+    # reschedule for the next available day (re-enter queue). Patients who
+    # do not reschedule simply do not return for that appointment.
     # Applied at primary and secondary screening queue overflow.
-    "reschedule_primary":    1.0,      # P(reschedule | primary screening slot full)
-    "reschedule_secondary":  1.0,      # P(reschedule | secondary screening slot full)
+    "reschedule_primary":    0.10,     # PLACEHOLDER — P(reschedule | primary screening slot full)
+    "reschedule_secondary":  0.10,     # PLACEHOLDER — P(reschedule | secondary screening slot full)
 }
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────
