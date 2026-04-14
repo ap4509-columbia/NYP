@@ -97,7 +97,8 @@ NYP/
 │
 ├── notebooks/
 │   ├── simulation.ipynb           # Main: 80-year run, metrics, 30+ visualizations
-│   └── scenario_analysis.ipynb    # Coordinated vs. fragmented workflow scenarios
+│   ├── scenario_analysis.ipynb    # Coordinated vs. fragmented workflow scenarios
+│   └── Base Visualizations/       # 30 saved PNGs from latest simulation run
 │
 ├── docs/
 │   ├── README.md                    # This file
