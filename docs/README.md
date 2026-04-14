@@ -96,8 +96,8 @@ NYP/
 │   └── runner.py       # SimulationRunner — day loop + queue engine
 │
 ├── notebooks/
-│   ├── simulation.ipynb        # Main: 80-year run + 30+ visualizations
-│   └── metrics_outputs.ipynb   # Deep-dive analytics
+│   ├── simulation.ipynb           # Main: 80-year run, metrics, 30+ visualizations
+│   └── scenario_analysis.ipynb    # Coordinated vs. fragmented workflow scenarios
 │
 ├── docs/
 │   ├── README.md                    # This file
