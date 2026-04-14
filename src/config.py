@@ -311,6 +311,14 @@ LTFU_PROBS = {
     "queue_primary_daily":   0.002,    # PLACEHOLDER — primary screening retry queue
     "queue_secondary_daily": 0.005,    # PLACEHOLDER — colposcopy / lung biopsy retry queue
     "queue_treatment_daily": 0.003,    # PLACEHOLDER — LEEP / cone biopsy retry queue
+
+    # ── Reschedule probability ──────────────────────────────────────────────
+    # When a patient's screening slot is full, this is the probability they
+    # reschedule for the next available day. Currently set to 1.0 (all
+    # patients reschedule). Adjust downward to model no-show attrition.
+    # Applied at primary and secondary screening queue overflow.
+    "reschedule_primary":    1.0,      # P(reschedule | primary screening slot full)
+    "reschedule_secondary":  1.0,      # P(reschedule | secondary screening slot full)
 }
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────
