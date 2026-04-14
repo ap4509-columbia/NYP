@@ -490,11 +490,62 @@ def compute_revenue(metrics: dict) -> dict:
     }
     foregone_total = sum(foregone.values())
 
+    # ── Uncaptured population revenue ────────────────────────────────────────
+    # Eligible NYC women who are NOT in the patient pool at all.
+    # These women never entered the system — distinct from LTFU (entered but
+    # dropped out).  Estimated from the gap between NYC_ELIGIBLE_POPULATION
+    # and the average pool size × POPULATION_SCALE_FACTOR.
+    #
+    # Revenue estimate: each uncaptured woman represents one missed screening
+    # per screening interval (cervical every 3 yrs, lung every 1 yr).
+    # We annualize the missed screening revenue.
+
+    # Get average pool size from year-end checkpoints
+    year_chk = metrics.get("year_checkpoints", [])
+    pool_sizes = [c.get("pool_size", 0) for c in year_chk if c.get("pool_size") is not None]
+    avg_pool_sim = sum(pool_sizes) / len(pool_sizes) if pool_sizes else 0
+    avg_pool_real = avg_pool_sim * cfg.POPULATION_SCALE_FACTOR
+
+    uncaptured_women = max(cfg.NYC_ELIGIBLE_POPULATION - avg_pool_real, 0)
+
+    # Annualized missed screening revenue per uncaptured woman:
+    # - Cervical: eligible ages 21-65; screened every 3 years → 1/3 per year
+    # - Lung: eligible ages 50-80, smokers only; screened annually
+    # Use population prevalence estimates for eligibility fractions
+    cerv_eligible_frac = 0.80    # PLACEHOLDER — fraction of eligible-age women due for cervical
+    lung_eligible_frac = 0.04    # PLACEHOLDER — fraction meeting lung screening criteria
+    cerv_interval_yrs  = 3.0
+    lung_interval_yrs  = 1.0
+
+    uncaptured_annual_cerv = (
+        uncaptured_women * cerv_eligible_frac / cerv_interval_yrs * avg_cerv_screen
+    )
+    uncaptured_annual_lung = (
+        uncaptured_women * lung_eligible_frac / lung_interval_yrs * rev["ldct"]
+    )
+    uncaptured_annual_total = uncaptured_annual_cerv + uncaptured_annual_lung
+
+    # Scale to simulation duration (post-warmup years)
+    sim_years = max((cfg.SIM_YEARS - cfg.WARMUP_YEARS), 1)
+    uncaptured_total = uncaptured_annual_total * sim_years
+
+    uncaptured = {
+        "cervical_screening": uncaptured_annual_cerv * sim_years,
+        "lung_ldct":          uncaptured_annual_lung * sim_years,
+    }
+
     return {
         "realized_total":        realized_total,
         "foregone_total":        foregone_total,
         "realized_by_procedure": realized,
         "foregone_by_node":      foregone,
+        # Population capture
+        "uncaptured_total":      uncaptured_total,
+        "uncaptured_by_cancer":  uncaptured,
+        "uncaptured_women":      uncaptured_women,
+        "avg_pool_real":         avg_pool_real,
+        "nyc_eligible":          cfg.NYC_ELIGIBLE_POPULATION,
+        "capture_rate":          avg_pool_real / max(cfg.NYC_ELIGIBLE_POPULATION, 1),
     }
 
 

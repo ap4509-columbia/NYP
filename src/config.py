@@ -475,6 +475,13 @@ ABNORMAL_FOLLOWUP_DAYS = {
 # ── Population scale ─────────────────────────────────────────────────────────
 POPULATION_SCALE_FACTOR = 100          # 1 sim patient = 100 NYC women
 
+# Total eligible women in NYC (real-world estimate).
+# Used to compute population capture rate and foregone revenue from the
+# uncaptured population (eligible but not in the patient pool).
+# Source: ACS 2020 5-Year Estimates — NYC women aged 21–80 ≈ 1.5M
+# PLACEHOLDER — replace with NYP-specific catchment area estimate
+NYC_ELIGIBLE_POPULATION = 1_500_000
+
 # ── Initial seed population ──────────────────────────────────────────────────
 # Number of established patients to seed at day 0.  The pool then grows or
 # shrinks organically as arrivals join and patients exit via mortality,
