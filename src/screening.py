@@ -282,49 +282,25 @@ def run_lung_pre_ldct(
     p: Patient, current_day: int, metrics: Optional[dict] = None
 ) -> bool:
     """
-    Simulate the two administrative steps that must clear before an LDCT scan occurs.
+    Record administrative milestones before an LDCT scan proceeds.
 
-    In real-world lung cancer screening, a significant fraction of eligible patients
-    never complete their scan because one of these two steps fails:
-      1. Provider places a referral/order (many eligible patients are never referred).
-      2. Patient schedules and shows up for the scan (many referred patients never book).
-
-    Each step draws a Bernoulli sample against the configured probability. If either
-    step fails the patient is classified as LTFU and the function returns False.
-    Returns True only when both steps succeed and the scan should proceed.
+    LTFU is handled exclusively by the queue-based geometric waiting-time
+    hazard (in runner.py _check_queue_ltfu), consistent with the cervical
+    pathway. This function only tracks metrics milestones — it always
+    returns True so the scan proceeds to capacity/slot competition.
     """
     if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_eligible"] += 1
-
-    # Step 1: Was a referral order placed?
-    if random.random() > cfg.LUNG_PATHWAY_PROBS["referral_placed"]:
-        p.log(current_day, "LUNG: no referral placed — LTFU")
-        p.exit_system(current_day, "lost_to_followup")
-        return False
 
     p.lung_referral_placed = True
     p.log(current_day, "LUNG: LDCT order placed")
     if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_referral_placed"] += 1
 
-    # Step 2: Did the patient schedule (and complete) the scan?
-    if random.random() > cfg.LUNG_PATHWAY_PROBS["scheduled_after_referral"]:
-        p.log(current_day, "LUNG: did not schedule LDCT — LTFU")
-        p.exit_system(current_day, "lost_to_followup")
-        return False
-
     p.lung_ldct_scheduled = True
     p.log(current_day, "LUNG: LDCT scheduled")
     if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_ldct_scheduled"] += 1
-
-    # Step 3: Did the patient actually complete the scan? (appointment completion rate)
-    # Source: AiP Parameters PDF; ASCO abstracts/197367 — P(completed | ordered) = 61.2%
-    # This is layered on top of referral+scheduling steps above
-    if random.random() > cfg.LUNG_TEST_COMPLETION_PROB:
-        p.log(current_day, "LUNG: LDCT ordered and scheduled but not completed — LTFU")
-        p.exit_system(current_day, "lost_to_followup")
-        return False
 
     p.log(current_day, "LUNG: LDCT completed")
     if metrics is not None and current_day >= _WARMUP_DAY:

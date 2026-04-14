@@ -19,8 +19,8 @@
 # Lung pathway:
 #   RADS routing → result communicated → biopsy referral → scheduling
 #   → completion → malignancy confirmed → treatment
-#   Each step has its own probability (LUNG_PATHWAY_PROBS in config).
-#   Patients who fail any step exit as "lost_to_followup".
+#   LTFU is handled by queue LTFU in runner.py (daily hazard while waiting
+#   for a procedure slot), consistent with the cervical pathway.
 #
 # DEPENDENCY DIRECTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,15 +243,11 @@ _LUNG_RADS_BIOPSY = {"RADS_4A", "RADS_4B_4X"}
 
 def _lung_result_communicated(p: Patient, current_day: int, metrics: Optional[dict]) -> bool:
     """
-    Was the LDCT result successfully communicated to the patient?
-    If not, the patient is classified as an unmet referral / LTFU.
-    Returns True if communicated, False if lost.
+    Record that the LDCT result was communicated to the patient.
+
+    Always returns True — LTFU is handled exclusively by the queue-based
+    geometric waiting-time hazard, consistent with the cervical pathway.
     """
-    if random.random() > cfg.LUNG_PATHWAY_PROBS["result_communicated"]:
-        p.log(current_day, f"LUNG {p.lung_result}: results NOT communicated — LTFU")
-        p.exit_system(current_day, "lost_to_followup")
-        return False
-    # Result was communicated — record the success
     if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_result_communicated"] += 1
     p.log(current_day, f"LUNG {p.lung_result}: results communicated to patient")
@@ -269,31 +265,23 @@ def run_lung_followup(
 
     For RADS 4A/4B/4X (biopsy pathway):
       Communicate result → biopsy referral → scheduling → completion
-      → malignancy confirmation → treatment decision.
-      Each step has its own LTFU probability (see LUNG_PATHWAY_PROBS in config).
+      → malignancy confirmation → treatment.
+      LTFU is handled by queue-based geometric waiting-time hazard only
+      (consistent with cervical pathway).
 
     Returns final disposition string:
       "repeat_ldct_12mo"    — RADS 1/2: routine annual repeat
       "repeat_ldct_6mo"     — RADS 3: 6-month repeat
       "repeat_ldct_1_3mo"   — RADS 0: incomplete scan, 1–3 month repeat
       "lung_treated"        — biopsy confirmed malignancy, treatment given
-      "lung_untreated"      — malignancy confirmed but patient LTFU before treatment
-      "exit"                — patient lost to follow-up at any step
+      "exit"                — guard (should not occur; LTFU via queue only)
     """
     rads = p.lung_result
 
     # ── RADS 0, 1, 2, 3 — communicate result then schedule repeat LDCT ────────
     if rads in _LUNG_RADS_REPEAT:
         if not _lung_result_communicated(p, current_day, metrics):
-            return "exit"  # result never reached the patient
-
-        # Apply Lung-RADS specific follow-up adherence
-        # Source: ASCO JCO 2021.39.15_suppl.10540
-        if rads in cfg.LUNG_RADS_ADHERENCE:
-            if random.random() > cfg.LUNG_RADS_ADHERENCE[rads]:
-                p.log(current_day, f"LUNG {rads}: non-adherent to follow-up schedule — LTFU")
-                p.exit_system(current_day, "lost_to_followup")
-                return "exit"
+            return "exit"  # should not happen (always True), but guard
 
         repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(rads, 365)
         if rads == "RADS_0":
@@ -310,46 +298,26 @@ def run_lung_followup(
             return "repeat_ldct_12mo"
 
     # ── RADS 4A / 4B / 4X — suspicious nodule, biopsy pathway ────────────────
+    # LTFU is handled exclusively by queue-based geometric waiting-time hazard
+    # (runner.py _check_queue_ltfu). No node-level Bernoulli LTFU here.
     if rads in _LUNG_RADS_BIOPSY:
         if not _lung_result_communicated(p, current_day, metrics):
-            return "exit"
+            return "exit"  # should not happen (always True), but guard
 
-        # Apply Lung-RADS specific follow-up adherence
-        # Source: ASCO JCO 2021.39.15_suppl.10540
-        if rads in cfg.LUNG_RADS_ADHERENCE:
-            if random.random() > cfg.LUNG_RADS_ADHERENCE[rads]:
-                p.log(current_day, f"LUNG {rads}: non-adherent to follow-up schedule — LTFU")
-                p.exit_system(current_day, "lost_to_followup")
-                return "exit"
-
-        # Node 1: Was a biopsy referral placed by the provider?
-        if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_referral_made"]:
-            p.log(current_day, f"LUNG {rads}: no biopsy referral — unmet referral (LTFU)")
-            p.exit_system(current_day, "lost_to_followup")
-            return "exit"
+        # Biopsy referral, scheduling, and completion — proceed to slot competition
         if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_biopsy_referral"] += 1
         p.log(current_day, f"LUNG {rads}: biopsy referral placed")
 
-        # Node 2: Did the patient schedule the biopsy?
-        if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_scheduled"]:
-            p.log(current_day, "LUNG biopsy: not scheduled — unmet referral (LTFU)")
-            p.exit_system(current_day, "lost_to_followup")
-            return "exit"
         if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_biopsy_scheduled"] += 1
         p.log(current_day, "LUNG biopsy: scheduled")
 
-        # Node 3: Was the biopsy actually completed?
-        if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_completed"]:
-            p.log(current_day, "LUNG biopsy: not completed — LTFU")
-            p.exit_system(current_day, "lost_to_followup")
-            return "exit"
         if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_biopsy_completed"] += 1
         p.log(current_day, "LUNG biopsy: completed")
 
-        # Node 4: Was malignancy confirmed by pathology?
+        # Malignancy confirmed by pathology? (clinical result, not LTFU)
         if random.random() > cfg.LUNG_PATHWAY_PROBS["malignancy_confirmed"]:
             # Biopsy came back benign — return to annual surveillance
             p.lung_biopsy_result = "benign"
@@ -361,14 +329,7 @@ def run_lung_followup(
             metrics["lung_malignancy_confirmed"] += 1
         p.log(current_day, "LUNG biopsy: malignancy confirmed")
 
-        # Node 5: Was treatment given (surgery / radiation / medical oncology)?
-        if random.random() > cfg.LUNG_PATHWAY_PROBS["treatment_given"]:
-            # Malignancy confirmed but patient did not receive treatment
-            p.exit_system(current_day, "lost_to_followup")
-            p.log(current_day, "LUNG: malignancy confirmed but no treatment given")
-            return "lung_untreated"
-
-        # Treatment successfully given
+        # Treatment — proceeds to slot competition (LTFU via queue hazard only)
         p.current_stage = "treated"
         if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_treatment_given"] += 1

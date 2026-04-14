@@ -205,12 +205,6 @@ SCREENING_INTERVALS_DAYS = {
 # Per-visit: 97.1% complete once ordered — different denominator
 CERVICAL_TEST_COMPLETION_PROB = 0.97108   # Source: AiP Parameters PDF (Google Doc)
 
-# P(LDCT completed | ordered)
-# Source: ASCO abstracts/presentations/197367; AiP Parameters PDF
-# Absolute completion rate = 71.9% after follow-up (same source)
-LUNG_TEST_COMPLETION_PROB    = 0.612         # Source: ASCO abstracts/197367; AiP Parameters PDF
-LUNG_TEST_COMPLETION_ABSOLUTE = 0.719        # absolute completion after follow-up; same source
-
 # ── Cervical Result Probabilities ─────────────────────────────────────────────
 # PLACEHOLDER — replace with NYP EHR rates / ASCCP risk table values
 #
@@ -288,31 +282,13 @@ LUNG_RADS_MALIGNANCY_RATE = {
     "RADS_4B_4X": 0.35,  # Source: Pinsky et al. 2015; ACR Lung-RADS v1.1
 }
 
-# Follow-up adherence by Lung-RADS category
-# Source: ASCO JCO 2021 (ascopubs.org/doi/10.1200/JCO.2021.39.15_suppl.10540)
-LUNG_RADS_ADHERENCE = {
-    "RADS_3":    0.671,   # Source: ASCO JCO 2021.39.15_suppl.10540
-    "RADS_4A":   0.664,   # Source: ASCO JCO 2021.39.15_suppl.10540
-    "RADS_4B_4X": 0.782,  # Source: ASCO JCO 2021.39.15_suppl.10540
-}
-
-# ── Lung Pathway Step Probabilities ──────────────────────────────────────────
-# Probability of successfully clearing each step (1 - value = LTFU at that node).
-# PLACEHOLDER — replace with NYP EHR-derived rates.
+# ── Lung Pathway Clinical Probabilities ─────────────────────────────────────
+# LTFU is handled exclusively by queue-based geometric waiting-time hazard
+# (consistent with the cervical pathway). Only clinical outcome probabilities
+# remain here — not per-node dropout rates.
 LUNG_PATHWAY_PROBS = {
-    "referral_placed":          0.72,
-    "scheduled_after_referral": 0.80,
-    "result_communicated":      0.90,
-    "biopsy_referral_made":     0.80,
-    "biopsy_scheduled":         0.78,
-    "biopsy_completed":         0.88,
-    "malignancy_confirmed":     0.25,
-    "treatment_given":          0.92,
+    "malignancy_confirmed":     0.25,    # P(malignant | biopsy completed); Source: Pinsky et al. 2015
 }
-
-# P(follow-up completed | positive LDCT) treated by NYP: ~50%
-# Source: AiP Parameters PDF (Yiye Zhang, Weill Cornell)
-LUNG_NYP_TREATMENT_RATE = 0.50   # Source: AiP Parameters PDF
 
 # ── Lung-RADS Repeat Intervals (days) ────────────────────────────────────────
 LUNG_RADS_REPEAT_INTERVALS = {
