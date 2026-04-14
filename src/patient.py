@@ -43,6 +43,8 @@ class Patient:
     active:                bool = True       # False once the patient exits the system
     current_stage:         str  = "arrived"  # tracks where in the pathway the patient is
     willing_to_reschedule: bool = True       # used by handle_unscreened to decide LTFU vs. retry
+    noshow_count:          int  = 0          # cumulative consecutive missed appointments (resets on attendance)
+    overdue_since_day:     Optional[int] = None  # day patient entered the overdue pool; None if current
 
     # ── Screening history (simulation day of last screen; -1 = never) ─────────
     # Compared against today's day in is_due_for_screening() to enforce intervals

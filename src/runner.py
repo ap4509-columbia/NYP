@@ -56,7 +56,10 @@ from typing import Optional
 
 import config as cfg
 from patient import Patient
-from population import sample_patient, generate_established_population, draw_mortality
+from population import (
+    sample_patient, sample_replacement_patient,
+    generate_established_population, draw_mortality,
+)
 from screening import (
     get_eligible_screenings,
     assign_screening_test,
@@ -195,8 +198,12 @@ class PatientQueues:
         """
         cap = _outpatient_cap(provider)
         if cap <= 0:
-            # Zero-capacity provider — add to drop-in queue, not outpatient schedule
-            self.dropin[provider].append(p)
+            # Zero-capacity provider (e.g. ER) — use the outpatient dict keyed
+            # by day so the patient appears only on the intended future date,
+            # not on today's drop-in queue.  process_day pops from outpatient
+            # first, then fills drop-ins, so this patient will be returned in
+            # the "seen_outpts" list on earliest_day regardless of capacity.
+            self.outpatient[provider][earliest_day].append(p)
             return earliest_day
 
         # Advance day until a slot is available (never overfills).
@@ -409,11 +416,12 @@ class SimulationRunner:
         self._pid                  = 0
 
         # Stable-population state — populated by _initialize_population()
-        self._established_pool:    list     = []   # all living established patients
-        self._flush_buffer:        list     = []   # exited patients awaiting DB write
-        self._pending_new_entries: int      = 0    # replacement entrants still to create
-        self._last_mortality_day:  int      = 0    # last day a mortality sweep ran
-        self._db:                  Optional[SimulationDB] = None
+        self._established_pool:          list = []   # all living established patients
+        self._flush_buffer:              list = []   # exited patients awaiting DB write
+        self._pending_new_entries:       int  = 0    # replacement entrants still to create
+        self._pending_replacement_exits: int  = 0    # non-mortality exits needing replacement
+        self._last_mortality_day:        int  = 0    # last day a mortality sweep ran
+        self._db:                        Optional[SimulationDB] = None
 
     # =========================================================================
     # Public interface
@@ -464,7 +472,9 @@ class SimulationRunner:
                 "day":                 self.n_days,
                 "pool_size":           len(self._established_pool) if self.use_stable_population else None,
                 "cum_cervical":        self.metrics["n_screened"]["cervical"],
+                "cum_cervical_est":    self.metrics["n_screened_established"]["cervical"],
                 "cum_lung":            self.metrics["n_screened"]["lung"],
+                "cum_lung_est":        self.metrics["n_screened_established"]["lung"],
                 "cum_cytology":        self.metrics["n_screened_by_test"]["cytology"],
                 "cum_hpv_alone":       self.metrics["n_screened_by_test"]["hpv_alone"],
                 "cum_ldct":            self.metrics["n_screened_by_test"]["ldct"],
@@ -658,7 +668,9 @@ class SimulationRunner:
                 "pool_size":           len(self._established_pool) if self.use_stable_population else None,
                 # Screening volumes — overall and by first-stage test modality
                 "cum_cervical":        self.metrics["n_screened"]["cervical"],
+                "cum_cervical_est":    self.metrics["n_screened_established"]["cervical"],
                 "cum_lung":            self.metrics["n_screened"]["lung"],
+                "cum_lung_est":        self.metrics["n_screened_established"]["lung"],
                 "cum_cytology":        self.metrics["n_screened_by_test"]["cytology"],
                 "cum_hpv_alone":       self.metrics["n_screened_by_test"]["hpv_alone"],
                 "cum_ldct":            self.metrics["n_screened_by_test"]["ldct"],
@@ -695,7 +707,18 @@ class SimulationRunner:
 
                 for p in seen:
                     p.wait_days = day - p.day_created
-                    self._screen_patient(p, day)
+                    # No-show gate — only for scheduled outpatients at non-ER providers.
+                    # Drop-ins are walk-ins who have already arrived, so no-show doesn't apply.
+                    # ER has no scheduled outpatient slots (OUTPATIENT_FRACTION = 0).
+                    if (
+                        p.patient_type == "outpatient"
+                        and provider != "er"
+                        and random.random() < cfg.NO_SHOW_PROB.get(provider, 0.0)
+                    ):
+                        self._handle_noshow(p, provider, day)
+                    else:
+                        p.noshow_count = 0   # reset streak on successful attendance
+                        self._screen_patient(p, day)
 
     # =========================================================================
     # Arrivals
@@ -728,25 +751,33 @@ class SimulationRunner:
         else:
             rate = self.daily_rate
 
-        _dest_keys = list(cfg.DESTINATION_PROBS.keys())
-        _dest_w    = list(cfg.DESTINATION_PROBS.values())
-        _type_keys = list(cfg.PATIENT_TYPE_PROBS.keys())
-        _type_w    = list(cfg.PATIENT_TYPE_PROBS.values())
+        # Two-stage routing (matches NYP operational data):
+        #   1. ARRIVAL_TYPE_PROBS decides ER (20%) vs outpatient (80%)
+        #   2. Outpatients get a destination from DESTINATION_PROBS_OUTPATIENT
+        #      (0% ER — they see PCP/GYN/Specialist)
+        #   3. ER arrivals are always drop-in walk-ins
+        _arrival_keys = list(cfg.ARRIVAL_TYPE_PROBS.keys())
+        _arrival_w    = list(cfg.ARRIVAL_TYPE_PROBS.values())
+        _op_dest_keys = list(cfg.DESTINATION_PROBS_OUTPATIENT.keys())
+        _op_dest_w    = list(cfg.DESTINATION_PROBS_OUTPATIENT.values())
 
         for _ in range(_poisson(rate)):
-            dest  = random.choices(_dest_keys, weights=_dest_w)[0]
-            ptype = random.choices(_type_keys, weights=_type_w)[0]
+            arrival = random.choices(_arrival_keys, weights=_arrival_w)[0]
 
-            p = sample_patient(self._pid, day, dest, ptype)
-            self._pid += 1
-
-            if ptype == "outpatient" and dest != "er":
-                lo, hi    = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
-                earliest  = day + random.randint(lo, hi)
-                self._queues.schedule_outpatient(p, dest, earliest)
+            if arrival == "er":
+                dest  = "er"
+                ptype = "drop_in"
+                p = sample_patient(self._pid, day, dest, ptype)
+                self._pid += 1
+                self._queues.add_dropin(p, "er")
             else:
-                # Drop-in or ER (ER has no outpatient slots)
-                self._queues.add_dropin(p, dest)
+                dest  = random.choices(_op_dest_keys, weights=_op_dest_w)[0]
+                ptype = "outpatient"
+                p = sample_patient(self._pid, day, dest, ptype)
+                self._pid += 1
+                lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
+                earliest = day + random.randint(lo, hi)
+                self._queues.schedule_outpatient(p, dest, earliest)
 
     # =========================================================================
     # Overflow routing
@@ -788,6 +819,146 @@ class SimulationRunner:
                     self._queues.schedule_outpatient(p, alt, earliest)
             else:
                 self._queues.add_dropin(p, provider)
+
+    # =========================================================================
+    # No-show handling
+    # =========================================================================
+
+    def _handle_noshow(self, p: Patient, provider: str, day: int) -> None:
+        """
+        Process a missed outpatient appointment for one patient.
+
+        Flow
+        ----
+        1. Increment noshow_count and record the event.
+        2. Apply cumulative exit draw (NOSHOW_CUMULATIVE_EXIT_PROB).
+           Probability rises with each consecutive miss.  If the patient exits
+           here they are classified as lost_to_followup immediately.
+        3. If they survive the cascade, draw NOT_SEEN_PROBS disposition:
+             - reschedule  → re-book at RESCHEDULE_DELAY_DAYS from today
+             - exit        → permanent lost_to_followup
+             - wait        → attempt outreach (_apply_outreach); if outreach
+                             also returns "wait", draw UNSCREENED_FATE to
+                             decide between overdue-pool entry and permanent exit
+        """
+        # Guard: dead / attrition patients may have pre-booked visits still in
+        # the queue.  Skip them silently — they already exited the system.
+        if not p.active:
+            return
+
+        p.noshow_count           += 1
+        self.metrics["n_noshow"] += 1
+        p.log(day, f"NO-SHOW at {provider} (streak={p.noshow_count})")
+
+        # ── Step 1: cumulative exit cascade ───────────────────────────────────
+        exit_probs = cfg.NOSHOW_CUMULATIVE_EXIT_PROB
+        idx        = min(p.noshow_count - 1, len(exit_probs) - 1)
+        if random.random() < exit_probs[idx]:
+            p.exit_system(day, "lost_to_followup")
+            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
+            self.metrics["n_noshow_exit"]   += 1
+            self.metrics["ltfu_unscreened"] += 1
+            if p.is_established:
+                self._flush_buffer.append(p)
+            self._pending_replacement_exits += 1
+            p.log(day, "NOSHOW CASCADE EXIT — lost_to_followup")
+            return
+
+        # ── Step 2: post-no-show disposition draw ─────────────────────────────
+        # NOT_SEEN_PROBS covers only pcp and gynecologist; fall back to pcp for others
+        probs_dict = cfg.NOT_SEEN_PROBS.get(provider, cfg.NOT_SEEN_PROBS.get("pcp", {}))
+        fate       = random.choices(
+            list(probs_dict.keys()), weights=list(probs_dict.values()), k=1
+        )[0]
+
+        if fate == "reschedule":
+            delay = cfg.RESCHEDULE_DELAY_DAYS.get(provider, cfg.RESCHEDULE_DELAY_DAYS["default"])
+            self._queues.schedule_outpatient(p, p.destination, day + delay)
+            p.log(day, f"NO-SHOW → reschedule in {delay} days")
+
+        elif fate == "exit":
+            p.exit_system(day, "lost_to_followup")
+            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
+            self.metrics["ltfu_unscreened"] += 1
+            if p.is_established:
+                self._flush_buffer.append(p)
+            self._pending_replacement_exits += 1
+            p.log(day, "NO-SHOW → immediate exit (lost_to_followup)")
+
+        else:  # "wait"
+            outreach_fate = self._apply_outreach(p, day)
+            if outreach_fate == "wait":
+                # Outreach also failed — draw UNSCREENED_FATE for long-term disposition
+                final = random.choices(
+                    list(cfg.UNSCREENED_FATE.keys()),
+                    weights=list(cfg.UNSCREENED_FATE.values()), k=1
+                )[0]
+                if final == "exit_system":
+                    p.exit_system(day, "lost_to_followup")
+                    record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
+                    self.metrics["ltfu_unscreened"] += 1
+                    if p.is_established:
+                        self._flush_buffer.append(p)
+                    self._pending_replacement_exits += 1
+                    p.log(day, "NO-SHOW → outreach wait → UNSCREENED_FATE: permanent exit")
+                else:  # "may_return_later"
+                    # Patient stays alive in pool; overdue sweep monitors for re-entry
+                    p.overdue_since_day = day
+                    p.log(day, f"NO-SHOW → outreach wait → overdue pool (entry day {day})")
+
+    # =========================================================================
+    # Outreach
+    # =========================================================================
+
+    def _apply_outreach(self, p: Patient, day: int) -> str:
+        """
+        Attempt one outreach contact for a patient who missed their appointment
+        or is sitting in the overdue pool.
+
+        The probability distribution over outcomes is read from OUTREACH_PROBS
+        keyed by WORKFLOW_MODE:
+          - "coordinated"  → "with_navigation" (higher reschedule rate)
+          - anything else  → "without_outreach" (lower reschedule rate)
+
+        Returns the fate string: "reschedule" | "exit" | "wait".
+
+        Side effects:
+          - "reschedule" → books a new appointment, clears overdue_since_day,
+                           resets noshow_count.
+          - "exit"       → exits patient as lost_to_followup, increments
+                           replacement counter.
+          - "wait"       → no side effects; caller handles the unresolved state.
+        """
+        if cfg.WORKFLOW_MODE == "coordinated":
+            probs_dict = cfg.OUTREACH_PROBS["with_navigation"]
+        else:
+            probs_dict = cfg.OUTREACH_PROBS["without_outreach"]
+
+        fate = random.choices(
+            list(probs_dict.keys()), weights=list(probs_dict.values()), k=1
+        )[0]
+
+        if fate == "reschedule":
+            self._queues.schedule_outpatient(
+                p, p.destination, day + cfg.REENTRY_DELAY_DAYS
+            )
+            p.overdue_since_day = None
+            p.noshow_count      = 0
+            p.log(day, f"OUTREACH → reschedule in {cfg.REENTRY_DELAY_DAYS} days")
+
+        elif fate == "exit":
+            p.exit_system(day, "lost_to_followup")
+            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
+            self.metrics["ltfu_unscreened"] += 1
+            if p.is_established:
+                self._flush_buffer.append(p)
+            self._pending_replacement_exits += 1
+            p.log(day, "OUTREACH → exit (lost_to_followup)")
+
+        else:  # "wait"
+            p.log(day, "OUTREACH → no response (still waiting)")
+
+        return fate
 
     # =========================================================================
     # Screening
@@ -837,9 +1008,22 @@ class SimulationRunner:
                     soonest = d
 
             if soonest > 0:
-                self._queues.schedule_outpatient(p, p.destination, day + soonest)
-                self.metrics["n_reschedule"] += 1
-                p.log(day, f"NOT YET ELIGIBLE — return visit scheduled in {soonest} days")
+                if p.is_established:
+                    self._queues.schedule_outpatient(p, p.destination, day + soonest)
+                    self.metrics["n_reschedule"] += 1
+                    p.log(day, f"NOT YET ELIGIBLE — return visit scheduled in {soonest} days")
+                else:
+                    # Non-established patients (organic arrivals, ER drop-ins) who
+                    # are not yet eligible should NOT be rescheduled.  For ER patients
+                    # in particular, schedule_outpatient would route them back to the
+                    # drop-in queue immediately (ER has 0 outpatient capacity), creating
+                    # an infinite daily loop that inflates ER visit counts.  These
+                    # patients complete their one-time visit and exit; they may return
+                    # naturally as a future organic arrival.
+                    p.exit_system(day, "ineligible")
+                    record_exit(self.metrics, "ineligible")
+                    p.log(day, f"NOT YET ELIGIBLE — non-established, exiting (soonest={soonest}d)")
+                return
             elif p.is_established:
                 # Permanently ineligible established patients (aged out of all
                 # screenings, no cervix, quit window closed) exit the pool and
@@ -884,15 +1068,21 @@ class SimulationRunner:
                 #    cancer types are checked, and the reschedule at the bottom
                 #    of _screen_patient still runs.
                 if p.exit_reason:
-                    record_exit(self.metrics, p.exit_reason)
                     if p.is_established:
-                        # Re-activate so they can be rescheduled for future visits
+                        # Established patients stay in the pool even after a
+                        # pathway LTFU event (e.g. lung referral not placed).
+                        # Do NOT call record_exit — that counts system-level
+                        # exits and would inflate totals since the same patient
+                        # can hit pathway LTFU multiple times over 70 years.
+                        # The LTFU sub-bucket (ltfu_post_abnormal, etc.) was
+                        # already incremented by the screening/followup function.
                         p.active      = True
                         p.exit_reason = None
                         p.exit_day    = None
                         # Reschedule BEFORE returning so the annual cycle continues
                         self._reschedule_established(p, day)
                     else:
+                        record_exit(self.metrics, p.exit_reason)
                         return   # non-established exits permanently
                     return       # LTFU handled — skip remaining cancers today
                 # Case B: no exit_reason → simple skip; continue to next cancer
@@ -924,15 +1114,34 @@ class SimulationRunner:
         # Pool cap (SIMULATED_POPULATION) is enforced — if the pool is already at
         # target size (maintained by mortality replacement), the patient completes
         # their visit but does not join the cycling cohort.
+        #
+        # To maintain demographic equilibrium, converted patients are re-stamped
+        # with a young replacement age (mean ~33) rather than keeping their
+        # Census-drawn age. This prevents the pool from aging over time, which
+        # would cause mortality to trend upward across the 70-year horizon.
         elif (
             self.use_stable_population
             and not p.is_established
             and p.active
             and len(self._established_pool) < cfg.SIMULATED_POPULATION
         ):
+            # Re-stamp age to replacement distribution so conversions don't
+            # age the pool the way Census-stock arrivals (mean ~51) would.
+            from population import _sample_replacement_age
+            p.age              = _sample_replacement_age()
+            p.age_at_entry     = p.age
             p.is_established       = True
-            p.age_at_entry         = p.age
             p.simulation_entry_day = day
+
+            # ER patients who join the established pool must be reassigned
+            # to a non-ER regular provider — ER is for unplanned visits only,
+            # not annual cycling.  Uses the same distribution as the initial
+            # established population (_sample_established_destination).
+            if p.destination == "er":
+                from population import _sample_established_destination
+                p.destination  = _sample_established_destination()
+                p.patient_type = "outpatient"
+
             self._established_pool.append(p)
 
             # Book the full ADVANCE_SCHEDULE_YEARS window from scratch, mirroring
@@ -949,7 +1158,7 @@ class SimulationRunner:
                 )
             p.log(
                 day,
-                f"FIRST VISIT COMPLETE — joined established cycling pool; "
+                f"FIRST VISIT COMPLETE — joined established cycling pool (age re-stamped to {p.age}); "
                 f"scheduled years 1–{cfg.ADVANCE_SCHEDULE_YEARS} "
                 f"(next visit day {first_booked})"
             )
@@ -1026,8 +1235,9 @@ class SimulationRunner:
         _spawn_replacement_entrants) can create matching new drop-ins.
         """
         sweep_days  = day - self._last_mortality_day if self._last_mortality_day > 0 else cfg.MORTALITY_CHECK_DAYS
-        survivors   = []
-        death_count = 0
+        survivors       = []
+        death_count     = 0
+        attrition_count = 0
 
         year_fraction = sweep_days / 365.0
 
@@ -1064,11 +1274,53 @@ class SimulationRunner:
                 record_exit(self.metrics, "mortality", patient=p, current_day=day)
                 self._flush_buffer.append(p)
                 death_count += 1
-            else:
+                continue
+
+            # 3b. Non-clinical attrition (moved, switched provider, insurance change)
+            attrition_prob = cfg.ANNUAL_ATTRITION_RATE * year_fraction
+            if random.random() < attrition_prob:
+                p.exit_system(day, "attrition")
+                record_exit(self.metrics, "attrition", patient=p, current_day=day)
+                self._flush_buffer.append(p)
+                attrition_count += 1
+                continue
+
+            # 4. Overdue pool check — patients who missed visits and are waiting
+            if p.overdue_since_day is not None:
+                days_overdue = day - p.overdue_since_day
+                max_overdue  = max(cfg.MAX_OVERDUE_DAYS.values())
+                if days_overdue > max_overdue:
+                    # Patient has been unreachable beyond the maximum — permanent exit
+                    p.exit_system(day, "lost_to_followup")
+                    record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
+                    self.metrics["n_overdue_exit"]    += 1
+                    self.metrics["ltfu_unscreened"]   += 1
+                    self._flush_buffer.append(p)
+                    self._pending_replacement_exits   += 1
+                    p.log(day, f"OVERDUE EXIT — {days_overdue} days overdue (max={max_overdue})")
+                    continue  # skip survivors.append — patient is gone
+                else:
+                    # Monthly outreach attempt for overdue patients
+                    fate = self._apply_outreach(p, day)
+                    if fate == "wait":
+                        # Outreach didn't re-engage — try spontaneous re-entry draw
+                        # Scale daily probability to the sweep interval
+                        daily_prob   = cfg.DAILY_REENTRY_PROB.get("cervical", 0.0013)
+                        reentry_prob = 1.0 - (1.0 - daily_prob) ** sweep_days
+                        if random.random() < reentry_prob:
+                            p.overdue_since_day = None
+                            self._queues.schedule_outpatient(
+                                p, p.destination, day + cfg.REENTRY_DELAY_DAYS
+                            )
+                            self.metrics["n_spontaneous_reentry"] += 1
+                            p.log(day, "OVERDUE — spontaneous re-entry; rescheduled")
                 survivors.append(p)
 
         self._established_pool = survivors
-        self._pending_new_entries += death_count
+        self._pending_new_entries += death_count + attrition_count
+        # Absorb non-mortality replacement exits accumulated since last sweep
+        self._pending_new_entries       += self._pending_replacement_exits
+        self._pending_replacement_exits  = 0
 
         if death_count > 0:
             self.metrics["mortality_count"] += death_count
@@ -1139,7 +1391,7 @@ class SimulationRunner:
         for _ in range(to_spawn):
             from population import _sample_established_destination
             dest = _sample_established_destination()
-            p    = sample_patient(self._pid, day, dest, "outpatient")
+            p    = sample_replacement_patient(self._pid, day, dest, "outpatient")
             self._pid += 1
 
             # New replacement joins the established cycling pool

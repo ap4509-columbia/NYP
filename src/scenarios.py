@@ -348,7 +348,7 @@ def age_cluster_summary(patients: List[Patient]) -> dict:
     Highlights the 40–50 convergence zone.
     """
     from collections import defaultdict
-    age_bins = [(21, 29), (30, 39), (40, 49), (50, 59), (60, 69), (70, 80)]
+    age_bins = [(21, 29), (30, 39), (40, 49), (50, 59), (60, 69), (70, 79), (80, 89), (90, 99)]
     summary  = defaultdict(lambda: defaultdict(int))
 
     for p in patients:

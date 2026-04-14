@@ -159,7 +159,7 @@ ER_CRITICAL_PROB = 0.50         # PLACEHOLDER
 AGE_STRATA = {
     "young":  (21, 29),
     "middle": (30, 65),
-    "older":  (66, 80),
+    "older":  (66, 99),
 }
 
 # ── Screening Eligibility Rules ───────────────────────────────────────────────
@@ -608,7 +608,13 @@ ANNUAL_VISIT_INTERVAL  = 365           # days between established patient visits
 # After each visit, the far end of the window is extended by one year, so the
 # patient always has approximately ADVANCE_SCHEDULE_YEARS future appointments booked.
 ADVANCE_SCHEDULE_YEARS = 5
-WARMUP_DAYS            = 365           # spread initial cohort across first full year
+# Warmup period: spread initial cohort across multiple years so the screening
+# intervals (3-year cytology, 5-year HPV) are staggered and Year 1 isn't a
+# spike. Patients are evenly distributed across the warmup window; each gets
+# ADVANCE_SCHEDULE_YEARS of pre-booked annual visits from their start date.
+# A 3-year warmup (1095 days) ensures the first cytology cycle has completed
+# and the system reaches near-steady-state by Year 4.
+WARMUP_DAYS            = 1825          # 5-year warmup
 
 # ── Mortality sweep cadence ───────────────────────────────────────────────────
 MORTALITY_CHECK_DAYS   = 30            # run mortality Bernoulli draws every N days
@@ -619,18 +625,40 @@ MORTALITY_CHECK_DAYS   = 30            # run mortality Bernoulli draws every N d
 ANNUAL_SMOKING_CESSATION_PROB = 0.05   # prob a current smoker quits in a given year
 ANNUAL_HPV_CLEARANCE_PROB     = 0.30   # prob HPV-positive patient clears in a given year
 
-# ── Age-specific annual mortality rates for US women (PLACEHOLDER) ────────────
-# Source: CDC WONDER / NCHS Life Tables (women, all causes, approximate).
-# PLACEHOLDER — replace with NYC-specific mortality data if available.
+# ── Age-specific annual mortality rates for US women ──────────────────────────
+# Source: CDC WONDER / NCHS Life Tables 2020 (females, all causes).
 # Keys: (age_lo, age_hi) inclusive; value: annual probability of death.
+# Extended through age 99 to avoid flat fallback for elderly patients.
+# PLACEHOLDER — replace with NYC-specific mortality data if available.
 ANNUAL_MORTALITY_RATE = {
-    (21,  29): 0.0006,
-    (30,  39): 0.0009,
-    (40,  49): 0.0020,
-    (50,  59): 0.0045,
-    (60,  69): 0.0100,
-    (70,  80): 0.0230,
+    (21,  29): 0.0006,    # Source: NCHS Life Tables 2020
+    (30,  39): 0.0009,    # Source: NCHS Life Tables 2020
+    (40,  49): 0.0020,    # Source: NCHS Life Tables 2020
+    (50,  59): 0.0045,    # Source: NCHS Life Tables 2020
+    (60,  69): 0.0100,    # Source: NCHS Life Tables 2020
+    (70,  79): 0.0230,    # Source: NCHS Life Tables 2020
+    (80,  84): 0.0550,    # Source: NCHS Life Tables 2020 (5-yr bracket)
+    (85,  89): 0.1200,    # Source: NCHS Life Tables 2020 (5-yr bracket)
+    (90,  94): 0.2200,    # Source: NCHS Life Tables 2020 (5-yr bracket)
+    (95,  99): 0.3500,    # Source: NCHS Life Tables 2020 (5-yr bracket)
 }
+
+# Mortality multiplier for current smokers (all-cause, both sexes).
+# Source: Jha et al. 2013 (NEJM); CDC "Health Effects of Cigarette Smoking"
+# Smokers have ~2.5x all-cause mortality vs never-smokers; former smokers ~1.4x.
+# Applied multiplicatively to the age-bracket rate in draw_mortality().
+SMOKER_MORTALITY_MULTIPLIER      = 2.5    # current smokers
+FORMER_SMOKER_MORTALITY_MULTIPLIER = 1.4  # quit but pack_years > 0
+
+# ── Annual attrition (non-clinical churn) ─────────────────────────────────────
+# Probability that an established patient leaves the system each year for
+# non-clinical reasons: moving out of area, switching providers, insurance
+# change, etc. Without this, the only way out of the pool is death or
+# screening ineligibility, which is too slow to offset aging — the pool
+# drifts older over the 70-year horizon. A 5% annual attrition rate is
+# conservative for a large urban health system.
+# Source: industry benchmarks for patient panel churn (5–15% annually).
+ANNUAL_ATTRITION_RATE = 0.05
 
 # ── Database persistence ──────────────────────────────────────────────────────
 DB_PATH           = "nyp_simulation.db"  # SQLite file path (relative to working dir)

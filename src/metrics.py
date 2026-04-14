@@ -62,8 +62,9 @@ def initialize_metrics() -> dict:
         "days_in_system":     [],                 # list of ints (retention days per patient)
 
         # ── Screenings ────────────────────────────────────────────────────────
-        "n_screened":        defaultdict(int),                     # cancer → count
-        "n_screened_by_test": defaultdict(int),                    # test modality → count (cytology / hpv_alone / ldct)
+        "n_screened":             defaultdict(int),                 # cancer → count (all patients)
+        "n_screened_established": defaultdict(int),                # cancer → count (established pool only)
+        "n_screened_by_test":     defaultdict(int),                # test modality → count (cytology / hpv_alone / ldct)
 
         # ── Cervical results ──────────────────────────────────────────────────
         "cervical_results": defaultdict(int),                      # result → count
@@ -107,6 +108,13 @@ def initialize_metrics() -> dict:
         "mortality_count":    0,   # total patients removed by mortality sweep
         "pool_size_snapshot": [],  # (day, pool_size) snapshots for longitudinal plot
 
+        # ── No-show / overdue exits ───────────────────────────────────────────
+        "n_noshow":              0,   # total missed appointment events recorded
+        "n_noshow_exit":         0,   # patients who exited after cumulative no-show cascade
+        "n_overdue_exit":        0,   # patients who timed out in the overdue pool
+        "n_spontaneous_reentry": 0,   # patients who spontaneously re-entered from overdue pool
+        "ltfu_noshow":           0,   # LTFU sub-bucket: no-show driven exits
+
         # ── Annual checkpoints (one dict per year, for longitudinal plots) ──────
         # Each entry: {year, day, pool_size, cum_cervical, cum_lung,
         #              cum_mortality, cum_colposcopy, cum_treated}
@@ -131,6 +139,8 @@ def record_screening(
     """
     from screening import get_cervical_age_stratum   # local import to avoid circularity
     metrics["n_screened"][cancer] += 1
+    if getattr(p, "is_established", False):
+        metrics["n_screened_established"][cancer] += 1
 
     # Track by test modality — infer from patient if not supplied
     if not test and cancer == "cervical":
@@ -337,6 +347,17 @@ def print_summary(metrics: dict) -> None:
             for rads in ["RADS_0","RADS_1","RADS_2","RADS_3","RADS_4A","RADS_4B_4X"]:
                 cnt = metrics["lung_rads_distribution"].get(rads, 0)
                 print(f"    {rads:<12} {cnt:>5,}  ({100*cnt/total_ldct:.1f}%)")
+
+    n_ns  = metrics.get("n_noshow", 0)
+    n_nsx = metrics.get("n_noshow_exit", 0)
+    n_ov  = metrics.get("n_overdue_exit", 0)
+    n_sr  = metrics.get("n_spontaneous_reentry", 0)
+    if n_ns > 0 or n_ov > 0:
+        print(f"\nNo-show / overdue exits:")
+        print(f"  {'Total no-show events:':<38} {n_ns:>6,}")
+        print(f"  {'Exited after cumulative no-shows:':<38} {n_nsx:>6,}")
+        print(f"  {'Exited from overdue pool:':<38} {n_ov:>6,}")
+        print(f"  {'Spontaneous re-entries:':<38} {n_sr:>6,}")
 
     print("=" * 65)
 
