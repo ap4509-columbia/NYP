@@ -24,6 +24,7 @@
 # NYP EHR-derived rates before the model is used for planning.
 # =============================================================================
 
+import math
 import random
 from patient import Patient
 import config as cfg
@@ -148,25 +149,6 @@ _BMI_NONOBES_SIGMA   = 3.2
 _BMI_OBESE_MU        = 34.8
 _BMI_OBESE_SIGMA     = 4.5
 
-# Replacement-patient age distribution — younger-skewing inflow
-# ─────────────────────────────────────────────────────────────────────────────
-# When a patient exits the established pool (mortality, aged out), their
-# replacement represents a NEW patient entering the health system: a woman
-# turning 21, a new mover, someone newly establishing care. In real life this
-# inflow skews younger than the Census stock distribution (mean ~51). Using
-# the stock distribution for replacements causes the pool to age over time
-# because replacements enter too old to offset survivors aging in place.
-#
-# This bracket distribution (mean ~33) maintains demographic equilibrium
-# across the 70-year simulation horizon.
-_REPLACEMENT_AGE_BRACKETS = [
-    ((21, 29), 0.40),   # women aging into eligibility, new movers
-    ((30, 39), 0.30),   # establishing care, post-pregnancy re-engagement
-    ((40, 49), 0.15),   # mid-career provider switches
-    ((50, 59), 0.10),   # later-life re-engagement
-    ((60, 69), 0.04),   # Medicare transitions
-    ((70, 85), 0.01),   # rare late-life new patients
-]
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -178,32 +160,29 @@ def _weighted_choice(dist: dict):
     return random.choices(keys, weights=weights, k=1)[0]
 
 
-def _sample_age() -> int:
+def _sample_age(age_range: tuple = None) -> int:
     """
     Sample a patient age from the Census single-year-of-age distribution.
 
     Draws from the empirical categorical distribution (ages 21–85).
     The age-85 bucket represents 85+ in the Census source; patients who
     draw 85 are expanded to 85–100 using a clipped Normal(89, 4).
+
+    If age_range is provided as (lo, hi), the draw is constrained to that
+    range by rejection sampling (re-drawing until the age falls within bounds).
     """
-    age = random.choices(_AGE_VALUES, weights=_AGE_PROBS, k=1)[0]
-    if age == 85:
-        # Expand 85+ bucket — Yutong's code: clipped Normal(89, 4) → 85-100
-        age = int(round(random.gauss(89.0, 4.0)))
-        age = max(85, min(100, age))
+    for _ in range(100):  # rejection sampling with safety limit
+        age = random.choices(_AGE_VALUES, weights=_AGE_PROBS, k=1)[0]
+        if age == 85:
+            age = int(round(random.gauss(89.0, 4.0)))
+            age = max(85, min(100, age))
+        if age_range is None or (age_range[0] <= age <= age_range[1]):
+            return age
+    # Fallback: uniform within range
+    if age_range:
+        return random.randint(age_range[0], age_range[1])
     return age
 
-
-def _sample_replacement_age() -> int:
-    """
-    Sample an age for a replacement patient entering the established pool.
-
-    Uses a younger-skewing distribution (mean ~33) rather than the full
-    Census stock distribution (mean ~51) to maintain demographic equilibrium.
-    """
-    brackets, weights = zip(*_REPLACEMENT_AGE_BRACKETS)
-    (lo, hi) = random.choices(brackets, weights=weights, k=1)[0]
-    return random.randint(lo, hi)
 
 
 def _sample_race_ethnicity() -> tuple:
@@ -273,6 +252,7 @@ def sample_patient(
     day_created:  int,
     destination:  str,
     patient_type: str,
+    age_range:    tuple = None,
 ) -> Patient:
     """
     Draw one patient from the NYC eligible women population.
@@ -283,15 +263,13 @@ def sample_patient(
     day_created  : simulation day the patient enters the system
     destination  : first provider — "pcp"|"gynecologist"|"specialist"|"er"
     patient_type : "outpatient" | "drop_in"
+    age_range    : optional (lo, hi) to constrain the age draw
 
     Returns
     -------
     Patient object with demographics and clinical flags set.
-
-    NOTE: This stub will be replaced by the provided population sampling code.
-          Do not change the function signature.
     """
-    age              = _sample_age()
+    age              = _sample_age(age_range)
     race, ethnicity  = _sample_race_ethnicity()
     insurance        = _sample_insurance(age)
 
@@ -323,55 +301,12 @@ def sample_patient(
                           hpv_vaccinated, prior_abnormal_pap, prior_cin)
 
 
-def sample_replacement_patient(
-    patient_id:   int,
-    day_created:  int,
-    destination:  str,
-    patient_type: str,
-) -> Patient:
-    """
-    Draw a replacement patient using a younger-skewing age distribution.
-
-    Identical to sample_patient except age is drawn from
-    _REPLACEMENT_AGE_BRACKETS (mean ~33) instead of the Census stock
-    distribution (mean ~51). This prevents the established pool from
-    aging over the 70-year simulation horizon.
-    """
-    age              = _sample_replacement_age()
-    race, ethnicity  = _sample_race_ethnicity()
-    insurance        = _sample_insurance(age)
-
-    smoker     = random.random() < _SMOKER_RATE
-    is_former  = (not smoker) and (random.random() < 0.30)
-    pack_years = round(random.uniform(5, 40), 1) if (smoker or is_former) else 0.0
-    years_since_quit = round(random.uniform(0, 30), 1) if is_former else 0.0
-
-    bmi = _sample_bmi()
-
-    hpv_vaccinated    = random.random() < _rate_for_age(_HPV_VAX_RATE, age)
-    hpv_positive      = (not hpv_vaccinated) and (random.random() < _HPV_POSITIVE_RATE)
-
-    hyst_group        = _hysterectomy_group(race, ethnicity)
-    hyst_table        = _HYSTERECTOMY_BY_GROUP[hyst_group]
-    hysterectomy_prob = _rate_for_age(hyst_table, age, default=0.35)
-    has_cervix        = random.random() > hysterectomy_prob
-
-    prior_abnormal_pap = has_cervix and (random.random() < 0.12)
-    prior_cin = None
-    if prior_abnormal_pap and random.random() < 0.30:
-        prior_cin = random.choice(["CIN1", "CIN2"])
-
-    return _build_patient(patient_id, day_created, patient_type, destination,
-                          age, race, ethnicity, insurance, smoker, pack_years,
-                          years_since_quit, bmi, has_cervix, hpv_positive,
-                          hpv_vaccinated, prior_abnormal_pap, prior_cin)
-
 
 def _build_patient(patient_id, day_created, patient_type, destination,
                    age, race, ethnicity, insurance, smoker, pack_years,
                    years_since_quit, bmi, has_cervix, hpv_positive,
                    hpv_vaccinated, prior_abnormal_pap, prior_cin) -> Patient:
-    """Shared Patient constructor for sample_patient and sample_replacement_patient."""
+    """Shared Patient constructor."""
     return Patient(
         patient_id           = patient_id,
         day_created          = day_created,
@@ -396,67 +331,106 @@ def _build_patient(patient_id, day_created, patient_type, destination,
 
 
 # =============================================================================
-# Stable population: mortality helpers
+# Life-event scheduling — independent of visits
+# =============================================================================
+# All patient-attribute events (death, attrition, smoking cessation, HPV
+# clearance) are drawn once at patient entry and placed into a life-event
+# queue.  Each event fires on its scheduled day whether or not the patient
+# has any upcoming clinical visits.  This eliminates batch sweeps and
+# produces smooth, continuous event distributions.
 # =============================================================================
 
-def get_mortality_prob(age: int) -> float:
+
+def draw_death_day(p: "Patient", entry_day: int) -> int:
     """
-    Return the BASE annual probability of death for a woman of the given age.
+    Draw a death day from the Gompertz hazard conditional on current age.
 
-    Values come from cfg.ANNUAL_MORTALITY_RATE, which is keyed on (lo, hi)
-    inclusive age brackets calibrated to NCHS Life Tables 2020. Returns 0.40
-    for ages above the highest bracket (≥100 is handled by a hard cap in
-    draw_mortality, so this fallback only applies to ages 100+).
+    Gompertz survival:  S(t|x) = exp[ -(a/b) * e^(bx) * (e^(bt) - 1) ]
+    where x = current age, t = additional years survived.
 
-    This is the non-smoking base rate. Smoking adjustment is applied in
-    draw_mortality() using cfg.SMOKER_MORTALITY_MULTIPLIER.
+    We invert S(t|x) = U  (U ~ Uniform(0,1)) to get t, then convert to
+    a simulation day.
+
+    Smoking adjustment scales `a` upward, shifting the hazard curve left
+    (earlier expected death).
     """
-    for (lo, hi), rate in cfg.ANNUAL_MORTALITY_RATE.items():
-        if lo <= age <= hi:
-            return rate
-    return 0.40   # extreme elderly fallback (ages above table ceiling)
+    a = cfg.GOMPERTZ_A
+    b = cfg.GOMPERTZ_B
 
-
-def draw_mortality(p: "Patient", sweep_days: int = cfg.MORTALITY_CHECK_DAYS) -> bool:
-    """
-    Bernoulli draw: does this patient die during the current sweep interval?
-
-    Scales the annual mortality rate to the sweep interval length so that the
-    expected number of deaths per year is correct regardless of sweep frequency:
-
-        p(die in N days) ≈ annual_rate × (N / 365)
-
-    Smoking adjustment: current smokers get cfg.SMOKER_MORTALITY_MULTIPLIER
-    (default 2.5x); former smokers with pack-year history get
-    cfg.FORMER_SMOKER_MORTALITY_MULTIPLIER (default 1.4x). This models the
-    well-documented excess all-cause mortality among smokers (Jha et al. 2013).
-
-    Parameters
-    ----------
-    p           : Patient object (must have .age, .smoker, .pack_years attributes)
-    sweep_days  : number of days since last mortality check (default from config)
-
-    Returns
-    -------
-    True  → patient dies; caller should call p.exit_system(day, "mortality")
-    False → patient survives this interval
-    """
-    if p.age >= 100:
-        return True   # hard cap — no patient survives past age 100
-
-    annual_prob = get_mortality_prob(p.age)
-
-    # Smoking-adjusted mortality
+    # Smoking-adjusted baseline
     if p.smoker:
-        annual_prob *= cfg.SMOKER_MORTALITY_MULTIPLIER
+        a *= cfg.SMOKER_MORTALITY_MULTIPLIER
     elif getattr(p, "pack_years", 0) > 0:
-        annual_prob *= cfg.FORMER_SMOKER_MORTALITY_MULTIPLIER
+        a *= cfg.FORMER_SMOKER_MORTALITY_MULTIPLIER
 
-    # Cap at 1.0 (can happen for very old smokers)
-    annual_prob = min(annual_prob, 1.0)
+    age = p.age
+    # Hard cap
+    max_remaining_years = max(0, cfg.MORTALITY_AGE_CAP - age)
+    if max_remaining_years <= 0:
+        return entry_day  # dies immediately
 
-    interval_prob = annual_prob * (sweep_days / 365.0)
-    return random.random() < interval_prob
+    # Inverse CDF:  t = (1/b) * ln(1 - (b * ln(U)) / (a * e^(b*x)))
+    # where U ~ Uniform(0,1).  If the argument to ln is ≤ 0, the patient
+    # "survives" beyond the Gompertz horizon — cap at max_remaining_years.
+    u = random.random()
+    # Avoid log(0)
+    if u == 0.0:
+        u = 1e-15
+
+    inner = 1.0 - (b * math.log(u)) / (a * math.exp(b * age))
+    if inner <= 0:
+        remaining_years = max_remaining_years
+    else:
+        remaining_years = min((1.0 / b) * math.log(inner), max_remaining_years)
+
+    remaining_days = int(remaining_years * 365)
+    return entry_day + remaining_days
+
+
+def draw_attrition_day(entry_day: int) -> tuple:
+    """
+    Draw an attrition day and sub-type from competing EXIT_SOURCES.
+
+    Uses the combined rate (sum of sub-rates) for the time draw, then assigns
+    the sub-type proportional to individual rates (standard competing risks).
+
+    Returns (day: int, subtype: str).
+    """
+    rate = cfg.ANNUAL_ATTRITION_RATE
+    if rate <= 0:
+        return (entry_day + 999 * 365, "relocation")  # effectively never
+    years = random.expovariate(rate)
+    day = entry_day + int(years * 365)
+
+    # Assign sub-type proportional to individual rates
+    sources  = list(cfg.EXIT_SOURCES.keys())
+    weights  = [cfg.EXIT_SOURCES[s]["annual_rate"] for s in sources]
+    subtype  = random.choices(sources, weights=weights, k=1)[0]
+    return (day, subtype)
+
+
+def draw_cessation_day(entry_day: int) -> int:
+    """
+    Draw the day a current smoker quits, from Exponential(ANNUAL_SMOKING_CESSATION_PROB).
+    Only called for patients who are smokers at entry.
+    """
+    rate = cfg.ANNUAL_SMOKING_CESSATION_PROB
+    if rate <= 0:
+        return entry_day + 999 * 365
+    years = random.expovariate(rate)
+    return entry_day + int(years * 365)
+
+
+def draw_hpv_clearance_day(entry_day: int) -> int:
+    """
+    Draw the day an HPV-positive patient clears the infection,
+    from Exponential(ANNUAL_HPV_CLEARANCE_PROB).
+    """
+    rate = cfg.ANNUAL_HPV_CLEARANCE_PROB
+    if rate <= 0:
+        return entry_day + 999 * 365
+    years = random.expovariate(rate)
+    return entry_day + int(years * 365)
 
 
 def _sample_established_destination() -> str:
@@ -493,7 +467,7 @@ def generate_established_population(
 
     Parameters
     ----------
-    n         : number of established patients to generate (cfg.SIMULATED_POPULATION)
+    n         : number of established patients to generate (cfg.INITIAL_POOL_SIZE)
     start_pid : starting patient_id counter (runner passes its current _pid)
     entry_day : simulation day to stamp as simulation_entry_day (usually 0)
 

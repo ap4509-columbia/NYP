@@ -12,17 +12,15 @@
 #     subject to stochastic loss-to-follow-up (LTFU) at each decision node.
 #
 # Cervical pathway:
-#   result routing → (LTFU check) → colposcopy → CIN grade draw
-#   → (LTFU check) → treatment assignment (surveillance or LEEP)
+#   result routing → colposcopy → CIN grade draw → treatment (LEEP)
+#   LTFU is handled by queue LTFU in runner.py (daily hazard while waiting
+#   for a procedure slot).
 #
 # Lung pathway:
-#   RADS routing → result communicated → (LTFU check) → biopsy referral
-#   → scheduling → completion → malignancy confirmed → treatment
-#
-# Each LTFU check is a Bernoulli draw against a config probability. If the
-# patient fails any check, they exit the system as "lost_to_followup" and no
-# further steps run. This models the real-world attrition that happens between
-# referral and follow-up appointment completion.
+#   RADS routing → result communicated → biopsy referral → scheduling
+#   → completion → malignancy confirmed → treatment
+#   Each step has its own probability (LUNG_PATHWAY_PROBS in config).
+#   Patients who fail any step exit as "lost_to_followup".
 #
 # DEPENDENCY DIRECTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,35 +37,8 @@ from typing import Optional
 import config as cfg
 from patient import Patient
 
-
-# ─── Loss-to-Follow-Up Checks ─────────────────────────────────────────────────
-# LTFU = patient drops out of care before completing the next clinical step.
-# Each check draws one Bernoulli sample; if lost, the patient exits the system.
-
-def check_ltfu_post_abnormal(p: Patient, metrics: Optional[dict] = None) -> bool:
-    """
-    Did the patient fail to follow up after receiving an abnormal screening result?
-    Probability driven by config: LTFU_PROBS['post_abnormal_to_colposcopy'].
-    Returns True if the patient is lost (did not go to colposcopy).
-    """
-    lost = random.random() < cfg.LTFU_PROBS["post_abnormal_to_colposcopy"]
-    if lost and metrics is not None:
-        metrics["ltfu_post_abnormal"] += 1
-    return lost
-
-
-def check_ltfu_post_colposcopy(p: Patient, metrics: Optional[dict] = None) -> bool:
-    """
-    Did the patient fail to follow up after colposcopy before completing treatment?
-    Probability driven by config: LTFU_PROBS['post_colposcopy_to_treatment'].
-    Returns True if the patient is lost (did not complete treatment).
-    """
-    # Source: AiP Parameters PDF — "50% Treated, 50% Exit" for CIN2/3 post-colposcopy
-    # Config: LTFU_PROBS["post_colposcopy_to_treatment"] = 0.50
-    lost = random.random() < cfg.LTFU_PROBS["post_colposcopy_to_treatment"]
-    if lost and metrics is not None:
-        metrics["ltfu_post_colposcopy"] += 1
-    return lost
+# Analysis warmup cutoff — metrics recorded before this day are excluded
+_WARMUP_DAY = cfg.WARMUP_YEARS * cfg.DAYS_PER_YEAR
 
 
 # ─── Cervical: Result Routing ─────────────────────────────────────────────────
@@ -108,21 +79,13 @@ def route_cervical_result(
         p.log(current_day, f"ROUTE cervical {result} → routine surveillance")
         return "routine_surveillance"
 
-    # Abnormal cytology: all four categories go to colposcopy (with LTFU risk)
+    # Abnormal cytology: all four categories go to colposcopy
     if result in _CYTOLOGY_COLPOSCOPY_TRIGGERS:
-        if check_ltfu_post_abnormal(p, metrics):
-            p.exit_system(current_day, "lost_to_followup")
-            p.log(current_day, f"LTFU after {result} — no colposcopy follow-up")
-            return "exit"
         p.log(current_day, f"ROUTE {result} → colposcopy")
         return "colposcopy"
 
     # HPV positive: use ASCCP triage split
     if result == "HPV_POSITIVE":
-        if check_ltfu_post_abnormal(p, metrics):
-            p.exit_system(current_day, "lost_to_followup")
-            p.log(current_day, "LTFU after HPV_POSITIVE — no follow-up")
-            return "exit"
         # HPV+ triage: route to 1-year repeat cytology (lower-risk) vs colposcopy.
         # Split is controlled by config.HPV_POSITIVE_COLPOSCOPY_PROB (PLACEHOLDER).
         if random.random() >= cfg.HPV_POSITIVE_COLPOSCOPY_PROB:
@@ -173,7 +136,7 @@ def run_colposcopy(
     p.colposcopy_result = cin
     p.log(current_day, f"COLPOSCOPY → {cin}")
 
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["n_colposcopy"] += 1
         metrics["colposcopy_results"][cin] += 1
 
@@ -195,10 +158,7 @@ def run_treatment(
     p: Patient, current_day: int, metrics: Optional[dict] = None
 ) -> str:
     """
-    Execute the treatment step after colposcopy, applying an LTFU check first.
-
-    If the patient drops out before treatment (LTFU):
-      → patient exits the system as "untreated"
+    Execute the treatment step after colposcopy.
 
     If CIN grade maps to surveillance (NORMAL or CIN1):
       → patient enters 1-year surveillance schedule
@@ -206,14 +166,8 @@ def run_treatment(
     If CIN grade maps to an excisional procedure (CIN2 or CIN3):
       → patient is treated with LEEP; stage set to 'treated'
 
-    Returns one of: "surveillance" | "treated" | "exit"
+    Returns one of: "surveillance" | "treated"
     """
-    # Check if the patient dropped out before completing treatment
-    if check_ltfu_post_colposcopy(p, metrics):
-        p.exit_system(current_day, "untreated")
-        p.log(current_day, "LTFU — did not complete treatment after colposcopy")
-        return "exit"
-
     treatment        = assign_treatment_type(p.colposcopy_result or "NORMAL")
     p.treatment_type = treatment
 
@@ -221,14 +175,14 @@ def run_treatment(
         # Low-grade finding — no procedure needed, watch and repeat in 1 year
         p.current_stage = "surveillance"
         p.log(current_day, f"TREATMENT — {p.colposcopy_result}: 1-year surveillance")
-        if metrics is not None:
+        if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["n_treatment"]["surveillance"] += 1
         return "surveillance"
 
     # High-grade finding — excisional treatment (LEEP or cold-knife cone)
     p.current_stage = "treated"
     p.log(current_day, f"TREATMENT — {treatment} (excisional) for {p.colposcopy_result}")
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["n_treatment"][treatment] += 1
         metrics["n_treated"] += 1
     return "treated"
@@ -296,11 +250,9 @@ def _lung_result_communicated(p: Patient, current_day: int, metrics: Optional[di
     if random.random() > cfg.LUNG_PATHWAY_PROBS["result_communicated"]:
         p.log(current_day, f"LUNG {p.lung_result}: results NOT communicated — LTFU")
         p.exit_system(current_day, "lost_to_followup")
-        if metrics is not None:
-            metrics["ltfu_post_abnormal"] += 1
         return False
     # Result was communicated — record the success
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_result_communicated"] += 1
     p.log(current_day, f"LUNG {p.lung_result}: results communicated to patient")
     return True
@@ -325,7 +277,7 @@ def run_lung_followup(
       "repeat_ldct_6mo"     — RADS 3: 6-month repeat
       "repeat_ldct_1_3mo"   — RADS 0: incomplete scan, 1–3 month repeat
       "lung_treated"        — biopsy confirmed malignancy, treatment given
-      "lung_untreated"      — malignancy confirmed but patient did not receive treatment
+      "lung_untreated"      — malignancy confirmed but patient LTFU before treatment
       "exit"                — patient lost to follow-up at any step
     """
     rads = p.lung_result
@@ -341,8 +293,6 @@ def run_lung_followup(
             if random.random() > cfg.LUNG_RADS_ADHERENCE[rads]:
                 p.log(current_day, f"LUNG {rads}: non-adherent to follow-up schedule — LTFU")
                 p.exit_system(current_day, "lost_to_followup")
-                if metrics is not None:
-                    metrics["ltfu_post_abnormal"] += 1
                 return "exit"
 
         repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(rads, 365)
@@ -370,18 +320,14 @@ def run_lung_followup(
             if random.random() > cfg.LUNG_RADS_ADHERENCE[rads]:
                 p.log(current_day, f"LUNG {rads}: non-adherent to follow-up schedule — LTFU")
                 p.exit_system(current_day, "lost_to_followup")
-                if metrics is not None:
-                    metrics["ltfu_post_abnormal"] += 1
                 return "exit"
 
         # Node 1: Was a biopsy referral placed by the provider?
         if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_referral_made"]:
             p.log(current_day, f"LUNG {rads}: no biopsy referral — unmet referral (LTFU)")
             p.exit_system(current_day, "lost_to_followup")
-            if metrics is not None:
-                metrics["ltfu_post_abnormal"] += 1
             return "exit"
-        if metrics is not None:
+        if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_biopsy_referral"] += 1
         p.log(current_day, f"LUNG {rads}: biopsy referral placed")
 
@@ -389,10 +335,8 @@ def run_lung_followup(
         if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_scheduled"]:
             p.log(current_day, "LUNG biopsy: not scheduled — unmet referral (LTFU)")
             p.exit_system(current_day, "lost_to_followup")
-            if metrics is not None:
-                metrics["ltfu_post_abnormal"] += 1
             return "exit"
-        if metrics is not None:
+        if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_biopsy_scheduled"] += 1
         p.log(current_day, "LUNG biopsy: scheduled")
 
@@ -400,14 +344,8 @@ def run_lung_followup(
         if random.random() > cfg.LUNG_PATHWAY_PROBS["biopsy_completed"]:
             p.log(current_day, "LUNG biopsy: not completed — LTFU")
             p.exit_system(current_day, "lost_to_followup")
-            if metrics is not None:
-                # Use ltfu_post_abnormal (shared lung/cervical LTFU bucket).
-                # Previously incremented ltfu_post_colposcopy — a cervical-only
-                # metric — which contaminated the cervical LTFU breakdown and the
-                # foregone LEEP revenue calculation.
-                metrics["ltfu_post_abnormal"] += 1
             return "exit"
-        if metrics is not None:
+        if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_biopsy_completed"] += 1
         p.log(current_day, "LUNG biopsy: completed")
 
@@ -419,20 +357,20 @@ def run_lung_followup(
             return "repeat_ldct_12mo"
 
         p.lung_biopsy_result = "malignant"
-        if metrics is not None:
+        if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_malignancy_confirmed"] += 1
         p.log(current_day, "LUNG biopsy: malignancy confirmed")
 
         # Node 5: Was treatment given (surgery / radiation / medical oncology)?
         if random.random() > cfg.LUNG_PATHWAY_PROBS["treatment_given"]:
             # Malignancy confirmed but patient did not receive treatment
-            p.exit_system(current_day, "untreated")
+            p.exit_system(current_day, "lost_to_followup")
             p.log(current_day, "LUNG: malignancy confirmed but no treatment given")
             return "lung_untreated"
 
         # Treatment successfully given
         p.current_stage = "treated"
-        if metrics is not None:
+        if metrics is not None and current_day >= _WARMUP_DAY:
             metrics["lung_treatment_given"] += 1
             metrics["n_treated"] += 1
         p.log(current_day, "LUNG: treatment given (surgery / radiation / med onc)")

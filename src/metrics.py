@@ -24,7 +24,11 @@
 from collections import defaultdict
 from typing import List
 
+import config as cfg
 from patient import Patient
+
+# Analysis warmup cutoff — metrics recorded before this day are excluded
+_WARMUP_DAY = cfg.WARMUP_YEARS * cfg.DAYS_PER_YEAR
 
 
 def initialize_metrics() -> dict:
@@ -35,7 +39,7 @@ def initialize_metrics() -> dict:
       - Volume counters: how many patients were seen, eligible, or unscreened.
       - Screening counts: per-cancer screening totals, cervical result distributions.
       - Cervical follow-up: colposcopy counts, CIN grade distribution, treatment types.
-      - Outcomes: treated, untreated, LTFU totals.
+      - Outcomes: treated, LTFU totals.
       - LTFU breakdown: how many patients were lost at each specific node.
       - Lung pathway funnel: step-by-step counts from referral through treatment.
       - Wait times: lists of days waited at each resource (for scheduling analysis).
@@ -60,6 +64,7 @@ def initialize_metrics() -> dict:
         # ── Exit / Retention breakdown ────────────────────────────────────────
         "exits_by_reason":    defaultdict(int),   # exit_reason string → count
         "days_in_system":     [],                 # list of ints (retention days per patient)
+        "days_in_system_screened": [],             # same but only patients with visit_count > 0
 
         # ── Screenings ────────────────────────────────────────────────────────
         "n_screened":             defaultdict(int),                 # cancer → count (all patients)
@@ -68,6 +73,9 @@ def initialize_metrics() -> dict:
 
         # ── Cervical results ──────────────────────────────────────────────────
         "cervical_results": defaultdict(int),                      # result → count
+        "cervical_results_by_test": defaultdict(                   # test → result → count
+            lambda: defaultdict(int)                               # e.g. cervical_results_by_test["cytology"]["ASCUS"]
+        ),
         "cervical_by_age_stratum": defaultdict(                    # stratum → result → count
             lambda: defaultdict(int)
         ),
@@ -79,14 +87,14 @@ def initialize_metrics() -> dict:
 
         # ── Outcomes ──────────────────────────────────────────────────────────
         "n_treated":   0,
-        "n_untreated": 0,
         "n_ltfu":      0,
         "n_exited":    0,
 
         # ── LTFU by node ──────────────────────────────────────────────────────
-        "ltfu_post_abnormal":   0,
-        "ltfu_post_colposcopy": 0,
-        "ltfu_unscreened":      0,
+        "ltfu_unscreened":          0,
+        "ltfu_queue_primary":       0,   # abandoned primary screening retry queue
+        "ltfu_queue_secondary":     0,   # abandoned secondary (colposcopy/biopsy) retry queue
+        "ltfu_queue_treatment":     0,   # abandoned treatment (LEEP/cone) retry queue
 
         # ── Lung pathway funnel ───────────────────────────────────────────────
         "lung_eligible":            0,
@@ -103,18 +111,25 @@ def initialize_metrics() -> dict:
 
         # ── Wait times (days, by resource) ────────────────────────────────────
         "wait_times": defaultdict(list),
+        # Abandoned waits: patients who died/attrited while queued for a slot
+        "wait_times_abandoned": defaultdict(list),
+
+        # ── Daily screening demand vs capacity ────────────────────────────────
+        # Each entry is one workday: (demand, supplied, overflow)
+        # demand = patients who attempted a primary screening slot
+        # supplied = slots consumed (screening happened)
+        # overflow = patients rescheduled (no slot available)
+        "daily_screening_demand": [],
+        "daily_secondary_demand": [],    # colposcopy + lung_biopsy
+        "daily_treatment_demand": [],    # leep + cone_biopsy
 
         # ── Stable population (only populated when use_stable_population=True) ─
-        "mortality_count":    0,   # total patients removed by mortality sweep
+        "mortality_count":    0,   # total patients removed by mortality events
         "pool_size_snapshot": [],  # (day, pool_size) snapshots for longitudinal plot
 
-        # ── No-show / overdue exits ───────────────────────────────────────────
-        "n_noshow":              0,   # total missed appointment events recorded
-        "n_noshow_exit":         0,   # patients who exited after cumulative no-show cascade
-        "n_overdue_exit":        0,   # patients who timed out in the overdue pool
-        "n_spontaneous_reentry": 0,   # patients who spontaneously re-entered from overdue pool
-        "ltfu_noshow":           0,   # LTFU sub-bucket: no-show driven exits
-
+        # ── Multi-source tracking ─────────────────────────────────────────────
+        "arrivals_by_source":  defaultdict(int),   # arrival source → count
+        "exits_by_source":     defaultdict(int),   # exit source/subtype → count
         # ── Annual checkpoints (one dict per year, for longitudinal plots) ──────
         # Each entry: {year, day, pool_size, cum_cervical, cum_lung,
         #              cum_mortality, cum_colposcopy, cum_treated}
@@ -123,10 +138,15 @@ def initialize_metrics() -> dict:
 
 
 def record_screening(
-    metrics: dict, p: Patient, cancer: str, result: str, test: str = ""
+    metrics: dict, p: Patient, cancer: str, result: str,
+    test: str = "", current_day: int = 0
 ) -> None:
     """
     Record a completed screening event in the metrics dict.
+
+    Events during the warmup period (day < WARMUP_YEARS * 365) are silently
+    skipped — they still happen in the simulation but are excluded from
+    analysis metrics.
 
     Increments the per-cancer screening counter and, for cervical screenings,
     also tallies the result category and the age-stratum breakdown. The stratum
@@ -137,6 +157,8 @@ def record_screening(
     to track first-stage screening volume by modality — the primary USPSTF metric.
     Falls back to the patient's last recorded test if not explicitly provided.
     """
+    if current_day < _WARMUP_DAY:
+        return
     from screening import get_cervical_age_stratum   # local import to avoid circularity
     metrics["n_screened"][cancer] += 1
     if getattr(p, "is_established", False):
@@ -152,6 +174,7 @@ def record_screening(
 
     if cancer == "cervical":
         metrics["cervical_results"][result] += 1
+        metrics["cervical_results_by_test"][test][result] += 1
         stratum = get_cervical_age_stratum(p.age)
         metrics["cervical_by_age_stratum"][stratum][result] += 1
 
@@ -160,21 +183,25 @@ def record_exit(metrics: dict, reason: str, patient=None, current_day: int = 0) 
     """
     Record a patient's exit from the system and classify it into an outcome bucket.
 
+    Events during the warmup period (day < WARMUP_YEARS * 365) are silently
+    skipped — they still happen in the simulation but are excluded from
+    analysis metrics.
+
     Called whenever a patient's pathway ends, whether through successful treatment,
     voluntary departure without treatment, or LTFU. The reason string comes from
     patient.exit_reason (set by patient.exit_system()) and maps to one of three
-    outcome counters: treated, untreated, or lost_to_followup.
+    outcome counters: treated or lost_to_followup.
 
     Optional patient and current_day are used to record retention duration
     (days from patient creation to exit) in metrics["days_in_system"].
     """
+    if current_day < _WARMUP_DAY:
+        return
     metrics["n_exited"] += 1
     metrics["exits_by_reason"][reason] += 1
 
     if reason == "treated":
         metrics["n_treated"] += 1
-    elif reason == "untreated":
-        metrics["n_untreated"] += 1
     elif reason == "lost_to_followup":
         metrics["n_ltfu"] += 1
 
@@ -182,6 +209,8 @@ def record_exit(metrics: dict, reason: str, patient=None, current_day: int = 0) 
         retention = current_day - getattr(patient, "day_created", current_day)
         if retention >= 0:
             metrics["days_in_system"].append(retention)
+            if getattr(patient, "visit_count", 0) >= 2:
+                metrics["days_in_system_screened"].append(retention)
 
 
 def compute_rates(metrics: dict) -> dict:
@@ -311,14 +340,14 @@ def print_summary(metrics: dict) -> None:
     print(f"\nOutcomes:")
     print(f"  {'Treated:':<38} {metrics['n_treated']:>6,}  "
           f"({rates['treatment_completion_pct']:.1f}% of colposcopies)")
-    print(f"  {'Untreated:':<38} {metrics['n_untreated']:>6,}")
     print(f"  {'Lost to follow-up:':<38} {metrics['n_ltfu']:>6,}  "
           f"({rates['ltfu_rate_pct']:.1f}% of all patients)")
 
     print(f"\nLTFU breakdown:")
-    print(f"  {'Post-abnormal screen:':<38} {metrics['ltfu_post_abnormal']:>6,}")
-    print(f"  {'Post-colposcopy:':<38} {metrics['ltfu_post_colposcopy']:>6,}")
     print(f"  {'Declined screening:':<38} {metrics['ltfu_unscreened']:>6,}")
+    print(f"  {'Queue — primary screening:':<38} {metrics['ltfu_queue_primary']:>6,}")
+    print(f"  {'Queue — secondary (colpo/biopsy):':<38} {metrics['ltfu_queue_secondary']:>6,}")
+    print(f"  {'Queue — treatment (LEEP/cone):':<38} {metrics['ltfu_queue_treatment']:>6,}")
 
     if metrics["lung_eligible"] > 0:
         print(f"\nLung LDCT pathway funnel:")
@@ -348,16 +377,6 @@ def print_summary(metrics: dict) -> None:
                 cnt = metrics["lung_rads_distribution"].get(rads, 0)
                 print(f"    {rads:<12} {cnt:>5,}  ({100*cnt/total_ldct:.1f}%)")
 
-    n_ns  = metrics.get("n_noshow", 0)
-    n_nsx = metrics.get("n_noshow_exit", 0)
-    n_ov  = metrics.get("n_overdue_exit", 0)
-    n_sr  = metrics.get("n_spontaneous_reentry", 0)
-    if n_ns > 0 or n_ov > 0:
-        print(f"\nNo-show / overdue exits:")
-        print(f"  {'Total no-show events:':<38} {n_ns:>6,}")
-        print(f"  {'Exited after cumulative no-shows:':<38} {n_nsx:>6,}")
-        print(f"  {'Exited from overdue pool:':<38} {n_ov:>6,}")
-        print(f"  {'Spontaneous re-entries:':<38} {n_sr:>6,}")
 
     print("=" * 65)
 
@@ -441,32 +460,32 @@ def compute_revenue(metrics: dict) -> dict:
         if k not in ("NORMAL", "HPV_NEGATIVE")
     )
 
-    foregone = {
-        # Eligible cervical patients who were never screened
-        "unscreened_cervical": (
-            max(cervical_eligible - cervical_screened, 0) * avg_cerv_screen
-        ),
-        # Abnormal result but LTFU before colposcopy
-        "ltfu_post_abnormal_cervical": (
-            metrics["ltfu_post_abnormal"] * (rev["colposcopy"] + rev["leep"] * 0.3)
-            # 0.3 ≈ fraction of colposcopies that lead to excisional treatment
-        ),
-        # Completed colposcopy but LTFU before treatment
-        "ltfu_post_colposcopy": (
-            metrics["ltfu_post_colposcopy"] * rev["leep"]
-        ),
+    # Lung pathway clinical dropoffs
+    lung_eligible      = metrics.get("lung_eligible", 0)
+    lung_ldct_done     = metrics.get("lung_ldct_completed", 0)
+    lung_biopsy_ref    = metrics.get("lung_biopsy_referral", 0)
+    lung_biopsy_done   = metrics.get("lung_biopsy_completed", 0)
 
-        # Lung: eligible but no LDCT order placed
-        "lung_no_ldct": (
-            max(
-                metrics["lung_eligible"] - metrics["lung_referral_placed"], 0
-            ) * rev["ldct"]
+    foregone = {
+        # Unscreened — eligible patients who declined / no-showed
+        "unscreened": (
+            metrics.get("ltfu_unscreened", 0) * avg_cerv_screen
         ),
-        # LDCT completed but RADS 4 result not followed up with biopsy
-        "lung_no_biopsy": (
-            max(
-                metrics["lung_biopsy_referral"] - metrics["lung_biopsy_completed"], 0
-            ) * rev["lung_biopsy"]
+        # Queue LTFU — primary screening queue
+        "queue_ltfu_primary": (
+            metrics["ltfu_queue_primary"] * avg_cerv_screen
+        ),
+        # Queue LTFU — diagnostic queue (colposcopy / biopsy)
+        "queue_ltfu_secondary": (
+            metrics["ltfu_queue_secondary"] * rev["colposcopy"]
+        ),
+        # Lung clinical LTFU — eligible but never completed LDCT
+        "lung_screening_ltfu": (
+            max(lung_eligible - lung_ldct_done, 0) * rev["ldct"]
+        ),
+        # Lung biopsy LTFU — referred for biopsy but never completed
+        "lung_biopsy_ltfu": (
+            max(lung_biopsy_ref - lung_biopsy_done, 0) * rev["lung_biopsy"]
         ),
     }
     foregone_total = sum(foregone.values())

@@ -43,9 +43,6 @@ class Patient:
     active:                bool = True       # False once the patient exits the system
     current_stage:         str  = "arrived"  # tracks where in the pathway the patient is
     willing_to_reschedule: bool = True       # used by handle_unscreened to decide LTFU vs. retry
-    noshow_count:          int  = 0          # cumulative consecutive missed appointments (resets on attendance)
-    overdue_since_day:     Optional[int] = None  # day patient entered the overdue pool; None if current
-
     # ── Screening history (simulation day of last screen; -1 = never) ─────────
     # Compared against today's day in is_due_for_screening() to enforce intervals
     last_cervical_screen_day:     int           = -1
@@ -99,10 +96,19 @@ class Patient:
     visit_count:          int          = 0      # total provider visits recorded
     next_visit_day:       Optional[int] = None  # next scheduled annual visit day
 
+    # ── Scheduled life events (independent of visits) ────────────────────────
+    # Drawn at patient entry and placed in the life-event priority queue.
+    # Each fires on its scheduled day regardless of visit activity.
+    scheduled_death_day:     Optional[int] = None  # Gompertz draw
+    scheduled_attrition_day: Optional[int] = None  # Exponential draw (competing risks)
+    attrition_subtype:       Optional[str] = None  # relocation | insurance_loss | provider_switch
+    scheduled_cessation_day: Optional[int] = None  # Exponential draw (smokers only)
+    scheduled_hpv_clear_day: Optional[int] = None  # Exponential draw (HPV+ only)
+
     # ── Exit state ────────────────────────────────────────────────────────────
     exit_day:    Optional[int] = None
     exit_reason: Optional[str] = None
-    # treated | untreated | lost_to_followup | ineligible | mortality
+    # treated | lost_to_followup | ineligible | mortality
 
     # ── Per-patient event log: [(day, event_string), ...] ─────────────────────
     # Each call to p.log() appends a (day, event_string) tuple here.

@@ -1,381 +1,1018 @@
-# NYP Women's Health Screening Simulation — Architecture & Design
+# NYP Women's Health Screening Simulation — Complete Architecture
 
-## Overview
-
-This is a **discrete-event simulation (DES)** of a women's cancer screening program at NewYork-Presbyterian Hospital, built in Python. It models cervical and lung cancer screening pathways across a 70-year horizon for a stable cycling population of 15,000 simulated patients, each representing a cohort of real NYC women.
-
-All numeric parameters live in a single file (`src/config.py`) and are never hard-coded elsewhere. To run a scenario analysis — doubling colposcopy capacity, changing LTFU rates, switching workflow modes — you change one number in config and re-run.
+A discrete-event simulation (DES) of a multi-cancer women's health screening program at NewYork-Presbyterian. The model simulates patient flow from provider arrival through screening, clinical follow-up, and system exit — across an **80-year longitudinal horizon** (with a 10-year warmup period) — quantifying drop-off at each step and supporting operational and financial planning.
 
 ---
 
-## 1. The Clock
+## Table of Contents
 
-The simulation runs as an **integer day-counter loop** from day 0 to day 25,550 (70 years × 365 days/year). There is no floating-point SimPy time — every iteration of the loop represents one full calendar day, processed by a function called `_tick(day)`.
-
-**Day 0 is treated as Monday.** When `SKIP_WEEKENDS = True`, any day where `day % 7 ≥ 5` is a weekend. On those days, all clinical steps are suppressed — no arrivals, no provider queues, no screenings. Background processes (mortality sweeps, database flushes, annual metric checkpoints) still run on weekends, because they model biological and administrative continuity that is not bounded by clinic hours.
-
----
-
-## 2. The Population
-
-The simulation maintains a **stable cycling population** of 15,000 established patients. These are not 15,000 unique individuals followed once — they are 15,000 simulation agents, each representing a cohort of real NYC women via a population scale factor. The pool collectively represents the eligible screening population of the NYC metro area.
-
-### Warmup
-
-At day 0, all 15,000 patients are created and spread evenly across the first 365 days. Patient `i` receives their first appointment on day `i × 365 / 15,000`. This prevents a cold-start bias where year-1 metrics look artificially low because the clinic is empty.
-
-Each patient is also given several years of pre-booked annual appointments from the start. After each visit, the far end of that window is extended by one year, so every established patient always has multiple future appointments on the books.
-
-### Patient Attributes
-
-Each patient is assigned at creation (from `population.py`):
-
-- **Age** — drawn to match NYC demographic distributions for women aged 21–80
-- `has_cervix` — anatomical eligibility for cervical screening
-- `smoker` / `pack_years` / `years_since_quit` — lung screening eligibility attributes
-- `hpv_positive` — HPV carrier status (modifies cervical result probabilities)
-- `prior_cin` — prior CIN grade history (modifies high-grade result probabilities)
-- `destination` — which provider type they are routed to (PCP, GYN, Specialist, ER)
-- `noshow_count` — consecutive missed appointments since last attendance; resets to 0 on attendance
-- `overdue_since_day` — simulation day the patient entered the overdue pool; `None` when current
+1. [Project Scope](#project-scope)
+2. [File Architecture](#file-architecture)
+3. [Population Generation](#1-population-generation)
+4. [Life Event Scheduling](#2-life-event-scheduling)
+5. [The Patient Pool & Warmup](#3-the-patient-pool--warmup)
+6. [Daily Simulation Loop](#4-daily-simulation-loop)
+7. [Arrivals & Provider Routing](#5-arrivals--provider-routing)
+8. [Eligibility & Screening Intervals](#6-eligibility--screening-intervals)
+9. [Screening Initiation Model](#7-screening-initiation-model)
+10. [Test Assignment & Result Draws](#8-test-assignment--result-draws)
+11. [Procedure Slot Capacity & Queue Overflow](#9-procedure-slot-capacity--queue-overflow)
+12. [Cervical Follow-Up Pathway](#10-cervical-follow-up-pathway)
+13. [Lung Follow-Up Pathway](#11-lung-follow-up-pathway)
+14. [Surveillance & Re-Entry](#12-surveillance--re-entry)
+15. [Loss-to-Follow-Up (LTFU)](#13-loss-to-follow-up-ltfu)
+16. [Mortality, Attrition & Life Events](#14-mortality-attrition--life-events)
+17. [Metrics & Revenue](#15-metrics--revenue)
+18. [Database Persistence](#16-database-persistence)
+19. [Visualizations](#17-visualizations)
+20. [Turnaround & Scheduling Delays](#turnaround--scheduling-delays)
+21. [Scale Interpretation](#scale-interpretation)
 
 ---
 
-## 3. Daily New Arrivals
+## Project Scope
 
-Every weekday, a draw from a **Poisson distribution** (approximated by a Normal distribution for computational efficiency) determines how many new first-time patients arrive as drop-ins. These are women who are genuinely new to NYP: first-time visitors, women turning 21, recent movers, patients switching providers. After their first visit, they join the established cycling pool.
+**Active cancers:** cervical and lung (`ACTIVE_CANCERS = ["cervical", "lung"]`).
 
-For each new arrival, two independent **categorical draws** happen:
+**Simulation window:** 80 years (`SIM_YEARS = 80`) = 29,200 days (`SIM_DAYS`). The first 10 years (`WARMUP_YEARS = 10`) are warmup; all metrics are collected from day 3,650 onward (70 years of measured output).
 
-1. **Destination** — which provider type they go to (PCP, GYN, Specialist, ER), drawn from configured routing weights
-2. **Patient type** — whether they have a scheduled appointment (outpatient) or walk in (drop-in), drawn from configured type weights
+**Population scale:** 15,000 simulated patients (`INITIAL_POOL_SIZE`) represent approximately 1.5 million NYC eligible women (scale factor `POPULATION_SCALE_FACTOR = 100`).
 
-Outpatient arrivals going to a non-ER provider receive a **scheduling lead time** drawn from a **discrete uniform distribution** over a provider-specific range of days. They are placed into the outpatient queue for that future day. Drop-ins and ER arrivals go directly into today's queue.
+**Replications:** `NUM_REPS = 10` independent runs for variance analysis.
 
----
+**Random seed:** `RANDOM_SEED = None` (non-deterministic by default; set to an integer for reproducibility).
 
-## 4. Queue Processing
-
-Each weekday, for each of the four provider types (PCP, GYN, Specialist, ER):
-
-### Outpatients
-Placed in the outpatient queue by the scheduler, which guarantees their slot was never overfilled when it was booked. Total daily capacity is split between outpatient and drop-in slots via a configured fraction per provider type. ER has no outpatient fraction — it is entirely drop-in.
-
-Before an outpatient is processed, a **no-show gate** fires (see Section 4a). Drop-ins are walk-ins who have already arrived and are not subject to this gate.
-
-### Drop-ins
-Fill whatever capacity remains after outpatients are seated. Available drop-in capacity = the drop-in cap plus any unused outpatient slots from today (e.g. if some booked patients have since died or aged out). When there are more drop-ins than available slots, **women aged 40 and above are sorted to the front of the queue** before the capacity slice is applied. This is a hospital operations assumption: the 40+ cohort is disproportionately associated with higher-complexity procedures.
-
-### Overflow Routing
-Drop-ins who cannot be seen:
-- **PCP / GYN / Specialist** — placed into tomorrow's drop-in queue for the same provider
-- **ER** — a **Bernoulli draw** determines whether they retry the ER tomorrow or are converted to a scheduled outpatient appointment at a non-ER provider with a new lead-time draw
+| Cancer | Status | Guideline |
+|---|---|---|
+| Cervical | Full pathway | USPSTF 2018 — cytology every 3 yrs (age 21–65) or HPV-alone every 5 yrs (age 30–65) |
+| Lung | Full pathway | USPSTF 2021 — annual LDCT, age 50–80, ≥20 pack-years, current smoker or quit ≤15 yrs |
 
 ---
 
-## 4a. No-Show Gate
-
-For every **scheduled outpatient** at a non-ER provider, a **Bernoulli draw** is taken before `_screen_patient` is called. The probability is provider-specific (`NO_SHOW_PROB` in config). If the patient does not show, `_handle_noshow` runs instead of screening.
-
-### No-Show Cascade (`_handle_noshow`)
-
-The chain has three sequential stages:
-
-**Stage 1 — Cumulative exit draw.**
-The patient's `noshow_count` is incremented. A **Bernoulli draw** is made against the cumulative exit probability for that streak position (`NOSHOW_CUMULATIVE_EXIT_PROB`). Probability rises with each consecutive miss. If the draw fires, the patient exits immediately as `lost_to_followup`. On a successful attendance (no-show did not trigger), `noshow_count` is reset to 0.
-
-**Stage 2 — Post-no-show disposition.**
-If the cascade draw did not exit the patient, a **weighted categorical draw** from `NOT_SEEN_PROBS` for that provider produces one of three fates:
-- `reschedule` — a new appointment is booked after a provider-specific delay (`RESCHEDULE_DELAY_DAYS`)
-- `exit` — patient exits immediately as `lost_to_followup`
-- `wait` — outreach is attempted (Stage 3)
-
-**Stage 3 — Outreach and final fate.**
-If the patient is "waiting," `_apply_outreach` is called (see Section 4b). If outreach also returns `"wait"`, a final **weighted categorical draw** from `UNSCREENED_FATE` determines long-term disposition:
-- `may_return_later` — patient's `overdue_since_day` is set; they enter the overdue pool monitored by the monthly sweep (Section 15)
-- `exit_system` — permanent `lost_to_followup` exit
-
----
-
-## 4b. Outreach (`_apply_outreach`)
-
-A single outreach contact attempt. The probability distribution over outcomes is read from `OUTREACH_PROBS` keyed by `WORKFLOW_MODE`:
-- `"coordinated"` → `"with_navigation"` (higher reschedule probability; reflects active care navigation)
-- any other value → `"without_outreach"` (lower reschedule probability; reflects fragmented care)
-
-A **weighted categorical draw** produces one of three outcomes:
-- `reschedule` — books an appointment after `REENTRY_DELAY_DAYS`, clears `overdue_since_day`, resets `noshow_count`
-- `exit` — exits as `lost_to_followup`
-- `wait` — no action; returns `"wait"` to caller
-
-This function is called from both `_handle_noshow` (Stage 3 above) and the monthly overdue sweep (Section 15). The `WORKFLOW_MODE` toggle means the coordinated-care scenario automatically produces higher outreach success rates than the fragmented-care scenario without any other code changes.
-
----
-
-## 5. Screening Eligibility
-
-Once a patient clears the no-show gate and is seen, two sequential checks determine whether screening occurs:
-
-### Check 1 — Clinical Eligibility
-- **Cervical:** age within the USPSTF-specified range AND anatomically has a cervix
-- **Lung:** age within the USPSTF-specified range AND cumulative pack-years above the threshold AND (currently smoking OR quit within the allowed window)
-
-Patients ineligible for all active cancer types who will never become eligible (aged out, no cervix, smoking window permanently closed) exit the cycling pool and trigger a replacement entrant.
-
-### Check 2 — Interval Check
-Is enough time elapsed since the patient's last screen? The interval is read from the **test type that was actually performed** at the previous visit, not a new random draw. This is critical: re-randomizing the test type at the interval check would apply the wrong interval (e.g. assigning a 5-year HPV-alone interval to a patient who actually received cytology last time).
-
-### Never-Screeners
-A fraction of eligible patients — assigned at population creation — will never initiate screening regardless of how many eligible visits they have. This fraction differs between cervical and lung and is drawn at patient initialization as a permanent attribute.
-
-### Screening Initiation Model
-For patients who are not never-screeners and who are both eligible and due, the probability of initiating screening on a given visit follows a **hybrid per-visit escalation model**:
+## File Architecture
 
 ```
-P(screen at visit k) = min(base + (k − 1) × increment, cap)
+NYP/
+├── src/
+│   ├── config.py          # All parameters, probabilities, capacities, revenue rates
+│   ├── patient.py         # Patient dataclass — shared data contract between all modules
+│   ├── population.py      # NYC population sampler + Gompertz mortality + life event draws
+│   ├── screening.py       # Eligibility, test assignment, result draws, pre-LDCT funnel
+│   ├── followup.py        # Post-screening clinical pathways (cervical + lung)
+│   ├── metrics.py         # Counters, rates, revenue analysis, summary reporting
+│   ├── db.py              # SQLite persistence — patient + event log storage
+│   ├── runner.py          # SimulationRunner — day-by-day orchestration + queue engine
+│   └── scenarios.py       # Co-scheduling scenario definitions
+│
+├── notebooks/
+│   ├── simulation.ipynb          # Main notebook: 80-year run + all visualizations
+│   ├── metrics_outputs.ipynb     # Analysis, funnels, revenue, LTFU plots
+│   └── scenario_analysis.ipynb   # Co-scheduling comparison
+│
+├── archive/                      # Reference notebooks (not required to run)
+└── docs/
+    └── README.md                 # Project overview
+    └── SIMULATION_ARCHITECTURE.md # This file
 ```
 
-The base, increment, and cap are configured separately by cancer type and provider type (e.g. a GYN visit has a higher cervical screening base rate than a PCP visit). This models the empirical finding that screening is more likely to be initiated on a second or third eligible visit than on the first.
+**Design principle:** all logic lives in `.py` modules — importable, testable, version-controlled. Notebooks are thin wrappers that call those modules, run scenarios, and display output. No probability, capacity, or interval value is hard-coded anywhere except `config.py`.
 
 ---
 
-## 6. Test Assignment
+## 1. Population Generation
 
-### Cervical, Age 21–29
-Always cytology (Pap smear). USPSTF does not recommend HPV testing under age 30. No randomness — deterministic by age stratum.
+**Module:** `population.py` → `sample_patient()`
 
-### Cervical, Age 30–65
-A **weighted categorical draw** over three modalities: co-test (HPV + cytology), cytology alone, and HPV-alone. Weights reflect practice patterns at large academic medical centers and are configurable.
+Each patient is drawn from NYC Census and health survey distributions at entry. The function signature:
 
-### Lung
-Always LDCT. No randomness in test assignment, but a multi-step attrition process runs before the scan occurs (see Section 7).
+```python
+sample_patient(patient_id, day_created, destination, patient_type, age_range=None) → Patient
+```
+
+### Demographics
+
+| Field | Distribution | Parameters / Source |
+|---|---|---|
+| `age` | Empirical categorical from Census single-year-of-age (21–85). Age-85 bucket expanded to 85–100 via `Normal(89, 4)` clipped [85, 100]. If `age_range` is provided, rejection sampling constrains the draw. | `_AGE_VALUES`, `_AGE_PROBS` — Census SC-EST2024-AGESEX-CIV |
+| `race` | Two-stage: (1) Hispanic vs Non-Hispanic by `_P_HISPANIC = 2030943/10161956 ≈ 0.1997`, (2) 6-category Census race within ethnicity group | `_RACE_PROBS_NON_HISP`, `_RACE_PROBS_HISP` — Census SC-EST2024-SR11H |
+| `ethnicity` | "Hispanic" or "Non-Hispanic" from stage 1 | Census SC-EST2024-SR11H |
+| `insurance` | Bernoulli by age band from `_INSURANCE_PROBS` (7 bands: 21–25, 26–34, 35–44, 45–54, 55–64, 65–74, 75–99). Lookup: `_INSURANCE_BY_AGE[band]["Insured"] / total` | ACS B27001 |
+| `bmi` | Mixture model: Bernoulli(`_BMI_OBESITY_RATE = 0.276`) selects component; Obese: `Normal(34.8, 4.5)` clipped [30, 60]; Non-obese: `Normal(24.7, 3.2)` clipped [16, 29.9] | NYC Health obesity indicator |
+
+### Clinical Attributes
+
+| Field | Distribution | Parameters |
+|---|---|---|
+| `smoker` | Bernoulli(`_SMOKER_RATE = 0.109`) | NYS BRFSS 2023 |
+| Former smoker | If not smoker: Bernoulli(0.30) → `is_former = True` | ~30% of ever-smokers |
+| `pack_years` | Uniform(5, 40) if smoker or former; 0 otherwise | — |
+| `years_since_quit` | Uniform(0, 30) if former smoker; 0 otherwise | — |
+| `has_cervix` | `1 - hysterectomy_prob` where prob looked up by `(age_band, race/ethnicity_group)` from `_HYSTERECTOMY_BY_GROUP` | CDC/BRFSS 2018 |
+| `hpv_vaccinated` | Bernoulli by age band from `_HPV_VAX_RATE`: {21–29: 0.60, 30–39: 0.40, 40–49: 0.20, 50+: 0.05} | PLACEHOLDER |
+| `hpv_positive` | Bernoulli(`_HPV_POSITIVE_RATE = 0.25`) if not vaccinated and has cervix | PLACEHOLDER |
+| `prior_abnormal_pap` | Bernoulli(0.12) if has cervix | Fixed prevalence |
+| `prior_cin` | If prior_abnormal_pap: Bernoulli(0.30) → random choice of "CIN1" or "CIN2" | — |
+
+### Hysterectomy Prevalence Table
+
+Stratified by race/ethnicity group (`_HYSTERECTOMY_BY_GROUP`):
+
+| Group | 21–29 | 30–39 | 40–49 | 50–59 | 60–69 | 70–99 |
+|---|---|---|---|---|---|---|
+| Hispanic | 0.004 | 0.029 | 0.109 | 0.211 | 0.295 | 0.430 |
+| White | 0.005 | 0.054 | 0.166 | 0.268 | 0.341 | 0.456 |
+| Black | 0.003 | 0.038 | 0.185 | 0.337 | 0.441 | 0.521 |
+| Asian | 0.004 | 0.006 | 0.078 | 0.112 | 0.149 | 0.276 |
+| Other | 0.004 | 0.038 | 0.143 | 0.239 | 0.310 | 0.418 |
+
+Source: CDC/BRFSS 2018
+
+### Established Population
+
+`generate_established_population(n, start_pid, entry_day)` creates the initial `INITIAL_POOL_SIZE` (15,000) patient cohort. All patients are assigned a non-ER provider destination via `_sample_established_destination()` (redistributes ER weight across PCP/GYN/Specialist proportionally), flagged `is_established=True`.
 
 ---
 
-## 7. Pre-Scan Attrition (Lung Only)
+## 2. Life Event Scheduling
 
-Before any LDCT result is generated, the patient must clear three sequential gates. Each is an independent **Bernoulli draw** against a configured probability. If any gate fails, the patient is classified as lost-to-follow-up and no scan result is produced:
+**Module:** `population.py` → called from `runner._schedule_life_events()`
 
-1. **Provider places a referral order** — a substantial fraction of eligible patients are never referred, representing the biggest real-world attrition point for lung screening
-2. **Patient schedules the scan** — of those referred, some never book an appointment
-3. **Patient completes the scan** — of those scheduled, some do not show up
+At patient entry, four independent life events are pre-drawn and scheduled on fixed future days. No periodic sweeps — events fire on their pre-drawn day.
 
-All three probabilities are sourced from the literature and configurable in `config.py`.
+### Mortality — Gompertz Survival
+
+**Function:** `draw_death_day(p, entry_day)`
+
+Conditional Gompertz survival function:
+
+```
+S(t|x) = exp[ -(a/b) × e^(b×x) × (e^(b×t) - 1) ]
+```
+
+Inverse CDF to draw remaining years:
+
+```
+t = (1/b) × ln(1 - (b × ln(U)) / (a × e^(b×x)))    where U ~ Uniform(0,1)
+```
+
+If the argument to `ln()` is ≤ 0, the patient "survives" beyond the Gompertz horizon and is capped at `max_remaining_years`. The result is converted to a simulation day: `entry_day + int(remaining_years × 365)`.
+
+| Parameter | Config Name | Value | Source |
+|---|---|---|---|
+| Baseline hazard (a) | `GOMPERTZ_A` | 0.0000592 | Missov et al. 2015 (US female life tables) |
+| Aging coefficient (b) | `GOMPERTZ_B` | 0.0819 | Missov et al. 2015 |
+| Smoker multiplier on a | `SMOKER_MORTALITY_MULTIPLIER` | 2.5× | Jha et al. 2013 (NEJM) |
+| Former smoker multiplier on a | `FORMER_SMOKER_MORTALITY_MULTIPLIER` | 1.4× | Jha et al. 2013 |
+| Hard age cap | `MORTALITY_AGE_CAP` | 100 | — |
+
+The hazard doubles roughly every 8.5 years (= ln(2) / b ≈ 8.46).
+
+**Smoking adjustment:** For current smokers, `a` is multiplied by `SMOKER_MORTALITY_MULTIPLIER` (2.5). For former smokers (pack_years > 0 but smoker=False), `a` is multiplied by `FORMER_SMOKER_MORTALITY_MULTIPLIER` (1.4). This shifts the hazard curve left (earlier expected death).
+
+### Attrition — Exponential with Competing Risks
+
+**Function:** `draw_attrition_day(entry_day)` → `(day, subtype)`
+
+```
+years ~ Exponential(rate = ANNUAL_ATTRITION_RATE = 0.050)
+day = entry_day + int(years × 365)
+```
+
+Subtype drawn proportional to individual source rates via `random.choices()`:
+
+| Source | Config Path | Annual Rate |
+|---|---|---|
+| Relocation | `EXIT_SOURCES["relocation"]["annual_rate"]` | 0.025 |
+| Insurance loss | `EXIT_SOURCES["insurance_loss"]["annual_rate"]` | 0.015 |
+| Provider switch | `EXIT_SOURCES["provider_switch"]["annual_rate"]` | 0.010 |
+| **Total** | `ANNUAL_ATTRITION_RATE` | **0.050** |
+
+Attrition is suppressed in `_schedule_life_events()` if it would occur after the drawn death day (`att_day < death_day` check).
+
+### Smoking Cessation — Exponential
+
+**Function:** `draw_cessation_day(entry_day)` (smokers only)
+
+```
+years ~ Exponential(rate = ANNUAL_SMOKING_CESSATION_PROB = 0.05)
+day = entry_day + int(years × 365)
+```
+
+Suppressed if after death or attrition day (`cess_day < min(death_day, att_day)` check). When the event fires: `p.pack_years` is accumulated up to the quit day, `p.smoker` is set to False, `p.years_since_quit` is set to 0.
+
+### HPV Clearance — Exponential
+
+**Function:** `draw_hpv_clearance_day(entry_day)` (HPV+ patients only)
+
+```
+years ~ Exponential(rate = ANNUAL_HPV_CLEARANCE_PROB = 0.30)
+day = entry_day + int(years × 365)
+```
+
+Suppressed if after death or attrition day. When the event fires: `p.hpv_positive` is set to False.
 
 ---
 
-## 8. Cervical Result Draw
+## 3. The Patient Pool & Warmup
 
-After a cervical test, the result is drawn using **`random.choices`** (a weighted categorical draw) over a result probability table. The table used depends on the age stratum and test type:
+### Open-System Model
 
-- **Age 21–29 cytology:** draws from the young-stratum table with categories NORMAL, ASCUS, LSIL, ASC-H, HSIL
-- **Age 30–65 cytology or co-test:** draws from the middle-stratum cytology table with the same categories
-- **Age 30–65 HPV-alone:** draws from the HPV binary table with categories HPV_NEGATIVE, HPV_POSITIVE
+The simulation models an **open system** — patients enter continuously (organic arrivals) and exit continuously (mortality, attrition, ineligibility, LTFU). There are **no replacement entrants** tied to exits; pool size is **emergent** from the balance of arrivals vs. exits and gradually decreases over time due to survivorship dynamics (the initial cohort ages out faster than new arrivals replenish it).
 
-### Risk Adjustment
-Before the draw, the probability table is modified based on patient risk factors using a **multiplicative inflation + renormalization** procedure:
+### Pool Initialization
 
-1. If `hpv_positive = True`: all abnormal cytology categories are multiplied by a configured risk multiplier, then the entire table is renormalized to sum to 1
-2. If `prior_cin` is a high-grade history: the high-grade categories (ASC-H, HSIL) are additionally multiplied by a second configured multiplier, then renormalized again
+On day 0, `_initialize_population()`:
+1. Creates `INITIAL_POOL_SIZE` (15,000) established patients via `generate_established_population()`
+2. Spreads their first visits evenly across `WARMUP_DAYS` (1,825 days = 5 years): `target_day = int(i × warmup / len(pool))`
+3. Pre-books `ADVANCE_SCHEDULE_YEARS` (5) annual visits per patient, spaced `ANNUAL_VISIT_INTERVAL` (365) days apart
+4. Calls `_schedule_life_events()` for each patient (mortality, attrition, cessation, clearance)
 
-These adjustments are applied sequentially (HPV inflation first, then CIN inflation), so a patient with both risk factors receives compounded inflation on the high-grade categories. All multipliers are configurable in `config.py`.
+### Warmup Period
+
+`WARMUP_YEARS = 10` years (days 0–3,649). **All metrics, counters, wait times, and revenue calculations exclude the warmup period.** Data collection begins on day 3,650 (`_WARMUP_DAY = WARMUP_YEARS × DAYS_PER_YEAR`). This ensures:
+- Screening intervals (3-year cytology, 5-year HPV) have completed at least one full cycle
+- The system reaches near-steady-state behavior
+- Year-10+ metrics are comparable to each other
+
+### Pool Size Snapshots
+
+Every 30 days, `_process_life_events()` appends `(day, len(self._established_pool))` to `metrics["pool_size_snapshot"]` for longitudinal plotting.
 
 ---
 
-## 9. Lung-RADS Result Draw
+## 4. Daily Simulation Loop
 
-After the three pre-scan gates clear, a single **weighted categorical draw** from the Lung-RADS v2022 distribution produces one of six result categories:
+**Module:** `runner.py` → `SimulationRunner.run()` and `_tick(day)`
 
-| Category | Meaning |
+Every day (0 to `n_days - 1`), in this exact order:
+
+### Background (runs every day including weekends):
+1. **Life events** — `_process_life_events(day)`: fire all pre-scheduled mortality, attrition, smoking cessation, and HPV clearance events due today. Exited patients are collected in `_pool_removals`; every 30 days a single O(n) filter pass purges them from `_established_pool`.
+2. **Database flush** — `_flush_exited_patients(day)`: batch-write exited patients to SQLite every `DB_FLUSH_INTERVAL` (30) days.
+
+### Annual checkpoint (every 365 days):
+- Snapshot: pool size, cumulative screenings (by cancer, by test), cumulative LTFU (by queue stage), procedure queue depth, procedure overflow counts, due-for-screening counts, mortality, arrivals, exits by reason.
+
+### Clinical steps (weekdays only — skipped if `SKIP_WEEKENDS = True` and `day % 7 >= 5`):
+3. **Follow-ups** — process all clinical follow-ups due today (colposcopy, LEEP, biopsy, surveillance, repeat LDCT, result routing, screening retries) via `_run_followup()`. Follow-ups consume procedure slots **before** new arrivals.
+4. **New arrivals** — `_generate_arrivals(day)`: create new patients from `ARRIVAL_SOURCES` via Poisson draws.
+5. **Provider queues** — for each provider (non-ER first, then ER):
+   - Fetch scheduled outpatients + drop-ins via `process_day(provider, day)`
+   - Apply provider-to-screening delay: if `TURNAROUND_DAYS["provider_to_screening"]` > 0, schedule a `provider_screening` follow-up; otherwise screen immediately
+   - Screen each patient via `_screen_patient(p, day)`
+6. **Daily demand recording** (post-warmup only): append `(demand, supplied, overflow)` tuples to `daily_screening_demand`, `daily_secondary_demand`, `daily_treatment_demand`.
+
+---
+
+## 5. Arrivals & Provider Routing
+
+### Arrival Sources
+
+Arrivals come from `ARRIVAL_SOURCES`, each with its own daily Poisson rate, age range, and routing:
+
+| Source | Config Key | Daily Rate (Poisson λ) | Formula | Age Range | Routing |
+|---|---|---|---|---|---|
+| Aging in (turning 21) | `ARRIVAL_SOURCES["aging_in"]` | ~0.53 | `TOTAL_DAILY_ARRIVALS × _OUTPATIENT_SHARE × _OP_AGING_IN` = 1.6 × 0.80 × 0.4141 | 21–25 | Outpatient |
+| New movers | `ARRIVAL_SOURCES["new_mover"]` | ~0.43 | 1.6 × 0.80 × 0.3359 | 21–85 | Outpatient |
+| ER walk-ins | `ARRIVAL_SOURCES["er_walkin"]` | ~0.32 | 1.6 × 0.20 | 21–85 | ER (drop-in) |
+| Referrals | `ARRIVAL_SOURCES["referral"]` | ~0.32 | 1.6 × 0.80 × 0.2500 | 30–75 | Outpatient |
+
+**Total:** `TOTAL_DAILY_ARRIVALS = 1.6` patients/day. Split: 80% outpatient (`_OUTPATIENT_SHARE`), 20% ER (`_ER_SHARE`).
+
+**Poisson sampling:** `_poisson(lam)` uses a Normal approximation: `max(0, round(random.gauss(lam, sqrt(lam))))`.
+
+### Provider Destination
+
+Outpatient arrivals are routed to a provider by weighted draw from `DESTINATION_PROBS_OUTPATIENT`:
+
+| Provider | Weight | Config Key |
+|---|---|---|
+| PCP | 0.852 | `DESTINATION_PROBS_OUTPATIENT["pcp"]` |
+| Gynecologist | 0.148 | `DESTINATION_PROBS_OUTPATIENT["gynecologist"]` |
+
+Provider daily capacities (`PROVIDER_CAPACITY`): PCP 70, GYN 52, Specialist 35, ER 43 — but these are **not enforced as hard constraints**. Provider routing is proportional; the real bottleneck is at procedure slots.
+
+### Scheduling Lead Time
+
+Drawn uniformly from `OUTPATIENT_LEAD_DAYS`:
+
+| Provider | Lead Time (days) | Config Key |
+|---|---|---|
+| PCP | Uniform(1, 7) | `OUTPATIENT_LEAD_DAYS["pcp"]` |
+| Gynecologist | Uniform(7, 21) | `OUTPATIENT_LEAD_DAYS["gynecologist"]` |
+| Specialist | Uniform(14, 28) | `OUTPATIENT_LEAD_DAYS["specialist"]` |
+
+ER patients are added directly as drop-ins (`_queues.add_dropin(p, "er")`).
+
+### New-to-Established Conversion
+
+After a first visit, non-established patients join the cycling pool:
+1. `p.is_established = True`, `p.age_at_entry = p.age`, `p.simulation_entry_day = day`
+2. If ER patient: reassigned to a non-ER provider via `_sample_established_destination()`
+3. Life events scheduled via `_schedule_life_events(p, entry_day=day)`
+4. Pre-booked for `ADVANCE_SCHEDULE_YEARS` (5) annual visits starting 365 days from today
+5. Added to `_established_pool`
+
+---
+
+## 6. Eligibility & Screening Intervals
+
+### Eligibility Criteria
+
+| Cancer | Function | Criteria | Config Path |
+|---|---|---|---|
+| Cervical | `is_eligible_cervical(p)` | Age 21–65 AND `has_cervix=True` | `ELIGIBILITY["cervical"]`: `age_min=21, age_max=65, requires_cervix=True` |
+| Lung | `is_eligible_lung(p)` | Age 50–80 AND `pack_years ≥ 20` AND (`smoker=True` OR `years_since_quit ≤ 15`) | `ELIGIBILITY["lung"]`: `age_min=50, age_max=80, min_pack_years=20, max_years_since_quit=15` |
+
+### Lung Eligibility Base Probability
+
+Not all age/smoking-eligible patients are actually lung-eligible in the population: `LUNG_ELIGIBLE_BASE_PROB = 0.055` (5.5% of women aged 50–80 meet all USPSTF criteria). Source: CDC BRFSS; Fedewa et al. 2022.
+
+### Future Eligibility Routing
+
+`days_until_eligible(p, cancer)` computes how many days until a not-yet-eligible patient becomes eligible:
+- `> 0` — schedule a return visit at that future day
+- `0` — eligible right now
+- `-1` — **permanently ineligible** (no cervix, aged out, never smoked, quit window closed)
+
+Permanently ineligible established patients exit the pool with `exit_reason = "ineligible"`. Non-established patients exit silently.
+
+### Screening Intervals
+
+`is_due_for_screening(p, cancer, day)` checks if enough time has passed since the last screen. The interval depends on the **test modality used at the last visit** (stored in `p.last_cervical_screening_test`), not a fresh random draw — this makes the check deterministic:
+
+| Test Modality | Interval | Config Key |
+|---|---|---|
+| Cytology | 3 years (1,095 days) | `SCREENING_INTERVALS_DAYS["cytology"]` |
+| HPV-alone | 5 years (1,825 days) | `SCREENING_INTERVALS_DAYS["hpv_alone"]` |
+| Co-test | 3 years (1,095 days) | `SCREENING_INTERVALS_DAYS["co_test"]` |
+| LDCT | 1 year (365 days) | `SCREENING_INTERVALS_DAYS["ldct"]` |
+
+First screen ever (`last_day = -1`): always due. Falls back to cytology (shorter 3-year interval) if no test recorded.
+
+### Age Strata
+
+`get_cervical_age_stratum(age)`:
+- **young** (21–29): cytology only, every 3 years
+- **middle** (30–65): cytology every 3 yrs OR HPV-alone every 5 yrs OR co-test every 3 yrs
+- **older** (66+): no routine screening
+
+---
+
+## 7. Screening Initiation Model
+
+The simulation uses a **hybrid per-visit probability model** for whether screening is actually initiated during an eligible visit. This is distinct from eligibility — a patient may be eligible but the provider may not initiate screening.
+
+### Per-Visit Initiation Probability
+
+```
+P(screen at visit k) = min(P_base + (k-1) × P_increment, P_cap)
+```
+
+| Setting | Base Probability | Config Key | Source |
+|---|---|---|---|
+| Cervical at PCP | 0.55 | `SCREENING_INITIATION_BASE["cervical_pcp"]` | Kepka et al. 2014; Stange et al. 2003 |
+| Cervical at GYN | 0.85 | `SCREENING_INITIATION_BASE["cervical_gyn"]` | Sawaya et al. 2019 |
+| Lung at PCP | 0.12 | `SCREENING_INITIATION_BASE["lung_pcp"]` | Fedewa et al. 2022; Mazzone et al. 2021 |
+
+### Escalation per Visit
+
+| Cancer | Increment per visit | Config Key |
+|---|---|---|
+| Cervical | +0.05 | `SCREENING_INITIATION_INCREMENT["cervical"]` |
+| Lung | +0.03 | `SCREENING_INITIATION_INCREMENT["lung"]` |
+
+### Caps
+
+| Cancer | Maximum | Config Key |
+|---|---|---|
+| Cervical | 0.95 | `SCREENING_INITIATION_CAP["cervical"]` |
+| Lung | 0.50 | `SCREENING_INITIATION_CAP["lung"]` |
+
+### Never-Screener Fraction
+
+A fixed fraction will never screen regardless of visit count:
+
+| Cancer | Fraction | Config Key | Source |
+|---|---|---|---|
+| Cervical | 12.5% | `NEVER_SCREENER_FRAC["cervical"]` | AiP Parameters PDF |
+| Lung | 65% | `NEVER_SCREENER_FRAC["lung"]` | AiP Parameters PDF |
+
+### Test Completion Rates
+
+| Test | P(completed \| ordered) | Config Key | Source |
+|---|---|---|---|
+| Cervical (in-office) | 0.97108 | `CERVICAL_TEST_COMPLETION_PROB` | AiP Parameters PDF |
+| LDCT (after ordering) | 0.612 | `LUNG_TEST_COMPLETION_PROB` | ASCO abstracts/197367 |
+| LDCT absolute completion | 0.719 | `LUNG_TEST_COMPLETION_ABSOLUTE` | Same source |
+
+### Calibration Targets
+
+| Metric | Target | Source |
+|---|---|---|
+| Cervical up-to-date (3-yr interval) | 73–83% | NHIS/BRFSS |
+| Lung annual rate (academic center) | 15–25% | Fedewa et al. 2022 |
+| Visits before cervical initiation | ~1.5 (range 1–3) | AiP Parameters PDF |
+| Visits before lung initiation | ~4 (range 2–6) | Triplette et al. 2022 |
+
+---
+
+## 8. Test Assignment & Result Draws
+
+### Cervical Test Assignment
+
+`assign_screening_test(p, cancer)`:
+
+| Age Stratum | Modality | Selection Logic |
+|---|---|---|
+| 21–29 (young) | Cytology only | Deterministic (`return "cytology"`) |
+| 30–65 (middle) | Co-test / Cytology / HPV-alone | Weighted draw from `TEST_TYPE_PROBS_30_65`: co_test **0.55**, cytology **0.35**, hpv_alone **0.10** |
+| 66+ (older) | None | Returns `"ineligible"` |
+
+Lung: always LDCT.
+
+### Cervical Result Draws
+
+`draw_cervical_result(p, test)` — multinomial draw from age-stratified probability tables.
+
+**Co-test** uses `middle_cytology` probabilities (returns both HPV and cytology; cytology result drives routing).
+
+**Young (21–29), cytology** — `CERVICAL_RESULT_PROBS["young"]`:
+
+| Result | Probability |
 |---|---|
-| RADS 0 | Incomplete scan — must repeat |
-| RADS 1 | No nodules — clearly negative |
-| RADS 2 | Nodule with benign appearance |
-| RADS 3 | Probably benign — short-interval follow-up |
-| RADS 4A | Suspicious — biopsy indicated |
-| RADS 4B / 4X | Very suspicious — urgent biopsy |
+| NORMAL | 0.890 |
+| ASCUS | 0.040 |
+| LSIL | 0.045 |
+| ASC-H | 0.015 |
+| HSIL | 0.010 |
 
-Probabilities are sourced from published LDCT screening studies and are configurable in `config.py`.
+**Middle (30–65), cytology** — `CERVICAL_RESULT_PROBS["middle_cytology"]`:
+
+| Result | Probability |
+|---|---|
+| NORMAL | 0.910 |
+| ASCUS | 0.035 |
+| LSIL | 0.030 |
+| ASC-H | 0.015 |
+| HSIL | 0.010 |
+
+**Middle (30–65), HPV-alone** — `CERVICAL_RESULT_PROBS["middle_hpv"]`:
+
+| Result | Probability |
+|---|---|
+| HPV_NEGATIVE | 0.880 |
+| HPV_POSITIVE | 0.120 |
+
+### Risk Adjustments
+
+Applied via `_adjust_probs()`: multiply selected result categories by the factor, then renormalize the entire distribution to sum to 1:
+
+| Condition | Affected Results | Multiplier | Config Key |
+|---|---|---|---|
+| HPV+ patient on cytology | ASCUS, LSIL, ASC-H, HSIL | 1.5× | `RISK_MULT_HPV_POSITIVE_CYTOLOGY` |
+| HPV+ patient on HPV test | HPV_POSITIVE | 2.0× | `RISK_MULT_HPV_POSITIVE_HPV_TEST` |
+| Prior CIN2/3 on cytology | ASC-H, HSIL | 1.8× | `RISK_MULT_PRIOR_CIN_HIGHGRADE` |
+
+Multiple adjustments stack: an HPV+ patient with prior CIN3 gets both the 1.5× and 1.8× adjustments (applied sequentially, each re-normalizing).
+
+### Lung Result Draws
+
+`draw_lung_rads_result()` — multinomial from `LUNG_RADS_PROBS`:
+
+| Lung-RADS | Probability | Interpretation | Source |
+|---|---|---|---|
+| RADS_0 | 0.010 | Incomplete — repeat in 1–3 months | ASSUMPTION |
+| RADS_1 | 0.291 | Negative — annual follow-up | PMC10331628 |
+| RADS_2 | 0.529 | Benign — annual follow-up | PMC10331628 |
+| RADS_3 | 0.102 | Probably benign — 6-month repeat | PMC10331628 + Pinsky et al. 2015 |
+| RADS_4A | 0.046 | Suspicious — biopsy pathway | PMC10331628 + Pinsky et al. 2015 |
+| RADS_4B_4X | 0.022 | Very suspicious — biopsy pathway | PMC10331628 + Pinsky et al. 2015 |
+
+No patient-level risk adjustments for lung results.
+
+### Lung-RADS Malignancy Rates (Among Patients in Each Category)
+
+| Category | Rate | Config Key | Source |
+|---|---|---|---|
+| RADS_3 | 0.03 | `LUNG_RADS_MALIGNANCY_RATE["RADS_3"]` | Pinsky et al. 2015 |
+| RADS_4A | 0.08 | `LUNG_RADS_MALIGNANCY_RATE["RADS_4A"]` | ACR Lung-RADS v1.1 |
+| RADS_4B_4X | 0.35 | `LUNG_RADS_MALIGNANCY_RATE["RADS_4B_4X"]` | Pinsky et al. 2015 |
+
+### Lung-RADS Follow-Up Adherence
+
+| Category | Adherence | Config Key | Source |
+|---|---|---|---|
+| RADS_3 | 67.1% | `LUNG_RADS_ADHERENCE["RADS_3"]` | ASCO JCO 2021 |
+| RADS_4A | 66.4% | `LUNG_RADS_ADHERENCE["RADS_4A"]` | ASCO JCO 2021 |
+| RADS_4B_4X | 78.2% | `LUNG_RADS_ADHERENCE["RADS_4B_4X"]` | ASCO JCO 2021 |
 
 ---
 
-## 10. Cervical Follow-Up Routing
+## 9. Procedure Slot Capacity & Queue Overflow
 
-After a result is drawn, the patient is routed based on result category:
+### Daily Procedure Slots
 
-- **NORMAL or HPV_NEGATIVE** → return to routine screening interval; no follow-up needed
-- **Any abnormal cytology (ASCUS, LSIL, ASC-H, HSIL)** → LTFU check #1, then colposcopy referral if not lost
-- **HPV_POSITIVE** → LTFU check #1, then ASCCP triage: a **Bernoulli draw** determines whether the patient goes to immediate colposcopy (higher-risk management) or a 1-year repeat cytology (lower-risk management)
+`PatientQueues.consume_slot(procedure, day)` enforces daily capacity limits from `CAPACITIES`. Slots are initialized lazily from config on first access per day.
 
-### LTFU Check #1 — Post-Abnormal Result
-A **Bernoulli draw** against the configured `post_abnormal_to_colposcopy` probability determines whether the patient fails to follow up after receiving an abnormal result. If lost, the patient exits the clinical pathway as `lost_to_followup` and returns to the annual cycling schedule.
+| Stage | Procedure | Daily Slots | Config Key |
+|---|---|---|---|
+| Primary | Cytology | 8 | `CAPACITIES["cytology"]` |
+| Primary | HPV-alone | 8 | `CAPACITIES["hpv_alone"]` |
+| Primary | Co-test | 8 | `CAPACITIES["co_test"]` |
+| Primary | LDCT | 4 | `CAPACITIES["ldct"]` |
+| Secondary | Colposcopy | 8 | `CAPACITIES["colposcopy"]` |
+| Secondary | Lung biopsy | 2 | `CAPACITIES["lung_biopsy"]` |
+| Treatment | LEEP | 5 | `CAPACITIES["leep"]` |
+| Treatment | Cone biopsy | 3 | `CAPACITIES["cone_biopsy"]` |
 
-### Scheduling Delay to Colposcopy
-The colposcopy appointment is placed a fixed number of days in the future, read from `config.FOLLOWUP_DELAY_DAYS`. This is a fixed offset, not a distribution, because empirical scheduling data from NYP has not yet been integrated. Once NYP scheduling data is available, this should be replaced with an empirical wait-time distribution.
+### Priority Order
+
+Primary screenings: outpatients (PCP/GYN/Specialist) are processed **before** ER drop-ins in the daily loop, so scheduled patients get priority on slots.
+
+Follow-ups (colposcopy, biopsy, LEEP) are processed **before** new arrivals on each day — existing patients in the pipeline get priority.
+
+### Overflow Handling
+
+When `consume_slot()` returns False (capacity full):
+1. Patient is **rescheduled to the next workday** via `schedule_followup()` with `step="screening_retry"` (for primary) or the same step name (for secondary/treatment)
+2. Tracked as `procedure_overflow` in `PatientQueues.procedure_overflow`
+3. On each retry day, the patient faces a daily queue LTFU hazard (see [LTFU section](#13-loss-to-follow-up-ltfu))
+4. `referral_day` is preserved across retries so wait time = total days from original referral
+5. Wait time = `day_performed - referral_day - scheduled_delay` (pure queue delay, excluding the configured scheduling window)
 
 ---
 
-## 11. Colposcopy — CIN Grade Draw
+## 10. Cervical Follow-Up Pathway
 
-On the day of the colposcopy appointment, a **conditional weighted categorical draw** produces a CIN grade. The probability table used is conditioned on the result that triggered the referral (e.g. a colposcopy triggered by HSIL uses a different distribution than one triggered by ASCUS). If the triggering result is not found in the config table, a default aggregate distribution is used as a fallback.
+### Result Routing
 
-Possible outcomes: NORMAL (no dysplasia found), CIN1 (low-grade), CIN2 (high-grade), CIN3 (high-grade), INSUFFICIENT (biopsy sample inadequate — patient loops back for a repeat colposcopy).
+`_route_cervical_followup(p, result, day)` dispatches based on screening result:
+
+| Result | Action | Scheduling Delay | Config Key |
+|---|---|---|---|
+| NORMAL, HPV_NEGATIVE | Return to routine screening interval | — | — |
+| HPV_POSITIVE | **ASCCP triage**: Bernoulli(`HPV_POSITIVE_COLPOSCOPY_PROB = 0.60`) → colposcopy; else → 1-year repeat cytology | Colposcopy: 50 days; Repeat: 365 days | `HPV_POSITIVE_COLPOSCOPY_PROB`, `FOLLOWUP_DELAY_DAYS["colposcopy"]` |
+| ASCUS, LSIL | Colposcopy referral | 50 days | `FOLLOWUP_DELAY_DAYS["colposcopy"]` |
+| ASC-H, HSIL | Expedited colposcopy | 32 days | `FOLLOWUP_DELAY_DAYS["colposcopy_hsil"]` |
+
+Note: Result routing happens **after lab turnaround delay** (e.g., `TURNAROUND_DAYS["cytology"] = 7` days for cytology, `TURNAROUND_DAYS["co_test"] = 10` for co-test, `TURNAROUND_DAYS["hpv_alone"] = 5` for HPV-alone).
+
+### One-Year Repeat Cytology (HPV+ Low-Risk Path)
+
+When HPV+ is triaged to 1-year repeat:
+1. Scheduled 365 days out
+2. On due day: consume a cytology slot, force cytology (not HPV-alone)
+3. Draw new cervical result
+4. Re-route the new result: normal → done; abnormal → colposcopy
+
+### Colposcopy
+
+`run_colposcopy(p, day, metrics)` draws CIN grade conditional on triggering result from `COLPOSCOPY_RESULT_PROBS`:
+
+| Trigger (`from_` key) | NORMAL | CIN1 | CIN2 | CIN3 |
+|---|---|---|---|---|
+| ASCUS | 0.60 | 0.25 | 0.10 | 0.05 |
+| LSIL | 0.40 | 0.35 | 0.15 | 0.10 |
+| ASC-H | 0.25 | 0.20 | 0.30 | 0.25 |
+| HSIL | 0.10 | 0.10 | 0.30 | 0.50 |
+| HPV_POSITIVE | 0.50 | 0.30 | 0.15 | 0.05 |
+
+**Default fallback** (`COLPOSCOPY_RESULT_PROBS_DEFAULT`): NORMAL 0.35, CIN1 0.28, CIN2 0.15, CIN3 0.15, INSUFFICIENT 0.07. INSUFFICIENT triggers a repeat colposcopy.
+
+After colposcopy, a pathology result delay of `TURNAROUND_DAYS["colposcopy_result"] = 10` days elapses before treatment routing.
+
+### Treatment Assignment
+
+From `TREATMENT_ASSIGNMENT`:
+
+| CIN Grade | Treatment | Next Step |
+|---|---|---|
+| NORMAL | Surveillance | CIN1 surveillance pathway |
+| CIN1 | Surveillance | CIN1 surveillance pathway |
+| CIN2 | LEEP | Schedule LEEP procedure |
+| CIN3 | LEEP | Schedule LEEP procedure |
+
+CIN2/3 treatment rate: `CIN23_TREATMENT_RATE = 0.50` — 50% treated, 50% exit.
+
+LEEP scheduling delay: `FOLLOWUP_DELAY_DAYS["leep"] = 14` days.
+Cone biopsy scheduling delay: `FOLLOWUP_DELAY_DAYS["cone_biopsy"] = 21` days.
+
+After LEEP/cone biopsy: post-treatment surveillance is scheduled per ASCCP guidelines.
 
 ---
 
-## 12. Treatment Assignment
+## 11. Lung Follow-Up Pathway
 
-### CIN Grade → Procedure
-Treatment assignment is deterministic by CIN grade:
-- NORMAL colposcopy or CIN1 → surveillance (watchful waiting, 1-year follow-up cytology)
-- CIN2 or CIN3 → LEEP (excisional procedure)
+### Pre-LDCT Funnel (3 Sequential LTFU Nodes)
 
-### LTFU Check #2 — Post-Colposcopy
-Before treatment is assigned, a **Bernoulli draw** against the configured `post_colposcopy_to_treatment` probability determines whether the patient drops out after colposcopy before completing treatment. If lost, the patient exits as `untreated` and returns to the annual cycling schedule.
+`run_lung_pre_ldct(p, day, metrics)` — each step is a Bernoulli draw; failure = LTFU:
+
+| Step | Success Probability | Config Key | Failure = LTFU |
+|---|---|---|---|
+| 1. Referral placed | 0.72 | `LUNG_PATHWAY_PROBS["referral_placed"]` | 28% drop |
+| 2. LDCT scheduled | 0.80 | `LUNG_PATHWAY_PROBS["scheduled_after_referral"]` | 20% drop |
+| 3. LDCT completed | 0.612 | `LUNG_TEST_COMPLETION_PROB` | 38.8% drop |
+
+Cumulative completion: 0.72 × 0.80 × 0.612 ≈ 35.3% of eligible patients actually complete an LDCT.
+
+### Post-LDCT Result Routing
+
+`run_lung_followup(p, day, metrics)` and `_lung_result_routing(p, day)`:
+
+**Step 1 — Result Communication:**
+| Step | Success Probability | Config Key |
+|---|---|---|
+| Result communicated | 0.90 | `LUNG_PATHWAY_PROBS["result_communicated"]` |
+
+**Step 2 — Follow-up adherence** (Bernoulli per category):
+
+| RADS Category | Adherence | Config Key | If non-adherent |
+|---|---|---|---|
+| RADS_3 | 67.1% | `LUNG_RADS_ADHERENCE["RADS_3"]` | LTFU |
+| RADS_4A | 66.4% | `LUNG_RADS_ADHERENCE["RADS_4A"]` | LTFU |
+| RADS_4B_4X | 78.2% | `LUNG_RADS_ADHERENCE["RADS_4B_4X"]` | LTFU |
+
+**Step 3 — Disposition:**
+
+| RADS Category | Action | Repeat Interval | Config Key |
+|---|---|---|---|
+| RADS_0 | Repeat LDCT | 60 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_0"]` |
+| RADS_1, RADS_2 | Repeat LDCT | 365 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_1"]` |
+| RADS_3 | Repeat LDCT | 180 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_3"]` |
+| RADS_4A | Biopsy pathway | — | — |
+| RADS_4B_4X | Biopsy pathway | — | — |
+
+### Biopsy Pathway (RADS 4A/4B/4X)
+
+Sequential LTFU nodes — each step is a Bernoulli draw:
+
+| Step | Success Probability | Config Key |
+|---|---|---|
+| Biopsy referral made | 0.80 | `LUNG_PATHWAY_PROBS["biopsy_referral_made"]` |
+| Biopsy scheduled | 0.78 | `LUNG_PATHWAY_PROBS["biopsy_scheduled"]` |
+| Biopsy completed | 0.88 | `LUNG_PATHWAY_PROBS["biopsy_completed"]` |
+| Malignancy confirmed | 0.25 | `LUNG_PATHWAY_PROBS["malignancy_confirmed"]` |
+| Treatment given | 0.92 | `LUNG_PATHWAY_PROBS["treatment_given"]` |
+
+If malignancy not confirmed (75%): `p.lung_biopsy_result = "benign"`, return to annual surveillance.
+If malignancy confirmed but treatment not given (8%): `p.exit_system(day, "lost_to_followup")`.
+
+Scheduling delays: `FOLLOWUP_DELAY_DAYS["lung_biopsy"] = 21` days, `FOLLOWUP_DELAY_DAYS["lung_treatment"] = 21` days.
+
+### Repeat LDCT Processing
+
+`_lung_repeat_ldct_step(p, day, referral_day, scheduled_delay)`:
+1. Consume an LDCT slot (overflow → retry next day)
+2. Draw new Lung-RADS result
+3. Re-route: may escalate to biopsy (RADS 4A/4B) or schedule another repeat
+
+---
+
+## 12. Surveillance & Re-Entry
 
 ### CIN1 Surveillance
-Patients in CIN1 surveillance return at each annual follow-up visit for a **three-outcome categorical draw**:
 
-| Outcome | Meaning |
+**Function:** `_cin1_surveillance_step(p, day, referral_day, clean_count)` — annual cytology with three possible outcomes per visit:
+
+| Outcome | Probability | Config Key | Action |
+|---|---|---|---|
+| Resolution | 0.40 | `CIN1_RESOLUTION_PROB_PER_VISIT` | Increment `clean_count`; if ≥ `CIN1_MAX_CLEAN_VISITS_BEFORE_ROUTINE` (2), return to routine |
+| Escalation to CIN2/3 | 0.07 | `CIN1_ESCALATION_PROB_PER_VISIT` | Route to colposcopy/treatment (random CIN2 or CIN3) |
+| Persistence | 0.53 | `CIN1_PERSISTENCE_PROB_PER_VISIT` (= 1 - 0.40 - 0.07) | Reschedule in `CIN1_SURVEILLANCE_INTERVAL_DAYS` (365) days, reset `clean_count = 0` |
+
+Sources: Resolution — Castle et al. 2009, Ostor 1993; Escalation — ALTS trial, Cox et al. 2003; Schedule — ASCCP 2019.
+
+### Cervical Post-Treatment Surveillance (ASCCP)
+
+**Function:** `_post_treatment_surveillance_step(p, day, treatment_day, visit_number)`
+
+Schedule from `POST_TREATMENT_SURVEILLANCE_CERVICAL`:
+
+| Years Since Treatment | Interval | Config Entry |
+|---|---|---|
+| 1–2 | Every 6 months (4 visits) | `(2, 6)` |
+| 3–5 | Every 12 months (3 visits) | `(5, 12)` |
+| 6–25 | Every 36 months (~7 visits) | `(25, 36)` |
+
+Active surveillance duration: `POST_TREATMENT_ACTIVE_YEARS_CERVICAL = 10` years, then return to routine provider visits.
+
+At each visit: consume a cytology slot, draw a recurrence result (recurrence probability = 0.07, PLACEHOLDER). If recurrence: draw ASCUS or HSIL, refer to colposcopy. If normal: schedule next surveillance visit.
+
+Source: Katki et al. 2013, JNCI.
+
+### Lung Post-Treatment Surveillance (NCCN)
+
+**Function:** `_lung_post_treatment_surveillance_step(p, day, treatment_day, visit_number)`
+
+Schedule from `POST_TREATMENT_SURVEILLANCE_LUNG`:
+
+| Years Since Treatment | Interval | Config Entry |
+|---|---|---|
+| 1–2 | Every 6 months | `(2, 6)` |
+| 3–5 | Every 12 months | `(5, 12)` |
+| 6+ | Every 12 months (if fit) | `(999, 12)` |
+
+Active surveillance duration: `POST_TREATMENT_ACTIVE_YEARS_LUNG = 5` years.
+
+At each visit: consume an LDCT slot, draw a new Lung-RADS result. If RADS 4A/4B_4X: escalate to biopsy pathway. Otherwise: schedule next surveillance per schedule.
+
+Source: NCCN NSCLC Survivorship; ASCO (Schneider et al. 2020).
+
+### Re-Entry After Normal/Negative Results
+
+After screening completes (including normal results), `_reschedule_established(p, day)` extends the advance-schedule window by one year at the far end. The patient's `next_visit_day` is set to `day + ANNUAL_VISIT_INTERVAL`. Established patients continuously cycle through annual visits with periodic screening based on their interval.
+
+### Re-Entry After Pathway LTFU
+
+Established patients who hit LTFU from a clinical pathway (e.g., lung referral not placed) are **re-activated**: `p.active=True`, `p.exit_reason=None`, `p.exit_day=None`, then `_reschedule_established(p, day)` is called. LTFU from a cancer pathway does **not** mean leaving the system — it means missing that specific follow-up step. The patient continues their annual provider visits.
+
+Non-established patients who hit LTFU exit permanently.
+
+---
+
+## 13. Loss-to-Follow-Up (LTFU)
+
+### Queue LTFU (Daily Geometric Hazard)
+
+**Function:** `_check_queue_ltfu(p, day, referral_day, queue_type, procedure)` — called each day a patient is retrying for a procedure slot.
+
+When a patient is waiting in a procedure queue (overflow, retrying daily), each day they face a small probability of abandoning:
+
+| Queue Type | Daily Hazard | Config Key | Median Survival in Queue |
+|---|---|---|---|
+| Primary screening | 0.002 | `LTFU_PROBS["queue_primary_daily"]` | ~346 days |
+| Secondary (colposcopy/biopsy) | 0.005 | `LTFU_PROBS["queue_secondary_daily"]` | ~139 days |
+| Treatment (LEEP/cone) | 0.003 | `LTFU_PROBS["queue_treatment_daily"]` | ~231 days |
+
+Queue LTFU is the **sole dropout mechanism** from procedure queues. Median survival = ln(2) / daily_prob.
+
+When queue LTFU fires:
+1. Wait time recorded in `metrics["wait_times_abandoned"][procedure]`
+2. Patient exits: `p.exit_system(day, f"ltfu_queue_{queue_type}")`
+3. `record_exit()` called with `reason="lost_to_followup"`
+4. `metrics["ltfu_queue_{queue_type}"]` incremented
+5. Established patients added to flush buffer + pool removals
+
+### Clinical Pathway LTFU (Lung)
+
+The lung pathway has explicit LTFU nodes at each step (see [Lung Follow-Up Pathway](#11-lung-follow-up-pathway)). Each node is a Bernoulli draw — failure = `p.exit_system(day, "lost_to_followup")` for non-established patients; re-activation for established patients.
+
+### Unscreened LTFU
+
+`handle_unscreened(p, day)`: eligible patients not offered screening:
+- `LTFU_PROBS["unscreened_will_reschedule"] = 0.40` probability of re-engaging → "reschedule"
+- 60% exit the system → `p.exit_system(day, "lost_to_followup")`
+
+---
+
+## 14. Mortality, Attrition & Life Events
+
+All life events are **pre-drawn at patient entry** and fire on their scheduled day. No periodic sweeps.
+
+### Daily Processing
+
+`_process_life_events(day)` fires all events due today via `_queues.get_due_life_events(day)`:
+
+| Event | Guard | Action |
+|---|---|---|
+| `mortality` | `p.active` | `p.exit_system(day, "mortality")`, `record_exit(metrics, "mortality")`, increment `mortality_count`, add to flush buffer + pool removals |
+| `attrition` | `p.active` | `p.exit_system(day, f"attrition:{subtype}")`, `record_exit(metrics, "attrition")`, increment `exits_by_source[subtype]`, add to flush buffer + pool removals |
+| `smoking_cessation` | `p.smoker` | `p.pack_years += years_smoked_since_entry`, `p.smoker = False`, `p.years_since_quit = 0.0` |
+| `hpv_clearance` | `p.hpv_positive` | `p.hpv_positive = False` |
+
+Age is updated arithmetically before processing: `p.age = p.age_at_entry + (day - p.simulation_entry_day) // 365`.
+
+### Attribute Evolution
+
+| Attribute | How It Changes | Eligibility Impact |
+|---|---|---|
+| `age` | Arithmetic: `age_at_entry + (day - simulation_entry_day) // 365` | Cervical ends at 65; lung starts at 50, ends at 80 |
+| `pack_years` | +accumulated years while `smoker=True` (added at cessation event) | Crosses 20 pk-yr lung threshold mid-simulation |
+| `smoker` | Pre-drawn cessation day from Exponential(0.05) | Former smokers enter 15-yr quit window for lung eligibility |
+| `years_since_quit` | Computed dynamically from cessation day | Closes lung eligibility after 15 years |
+| `hpv_positive` | Pre-drawn clearance day from Exponential(0.30) | Lowers abnormal cervical result risk (removes multiplier) |
+
+### Batch Pool Purge
+
+Exited patients are **not** removed individually (O(n) per removal). Instead:
+- `_pool_removals` collects `id(p)` of exited patients
+- Every 30 days: `self._established_pool = [p for p in self._established_pool if id(p) not in self._pool_removals]`
+- Then `_pool_removals.clear()`
+
+---
+
+## 15. Metrics & Revenue
+
+### Metrics Initialization
+
+**Module:** `metrics.py` → `initialize_metrics()` returns a fresh dict for each run.
+
+All metrics are gated by warmup: events before day `_WARMUP_DAY = WARMUP_YEARS × DAYS_PER_YEAR` are not recorded.
+
+### Recording Functions
+
+| Function | Called When | What It Records |
+|---|---|---|
+| `record_screening(metrics, p, cancer, result)` | After each successful screening | `n_screened[cancer]`, `n_screened_established[cancer]`, `n_screened_by_test[test]`, `cervical_results[result]`, `cervical_results_by_test[test][result]`, `cervical_by_age_stratum[stratum][result]` |
+| `record_exit(metrics, reason, patient, day)` | When a patient exits the system | `n_exited`, `exits_by_reason[reason]`, `n_treated` (if treated), `n_ltfu` (if LTFU), `days_in_system`, `days_in_system_screened` (if `visit_count ≥ 2`) |
+
+### Key Metrics Tracked
+
+| Category | Metrics |
 |---|---|
-| Resolution | Lesion reverts to normal; patient returns to routine screening |
-| Escalation | Lesion progresses to CIN2/3; patient enters the treatment pathway |
-| Persistence | Lesion remains CIN1; patient continues surveillance for another year |
+| Volume | `n_patients`, `n_eligible_any`, `n_eligible[cancer]`, `n_unscreened`, `n_reschedule` |
+| Entry/Exit | `entries_by_destination[provider]`, `entries_by_type[type]`, `exits_by_reason[reason]`, `arrivals_by_source[source]`, `exits_by_source[subtype]` |
+| Retention | `days_in_system` (all patients), `days_in_system_screened` (visit_count ≥ 2 only) |
+| Screenings | `n_screened[cancer]`, `n_screened_established[cancer]`, `n_screened_by_test[test]` |
+| Cervical Results | `cervical_results[result]`, `cervical_results_by_test[test][result]`, `cervical_by_age_stratum[stratum][result]` |
+| Follow-Up | `n_colposcopy`, `colposcopy_results[grade]`, `n_treatment[type]` |
+| Lung Funnel | `lung_eligible` → `lung_referral_placed` → `lung_ldct_scheduled` → `lung_ldct_completed` → `lung_result_communicated` → `lung_biopsy_referral` → `lung_biopsy_scheduled` → `lung_biopsy_completed` → `lung_malignancy_confirmed` → `lung_treatment_given` |
+| Outcomes | `n_treated`, `n_ltfu`, `n_exited` |
+| LTFU Breakdown | `ltfu_unscreened`, `ltfu_queue_primary`, `ltfu_queue_secondary`, `ltfu_queue_treatment` |
+| Wait Times | `wait_times[procedure]` (list of days completed), `wait_times_abandoned[procedure]` (list of days before abandoning) |
+| Demand/Capacity | `daily_screening_demand`, `daily_secondary_demand`, `daily_treatment_demand` — each: list of `(demand, supplied, overflow)` tuples per workday |
+| Population | `mortality_count`, `pool_size_snapshot` (sampled every 30 days), `year_checkpoints` |
 
-Probabilities are sourced from ASCCP guidelines and long-term CIN1 cohort studies and are configurable in `config.py`.
+### Revenue Analysis
+
+`compute_revenue(metrics)`:
+
+**Realized revenue** = procedures completed × CPT rate from `PROCEDURE_REVENUE`:
+
+| Procedure | Rate (USD) | Config Key |
+|---|---|---|
+| Cytology | $156 | `PROCEDURE_REVENUE["cytology"]` |
+| HPV-alone | $198 | `PROCEDURE_REVENUE["hpv_alone"]` |
+| Colposcopy | $312 | `PROCEDURE_REVENUE["colposcopy"]` |
+| LEEP | $847 | `PROCEDURE_REVENUE["leep"]` |
+| Cone biopsy | $1,240 | `PROCEDURE_REVENUE["cone_biopsy"]` |
+| LDCT | $285 | `PROCEDURE_REVENUE["ldct"]` |
+| Lung biopsy | $2,100 | `PROCEDURE_REVENUE["lung_biopsy"]` |
+| Lung treatment | $18,500 | `PROCEDURE_REVENUE["lung_treatment"]` |
+| Surveillance | $0 | `PROCEDURE_REVENUE["surveillance"]` |
+
+**Foregone revenue** = patients lost at LTFU nodes × missed procedure cost:
+
+| LTFU Source | Missed Procedure | Calculation |
+|---|---|---|
+| Unscreened (declined) | Avg cervical screening | `ltfu_unscreened × avg(cytology_rate, hpv_alone_rate)` |
+| Queue LTFU — primary | Avg cervical screening | `ltfu_queue_primary × avg(cytology_rate, hpv_alone_rate)` |
+| Queue LTFU — secondary | Colposcopy | `ltfu_queue_secondary × colposcopy_rate` |
+| Lung screening LTFU | LDCT | `max(lung_eligible - lung_ldct_completed, 0) × ldct_rate` |
+| Lung biopsy LTFU | Lung biopsy | `max(lung_biopsy_referral - lung_biopsy_completed, 0) × lung_biopsy_rate` |
+
+### Computed Rates
+
+`compute_rates(metrics)` derives:
+- `screening_rate_cervical_pct`: cervical screened / total patients
+- `screening_rate_lung_pct`: lung screened / lung eligible
+- `abnormal_rate_cervical_pct`: abnormal cervical results / cervical screened
+- `colposcopy_completion_pct`: colposcopies / abnormal results
+- `treatment_completion_pct`: cervical excisional treatments (LEEP + cone) / colposcopies
+- `ltfu_rate_pct`: total LTFU / total patients
 
 ---
 
-## 13. Lung Follow-Up
+## 16. Database Persistence
 
-### RADS 0 / 1 / 2 / 3 — Repeat LDCT Pathway
+**Module:** `db.py` → `SimulationDB`
 
-1. **Result communication check** — **Bernoulli draw**: was the result successfully communicated to the patient? If not → LTFU.
-2. **Adherence check (RADS 3 only)** — **Bernoulli draw** using the RADS-3-specific adherence rate from the literature. RADS 1/2 have no separate adherence check (negative results have higher natural adherence).
-3. Schedule repeat LDCT at the appropriate interval per Lung-RADS guidelines (RADS 0: 1–3 months, RADS 3: 6 months, RADS 1/2: 12 months).
+SQLite database (`DB_PATH = "nyp_simulation.db"`) with WAL mode and `PRAGMA synchronous=NORMAL` for performance.
 
-### RADS 4A / 4B / 4X — Biopsy Pathway
+### Schema
 
-Five sequential **Bernoulli draws**, each representing a real-world attrition node:
+**`patients` table** — one row per exited patient:
+`patient_id (PK), age_at_entry, age_at_exit, race, insurance, is_established, simulation_entry_day, exit_day, exit_reason, visit_count, has_cervix, smoker, pack_years, cervical_result, lung_result, colposcopy_result, treatment_type, last_cervical_screen_day, last_lung_screen_day`
 
-1. Result successfully communicated to patient
-2. Patient adheres to the biopsy recommendation (adherence rate is RADS-category-specific, sourced from published literature)
-3. Biopsy referral placed by provider
-4. Patient schedules the biopsy
-5. Patient completes the biopsy
+**`events` table** — full event log:
+`id (PK, auto), patient_id (FK), day, event` with `UNIQUE(patient_id, day, event)` constraint.
 
-Then two conditional outcomes:
+### Indexes
 
-6. **Malignancy confirmed by pathology** — **Bernoulli draw**; if benign → return to annual surveillance
-7. **Treatment given** — **Bernoulli draw**; if not → patient exits as `untreated`
+- `idx_patients_exit_reason`, `idx_patients_is_established`, `idx_patients_race`
+- `idx_events_patient_id`, `idx_events_day`
+- `idx_patients_last_cervical_screen`, `idx_patients_last_lung_screen`
 
-Each node failure exits the patient as `lost_to_followup`. All node probabilities are configurable in `config.py`.
+### Write Strategy
+
+- Batch flush every `DB_FLUSH_INTERVAL = 30` days via `_flush_exited_patients()`
+- `flush_patients()` — `executemany` with `INSERT OR IGNORE` (idempotent)
+- `flush_events()` — same pattern for the event log
+- Final forced flush at simulation end
+
+### Query Methods
+
+- `get_patient_history(patient_id)` → chronological event log
+- `get_patient(patient_id)` → demographic/outcome row
+- `count_by_exit_reason()` → `{reason: count}`
+- `count_established_vs_new()` → `{established: N, new_entrant: M}`
+- `summary_stats()` → total, by_exit_reason, mean_visit_count, mean_age_at_exit
+- `query(sql, params)` → arbitrary read-only SQL
 
 ---
 
-## 14. Patient Lifecycle and Re-Scheduling
+## 17. Visualizations
 
-After every provider visit — regardless of whether screening occurred, or whether a result was abnormal — established patients are immediately rescheduled for their next annual visit approximately one year later. The scheduler finds the next available outpatient slot on or after that target day.
+The notebook (`simulation.ipynb`) produces 30+ visualizations organized by category:
 
-### All Ways to Leave the Cycling Pool
-
-| Exit Reason | Mechanism |
+| Category | Visualizations |
 |---|---|
-| **Mortality** | Bernoulli draw in monthly sweep, age-stratified annual rate from US life tables |
-| **Permanent ineligibility** | Aged out of all cancers, no cervix, smoking window permanently closed — deterministic |
-| **No-show cascade** | Cumulative Bernoulli exit draw after consecutive missed appointments |
-| **No-show disposition exit** | Categorical draw from `NOT_SEEN_PROBS` returns `"exit"` after a single miss |
-| **Outreach failure** | Outreach categorical draw returns `"exit"` during no-show or overdue handling |
-| **UNSCREENED_FATE exit** | After both no-show and outreach return `"wait"`, final categorical draw returns `"exit_system"` |
-| **Overdue pool timeout** | Patient in overdue pool exceeds `MAX_OVERDUE_DAYS` without re-engaging |
-| **Clinical LTFU — post-abnormal** | Bernoulli draw after abnormal cervical result; patient exits that clinical episode |
-| **Clinical LTFU — post-colposcopy** | Bernoulli draw before treatment; CIN2/3 patient exits without completing LEEP |
-| **Lung pathway LTFU** | Any of the sequential Bernoulli gates in the lung referral or biopsy chain |
-| **Untreated exit** | Malignancy confirmed but treatment Bernoulli draw fails |
+| Population | Pool size over time, entry density, exit breakdown, retention distribution (all + returning patients with visit_count ≥ 2), mortality & pool dynamics |
+| Entries & Exits | Annual entries & exits by reason (stacked area chart: green entries above zero; stacked exits below zero color-coded by mortality, attrition, ineligible, LTFU, queue LTFU secondary, queue LTFU treatment; net flow dashed line) |
+| Capacity & Queues | Procedure capacity utilization (horizontal bars with capacity overlay), queue wait time distribution, follow-up scheduling delays, screening queue length, demand vs. capacity (primary / secondary / treatment), turnaround delays |
+| Screening Volume | Annual screening volume, cervical uptake, lung uptake, first-stage screenings by modality, cervical uptake rate, lung uptake rate |
+| Clinical Cascade | Cervical cascade (funnel), cervical follow-up pathway, lung cascade, lung follow-up pathway |
+| Revenue | Annual cumulative revenue, foregone revenue by LTFU source (3-year rolling average, 4 sources: unscreened, queue LTFU primary, queue LTFU secondary, lung screening LTFU + lung biopsy LTFU) |
 
-For **established patients**, clinical LTFU exits (post-abnormal, post-colposcopy, lung pathway) are **soft exits** — the patient exits the current clinical episode but is immediately re-activated and rescheduled for next year's annual visit. They continue cycling. All other exits above are **hard exits** that remove the patient from the pool and trigger a replacement entrant.
-
-For **non-established patients** (first-time drop-ins who have not yet completed their first visit), all exits are permanent.
+All visualizations respect the warmup filter — only post-warmup data is plotted.
 
 ---
 
-## 15. Mortality Sweep and Overdue Pool
+## Turnaround & Scheduling Delays
 
-Every 30 days, a sweep runs over all established patients in the pool. It handles both mortality and the overdue pool in the same pass.
+These are **configured scheduling windows**, not simulation outputs. Queue wait time is the *additional* delay beyond these windows when capacity is insufficient.
 
-### Mortality
+| Step | Delay (days) | Config Key |
+|---|---|---|
+| Provider visit → Screening | 10 | `TURNAROUND_DAYS["provider_to_screening"]` |
+| Cytology → Result | 7 | `TURNAROUND_DAYS["cytology"]` |
+| Co-test → Result | 10 | `TURNAROUND_DAYS["co_test"]` |
+| HPV-alone → Result | 5 | `TURNAROUND_DAYS["hpv_alone"]` |
+| LDCT → Result notification | 5 | `TURNAROUND_DAYS["ldct_notification"]` |
+| Positive LDCT → Diagnostic workup | 21 | `TURNAROUND_DAYS["ldct_to_workup"]` |
+| Normal result → Patient notification | 10 | `TURNAROUND_DAYS["notification_normal"]` |
+| Abnormal result → Patient notification | 14 | `TURNAROUND_DAYS["notification_abnormal"]` |
+| Colposcopy → Pathology result | 10 | `TURNAROUND_DAYS["colposcopy_result"]` |
+| Lung biopsy → Pathology result | 10 | `TURNAROUND_DAYS["lung_biopsy_result"]` |
+| Abnormal cytology → Colposcopy appt | 50 | `FOLLOWUP_DELAY_DAYS["colposcopy"]` |
+| HSIL → Expedited colposcopy | 32 | `FOLLOWUP_DELAY_DAYS["colposcopy_hsil"]` |
+| CIN2/3 → LEEP | 14 | `FOLLOWUP_DELAY_DAYS["leep"]` |
+| CIN2/3 → Cone biopsy | 21 | `FOLLOWUP_DELAY_DAYS["cone_biopsy"]` |
+| RADS 4 → Lung biopsy | 21 | `FOLLOWUP_DELAY_DAYS["lung_biopsy"]` |
+| Malignancy → Lung treatment | 21 | `FOLLOWUP_DELAY_DAYS["lung_treatment"]` |
 
-1. **Age is updated** — `age = age_at_entry + floor((current_day − entry_day) / 365)` — integer years only
-2. **Smoking dynamics** — current smokers accumulate pack-years; a **Bernoulli draw** determines annual cessation; former smokers advance their years-since-quit counter (which eventually closes the USPSTF eligibility window)
-3. **HPV clearance** — HPV-positive patients draw a **Bernoulli** against the configured annual clearance rate; cleared patients become HPV-negative, reducing their future result probabilities
-4. **Mortality draw** — **Bernoulli(annual_rate × sweep_fraction)** where the annual rate comes from the age-stratified US life table lookup and `sweep_fraction = sweep_days / 365`
+### ASCCP Time-to-Colposcopy Guidelines
 
-Dead patients are removed from the pool, buffered for database write, and counted toward a replacement quota.
+| Result Severity | Target Window | Config Key |
+|---|---|---|
+| ASCUS / LSIL | Within 3 months (90 days) | `ABNORMAL_FOLLOWUP_DAYS["ASCUS_LSIL"]` |
+| HSIL / ASC-H | Within 1 month (30 days) | `ABNORMAL_FOLLOWUP_DAYS["HSIL_ASCH"]` |
 
-### Overdue Pool
+Source: 2019 ASCCP Risk-Based Management Consensus Guidelines (Perkins et al., J Low Genit Tract Dis 2020).
 
-For each patient who survives the mortality draw and has `overdue_since_day` set:
+### Unscreened Re-entry Delay
 
-1. Compute `days_overdue = current_day − overdue_since_day`
-2. If `days_overdue > MAX_OVERDUE_DAYS`: the patient exits as `lost_to_followup` (`n_overdue_exit`) and triggers a replacement entrant
-3. Otherwise: `_apply_outreach` is called (one monthly outreach attempt). If outreach returns `"wait"`, a **Bernoulli spontaneous re-entry draw** is taken, scaled from the daily re-entry probability to the 30-day sweep interval via `1 − (1 − p_daily)^sweep_days`. If it fires, `overdue_since_day` is cleared and an appointment is booked after `REENTRY_DELAY_DAYS` (`n_spontaneous_reentry`)
+| Provider | Delay (days) | Config Key |
+|---|---|---|
+| PCP | 28 | `RESCHEDULE_DELAY_DAYS["pcp"]` |
+| Gynecologist | 38 | `RESCHEDULE_DELAY_DAYS["gynecologist"]` |
+| Specialist | 30 | `RESCHEDULE_DELAY_DAYS["specialist"]` |
+| ER | 7 | `RESCHEDULE_DELAY_DAYS["er"]` |
+| Default | 30 | `RESCHEDULE_DELAY_DAYS["default"]` |
 
-### Replacement Accounting
+### Post-Treatment Re-entry Delay
 
-Non-mortality exits (no-show cascades, overdue timeouts, outreach failures) are accumulated in a counter between sweeps. At the end of each sweep this counter is folded into the main `_pending_new_entries` quota and reset, so replacement entrants trickle in to refill all exits — not just deaths — and the pool stays near its target size.
+| Cancer | Delay (days) | Config Key |
+|---|---|---|
+| Cervical | 180 | `POST_TREATMENT_DELAY_DAYS["cervical"]` |
+| Lung | 365 | `POST_TREATMENT_DELAY_DAYS["lung"]` |
 
 ---
 
-## 16. Metrics and Annual Checkpoints
+## Scale Interpretation
 
-Every 365 simulation days, a checkpoint snapshot is appended to `metrics["year_checkpoints"]` with all cumulative counts: cervical screens by modality, lung LDCTs, colposcopies, LEEPs, LTFU events, mortality count, pool size. The 70 checkpoint snapshots are the primary input to all notebook visualizations.
-
-The metrics dictionary is the single output object of a simulation run. All rates and percentages (uptake %, LTFU %, completion %) are computed in the notebook by dividing event counts by the appropriate denominators from the same metrics object.
-
-Key no-show and overdue counters tracked:
-- `n_noshow` — total missed appointment events
-- `n_noshow_exit` — exits triggered by the cumulative cascade
-- `n_overdue_exit` — exits triggered by exceeding the maximum overdue window
-- `n_spontaneous_reentry` — patients who re-engaged from the overdue pool without active outreach
-- `ltfu_unscreened` — combined LTFU sub-bucket for all appointment-miss-driven exits
-
----
-
-## Summary of Distributions Used
-
-| Simulation Step | Distribution |
+| Simulation Unit | Real-World Equivalent |
 |---|---|
-| Daily new arrivals | Poisson (Normal approximation) |
-| Provider destination assignment | Categorical (weighted) |
-| Patient type (outpatient / drop-in) | Categorical (weighted) |
-| Outpatient scheduling lead time | Discrete Uniform [lo, hi] |
-| **No-show draw (per outpatient)** | **Bernoulli (provider-specific rate)** |
-| **Cumulative no-show exit** | **Bernoulli (probability indexed by streak length)** |
-| **Post-no-show disposition** | **Categorical (weighted 3-way: reschedule / exit / wait)** |
-| **Outreach outcome** | **Categorical (weighted 3-way, keyed by WORKFLOW_MODE)** |
-| **Unscreened fate** | **Categorical (weighted 2-way: may_return_later / exit_system)** |
-| **Spontaneous overdue re-entry** | **Bernoulli (daily rate scaled to sweep interval)** |
-| Cervical test type (age 30–65) | Categorical (weighted, 3-way) |
-| Cervical result draw | Categorical (weighted, with multiplicative risk adjustment and renormalization) |
-| Lung-RADS result draw | Categorical (weighted, 6-way) |
-| All clinical LTFU checks | Bernoulli |
-| All lung pathway attrition gates | Bernoulli (sequential, independent) |
-| HPV+ triage split | Bernoulli |
-| Colposcopy CIN grade draw | Categorical (weighted, conditioned on triggering result) |
-| CIN1 surveillance outcome | Categorical (weighted, 3-way: resolve / escalate / persist) |
-| ER overflow routing | Bernoulli |
-| Mortality draw | Bernoulli (age-stratified rate × time fraction) |
-| HPV clearance | Bernoulli |
-| Smoking cessation | Bernoulli |
-| Age-based drop-in priority | Deterministic sort — no randomness |
+| 1 simulated patient | 100 NYC eligible women (`POPULATION_SCALE_FACTOR = 100`) |
+| 15,000 sim patients | ~1.5 million NYC eligible women |
+| 1 cervical screen | 100 cervical screens in the real population |
+| 1 LDCT | 100 LDCTs in the real population |
+
+All volume outputs should be multiplied by `POPULATION_SCALE_FACTOR = 100` when extrapolating to real-world planning figures.
 
 ---
 
-## Key Design Principles
+## Disease-Specific Mortality (Placeholder)
 
-- **Single source of truth:** every probability, capacity, and interval is defined once in `config.py`. No magic numbers anywhere else in the codebase.
-- **Scenario toggles:** changing `WORKFLOW_MODE` between `"fragmented"` and `"coordinated"` adjusts outreach success rates, capacity, and LTFU assumptions simultaneously for scenario comparison.
-- **Parameter provenance:** every parameter in config is tagged with its source citation or labeled `# ASSUMPTION` if not yet grounded in data.
-- **Stable population:** the cycling pool design avoids the ramp-up bias of open-queue models while keeping the age distribution realistic over 70 years through continuous mortality and non-mortality replacement.
-- **Weekday-only clinical activity:** all screening and provider activity is suppressed on weekends; background biological and administrative processes are not.
-- **Layered exit system:** exits are structured as a cascade — each layer (no-show, outreach, UNSCREENED_FATE, overdue timeout) gives the patient one more chance to re-engage before permanent removal, matching the real-world pattern of repeated missed contacts before a patient is truly lost.
+`DISEASE_MORTALITY` in config defines additional mortality risk given a confirmed diagnosis. **Currently set to `None` for all categories** — no disease-specific death days are drawn. When populated with NYP/SEER data, the runner should draw a disease-specific death day at diagnosis time and add it to the life-event queue.
+
+| Condition | Config Key | Current Value |
+|---|---|---|
+| CIN1 | `DISEASE_MORTALITY["CIN1"]` | None |
+| CIN2 | `DISEASE_MORTALITY["CIN2"]` | None |
+| CIN3 | `DISEASE_MORTALITY["CIN3"]` | None |
+| Lung malignant | `DISEASE_MORTALITY["lung_malignant"]` | None |
+| Any cancer | `DISEASE_MORTALITY["any_cancer"]` | None |
+
+---
+
+## Workflow Mode
+
+`WORKFLOW_MODE` controls the care delivery model:
+- `"fragmented"` (current default) — separate appointments per specialty
+- `"coordinated"` — bundled multi-screening program (future state)
+
+---
+
+*All clinical probabilities and revenue rates are PLACEHOLDERS unless otherwise sourced — replace with NYP EHR/finance data before operational use. Parameters marked PLACEHOLDER in `config.py` are clearly annotated.*

@@ -30,6 +30,9 @@ from typing import List, Optional
 import config as cfg
 from patient import Patient
 
+# Analysis warmup cutoff — metrics recorded before this day are excluded
+_WARMUP_DAY = cfg.WARMUP_YEARS * cfg.DAYS_PER_YEAR
+
 
 # ─── Eligibility ──────────────────────────────────────────────────────────────
 
@@ -290,7 +293,7 @@ def run_lung_pre_ldct(
     step fails the patient is classified as LTFU and the function returns False.
     Returns True only when both steps succeed and the scan should proceed.
     """
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_eligible"] += 1
 
     # Step 1: Was a referral order placed?
@@ -301,7 +304,7 @@ def run_lung_pre_ldct(
 
     p.lung_referral_placed = True
     p.log(current_day, "LUNG: LDCT order placed")
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_referral_placed"] += 1
 
     # Step 2: Did the patient schedule (and complete) the scan?
@@ -312,7 +315,7 @@ def run_lung_pre_ldct(
 
     p.lung_ldct_scheduled = True
     p.log(current_day, "LUNG: LDCT scheduled")
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_ldct_scheduled"] += 1
 
     # Step 3: Did the patient actually complete the scan? (appointment completion rate)
@@ -324,7 +327,7 @@ def run_lung_pre_ldct(
         return False
 
     p.log(current_day, "LUNG: LDCT completed")
-    if metrics is not None:
+    if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["lung_ldct_completed"] += 1
 
     return True
@@ -342,6 +345,7 @@ _RESULT_FIELD = {
 def run_screening_step(
     p: Patient, cancer: str, current_day: int,
     metrics: Optional[dict] = None,
+    test_override: Optional[str] = None,
 ) -> Optional[str]:
     """
     Execute one full screening event for the given cancer type.
@@ -349,6 +353,11 @@ def run_screening_step(
     Checks eligibility and interval, assigns the test, draws the result,
     and stores it on the patient. For lung, also runs the pre-LDCT pathway
     (referral + scheduling steps) before drawing a result.
+
+    If test_override is provided, that test is used instead of drawing a new
+    one via assign_screening_test(). This avoids a double random draw when
+    the caller has already assigned the test (e.g. to check slot availability
+    before committing to the screening).
 
     Returns the result string, or None if the patient was skipped or lost.
     """
@@ -362,7 +371,7 @@ def run_screening_step(
         p.log(current_day, f"SKIP {cancer} — not yet due")
         return None
 
-    test            = assign_screening_test(p, cancer)
+    test            = test_override or assign_screening_test(p, cancer)
     p.current_stage = "screening"
     p.log(current_day, f"SCREEN {cancer} via {test}")
 

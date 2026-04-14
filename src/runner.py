@@ -4,35 +4,25 @@
 # =============================================================================
 #
 # The clock is an integer day counter (0 … n_days-1).  Each tick processes
-# one full day: new arrivals, provider queues, overflow routing, and any
-# follow-up appointments that fall due.
+# one full day: new arrivals, provider visits, procedure slot allocation,
+# and any follow-up appointments that fall due.
 #
-# Queue logic
-# -----------
-# PCP / Gynecologist / Specialist
-#   Capacity is split into outpatient slots (OUTPATIENT_FRACTION) and
-#   drop-in slots.  Outpatients are scheduled in advance so their slots are
-#   always guaranteed — the scheduler finds the next day with room rather
-#   than ever overfilling.  Drop-ins fill whatever capacity remains after
-#   outpatients are seated.  Drop-ins who cannot be seen today overflow
-#   to tomorrow's drop-in queue for the same provider.
+# Provider routing
+# ----------------
+# Patients are distributed to providers proportionally based on config
+# probabilities.  Outpatients (PCP / GYN / Specialist) are scheduled;
+# drop-ins (ER) are walk-ins.  There is no provider-level capacity
+# constraint — the distribution is proportional, not a queue.
 #
-# ER
-#   No outpatient slots — entirely drop-in.  Overflow patients either
-#   retry the ER tomorrow (ER_OVERFLOW_RETRY_PROB) or are converted to a
-#   scheduled outpatient appointment at PCP / Gyno / Specialist.
+# Procedure slot queueing
+# -----------------------
+# The real capacity bottleneck lives at procedure slots (consume_slot).
+# Primary screenings (cytology, HPV, LDCT) are served with priority:
+# outpatients (PCP/GYN/Specialist) before drop-ins (ER).
+# When a slot overflows, the patient is rescheduled to the next workday.
 #
-# Wait times
-# ----------
-# Wait time = day_seen - day_created.  For outpatients this equals the
-# scheduling lead time.  For drop-ins it grows each time they overflow.
-# These are recorded per resource in metrics["wait_times"].
-#
-# PENDING: actual scheduling wait time distributions (e.g. days-to-colposcopy,
-# days-to-LEEP) are not yet modelled.  Currently follow-up appointments are
-# placed at a fixed offset (cfg.FOLLOWUP_DELAY_DAYS).  Replace with
-# empirical or literature-derived wait-time distributions once NYP
-# scheduling data is available.
+# Secondary screenings (colposcopy, biopsy) and treatment (LEEP, cone)
+# follow FIFO logic — only patients with abnormal primary results enter.
 #
 # Follow-up scheduling
 # --------------------
@@ -51,17 +41,25 @@
 
 import math
 import random
+import time
 from collections import defaultdict
 from typing import Optional
 
 import config as cfg
 from patient import Patient
 from population import (
-    sample_patient, sample_replacement_patient,
-    generate_established_population, draw_mortality,
+    sample_patient,
+    generate_established_population,
+    draw_death_day,
+    draw_attrition_day,
+    draw_cessation_day,
+    draw_hpv_clearance_day,
 )
 from screening import (
     get_eligible_screenings,
+    is_eligible_cervical,
+    is_eligible_lung,
+    is_due_for_screening,
     assign_screening_test,
     run_screening_step,
     days_until_eligible,
@@ -97,58 +95,25 @@ def _poisson(lam: float) -> int:
     return max(0, round(random.gauss(lam, math.sqrt(lam))))
 
 
-def _outpatient_cap(provider: str) -> int:
-    """Daily outpatient slot count for a provider."""
-    total = cfg.PROVIDER_CAPACITY.get(provider, 0)
-    frac  = cfg.OUTPATIENT_FRACTION.get(provider, 0.0)
-    return int(total * frac)
-
-
-def _dropin_cap(provider: str) -> int:
-    """Daily drop-in slot count for a provider."""
-    return cfg.PROVIDER_CAPACITY.get(provider, 0) - _outpatient_cap(provider)
-
-
 # =============================================================================
 # Patient Queue Manager
 # =============================================================================
 
 class PatientQueues:
     """
-    Day-by-day patient queue manager for all providers.
+    Day-by-day queue manager for patient visits and procedure slots.
 
-    PATIENT TYPES
-    ─────────────────────────────────────────────────────────────────────────────
-    There are exactly two types — no inpatient modelling in this simulation:
-
-      outpatient  — a patient with a confirmed scheduled appointment.
-                    Guaranteed a slot: the scheduler never books beyond capacity.
-                    Once scheduled they cannot be turned away on the day.
-
-      drop_in     — a walk-in patient with no prior appointment.
-                    Fills whatever capacity is left after outpatients are seated.
-                    Excess drop-ins overflow to the next day (or are re-routed).
-
-    CAPACITY GUARANTEE
-    ─────────────────────────────────────────────────────────────────────────────
-    The number of outpatients scheduled on any (provider, day) pair is always
-    strictly less than _outpatient_cap(provider).  This invariant is enforced
-    by schedule_outpatient(), which advances the booking day until a slot is
-    free, and verified by a hard assertion after every booking.
-
-    This guarantee holds regardless of how PROVIDER_CAPACITY or OUTPATIENT_FRACTION
-    are set in config — the cap is recomputed from config at each call to
-    schedule_outpatient(), so changing those values between scenario runs
-    automatically applies to all subsequent bookings.
+    Provider routing is proportional (no provider-level capacity constraint).
+    The real bottleneck lives at procedure slots (consume_slot), where
+    primary screenings get priority for scheduled patients over ER walk-ins.
 
     Attributes
     ----------
     outpatient[provider][day] : list[Patient]
         Patients with a confirmed appointment on that day.
-        Invariant: len(outpatient[p][d]) < _outpatient_cap(p) for all p, d.
 
     dropin[provider] : list[Patient]
-        Today's walk-ins.  Reset at the start of each provider's processing.
+        Today's walk-ins (ER).
 
     followup[day] : list[(Patient, dict)]
         Follow-up appointments due on a specific future day.
@@ -159,11 +124,18 @@ class PatientQueues:
         Initialised lazily from cfg.CAPACITIES.
     """
 
-    def __init__(self):
+    def __init__(self, warmup_day: int = 0):
         self.outpatient   = defaultdict(lambda: defaultdict(list))
         self.dropin       = defaultdict(list)
         self.followup     = defaultdict(list)
         self.daily_slots  = defaultdict(dict)
+        self._warmup_day  = warmup_day
+        # Procedure utilization counters (post-warmup only, for statistical summary)
+        self.procedure_used      = {}   # procedure → total slots consumed
+        self.procedure_overflow  = {}   # procedure → total slot overflows (capacity full)
+        # Life events: day → [(patient, event_type), ...]
+        # Event types: "mortality", "attrition", "smoking_cessation", "hpv_clearance"
+        self.life_events  = defaultdict(list)
 
     # ── Outpatient scheduling ─────────────────────────────────────────────────
 
@@ -171,60 +143,14 @@ class PatientQueues:
         self, p: Patient, provider: str, earliest_day: int
     ) -> int:
         """
-        Book a patient into the earliest available outpatient slot on or after
-        earliest_day, then return the booked day.
+        Book a patient for a visit on earliest_day and return that day.
 
-        CAPACITY CONTRACT
-        -----------------
-        After every booking this method asserts:
-            len(outpatient[provider][booked_day]) <= cap
-        If the assertion ever fails, a bug was introduced that let two code
-        paths book the same slot simultaneously.  The assert fires immediately
-        rather than allowing a silent capacity violation.
-
-        The cap is read fresh from config at each call — so if PROVIDER_CAPACITY
-        or OUTPATIENT_FRACTION are changed between scenario runs, the new values
-        are automatically respected for all future bookings without any
-        additional code changes.
-
-        Zero-capacity providers (ER)
-        ----------------------------
-        ER has OUTPATIENT_FRACTION = 0, so its outpatient cap is 0.
-        Attempting to schedule an outpatient there would loop forever
-        (0 >= 0 is always True).  Instead, zero-cap providers receive the
-        patient as a drop-in for earliest_day.  This is the correct clinical
-        model: established patients never use the ER as their primary
-        scheduled provider.
+        Provider distribution is proportional to config caps — there is no
+        provider-level capacity constraint.  The real bottleneck lives at
+        procedure slots (consume_slot).
         """
-        cap = _outpatient_cap(provider)
-        if cap <= 0:
-            # Zero-capacity provider (e.g. ER) — use the outpatient dict keyed
-            # by day so the patient appears only on the intended future date,
-            # not on today's drop-in queue.  process_day pops from outpatient
-            # first, then fills drop-ins, so this patient will be returned in
-            # the "seen_outpts" list on earliest_day regardless of capacity.
-            self.outpatient[provider][earliest_day].append(p)
-            return earliest_day
-
-        # Advance day until a slot is available (never overfills).
-        # Count only active patients — inactive (dead/exited) patients leave
-        # their slot logically vacated so replacement entrants can fill it.
-        day = earliest_day
-        while sum(1 for q in self.outpatient[provider][day] if q.active) >= cap:
-            day += 1
-
-        self.outpatient[provider][day].append(p)
-
-        # Hard post-condition: the booked day must not exceed capacity.
-        # This catches any future bug where two threads / code paths race on
-        # the same slot, or where the cap calculation is wrong.
-        booked_count = sum(1 for q in self.outpatient[provider][day] if q.active)
-        assert booked_count <= cap, (
-            f"CAPACITY VIOLATION: {provider} day {day} has {booked_count} active "
-            f"outpatients but cap={cap}. Check _outpatient_cap() and config."
-        )
-
-        return day
+        self.outpatient[provider][earliest_day].append(p)
+        return earliest_day
 
     # ── Drop-in management ────────────────────────────────────────────────────
 
@@ -236,99 +162,20 @@ class PatientQueues:
 
     def process_day(self, provider: str, day: int):
         """
-        Seat today's patients for one provider, respecting total capacity.
+        Return all patients scheduled or walking in for this provider today.
 
-        NO INPATIENTS — only two patient types exist:
-          • outpatient (scheduled) — always seen; guaranteed slot by scheduler.
-          • drop_in  (walk-in)    — fills whatever capacity remains after
-                                    outpatients are seated; excess overflows.
-
-        Seating priority
-        ----------------
-        1. ALL scheduled outpatients are seated unconditionally. The scheduler
-           already guaranteed their count ≤ outpatient cap (see schedule_outpatient).
-        2. Drop-ins fill any unused outpatient slots first, then their own
-           dedicated drop-in slots.  Available drop-in capacity =
-               dropin_cap + max(0, outpt_cap - n_outpatients_today)
-           Using the ACTUAL scheduled headcount (not config cap) ensures that
-           if a scenario reduces capacity after patients were booked, the fill
-           math is still correct.
-        3. Excess drop-ins (overflow) are returned to the caller for re-routing.
+        Provider distribution is proportional — there is no provider-level
+        capacity constraint, so there is never overflow.  Outpatients are
+        returned before drop-ins so that downstream procedure-slot logic
+        can prioritise scheduled patients over ER walk-ins.
 
         Returns
         -------
-        seen     : list[Patient]   — all patients who will be processed today
-        overflow : list[Patient]   — drop-ins who could not be accommodated
+        seen : list[Patient] — all patients to be processed today
         """
-        # Capacities from config — govern drop-in fill only
-        outpt_cap  = _outpatient_cap(provider)
-        dropin_cap = _dropin_cap(provider)
-        total_cap  = outpt_cap + dropin_cap          # = PROVIDER_CAPACITY[provider]
-
-        # Outpatients are always all seated (capacity was guaranteed at booking)
-        seen_outpts     = self.outpatient[provider].pop(day, [])
-
-        # Count only ACTIVE outpatients for the drop-in capacity calculation.
-        # schedule_outpatient() also counts only active patients when checking
-        # the cap, so a dead patient whose slot was "refilled" by a replacement
-        # entrant must not reduce the available drop-in headroom.  Using the
-        # raw len() would double-count those slots and incorrectly zero out
-        # drop-in capacity on mortality-sweep days.
-        n_active_outpts = sum(1 for q in seen_outpts if q.active)
-
-        # Drop-ins fill remaining total capacity, computed from ACTIVE headcount.
-        remaining     = max(0, total_cap - n_active_outpts)
-
-        # NYP MODEL ASSUMPTION — age-based drop-in priority (cfg.AGE_PRIORITY_THRESHOLD)
-        # Women aged 40+ are sorted to the front of the drop-in queue before the
-        # capacity slice is applied. This ensures that when the drop-in pool exceeds
-        # available slots, younger patients overflow rather than high-revenue 40+ patients.
-        # Ordering within each age group preserves arrival order (stable sort).
-        today_dropins = sorted(
-            self.dropin.get(provider, []),
-            key=lambda p: (0 if p.age >= cfg.AGE_PRIORITY_THRESHOLD else 1),
-        )
-        seen_dropins     = today_dropins[:remaining]
-        overflow         = today_dropins[remaining:]
-        self.dropin[provider] = []
-
-        return seen_outpts + seen_dropins, overflow
-
-    # ── Schedule integrity check ──────────────────────────────────────────────
-
-    def validate_capacity(self, raise_on_violation: bool = True) -> list:
-        """
-        Scan the entire outpatient schedule and verify no day exceeds its cap.
-
-        Returns a list of violation strings (empty = all clear). Call this
-        after warmup initialisation or after loading a scenario config to
-        confirm the capacity guarantee holds before a long run starts.
-
-        Parameters
-        ----------
-        raise_on_violation : if True (default), raises AssertionError on the
-                             first violation found so the bug surfaces
-                             immediately rather than corrupting a full run.
-
-        Example
-        -------
-            sim._queues.validate_capacity()   # called after _initialize_population()
-        """
-        violations = []
-        for provider, day_map in self.outpatient.items():
-            cap = _outpatient_cap(provider)
-            if cap <= 0:
-                continue
-            for day, patients in day_map.items():
-                if len(patients) > cap:
-                    msg = (
-                        f"CAPACITY VIOLATION: provider={provider} "
-                        f"day={day} scheduled={len(patients)} cap={cap}"
-                    )
-                    violations.append(msg)
-                    if raise_on_violation:
-                        raise AssertionError(msg)
-        return violations
+        seen_outpts  = self.outpatient[provider].pop(day, [])
+        today_dropins = self.dropin.pop(provider, [])
+        return seen_outpts + today_dropins
 
     # ── Follow-up scheduling ──────────────────────────────────────────────────
 
@@ -342,6 +189,43 @@ class PatientQueues:
         """Return (and clear) all follow-ups due today."""
         return self.followup.pop(day, [])
 
+    # ── Life event scheduling ────────────────────────────────────────────────
+
+    def schedule_life_event(self, p: "Patient", event_type: str, day: int) -> None:
+        """Schedule an independent life event (mortality, attrition, etc.)."""
+        self.life_events[day].append((p, event_type))
+
+    def get_due_life_events(self, day: int):
+        """Return (and clear) all life events due today."""
+        return self.life_events.pop(day, [])
+
+    def procedure_queue_depth(self, from_day: int) -> dict:
+        """
+        Count how many patients are waiting for each procedure type
+        in the followup queue (from_day onward).
+        Returns {procedure_step: count}.
+        """
+        depth = defaultdict(int)
+        for day, entries in self.followup.items():
+            if day >= from_day:
+                for _patient, context in entries:
+                    step = context.get("step", "unknown")
+                    depth[step] += 1
+        return dict(depth)
+
+    def screening_queue_depth(self, from_day: int) -> int:
+        """
+        Count patients waiting specifically for primary screening slots
+        (screening_retry followups from from_day onward).
+        """
+        count = 0
+        for day, entries in self.followup.items():
+            if day >= from_day:
+                for _patient, context in entries:
+                    if context.get("step") == "screening_retry":
+                        count += 1
+        return count
+
     # ── Procedure slot management ─────────────────────────────────────────────
 
     def consume_slot(self, procedure: str, day: int) -> bool:
@@ -354,7 +238,13 @@ class PatientQueues:
             self.daily_slots[day][procedure] = cfg.CAPACITIES.get(procedure, 0)
         if self.daily_slots[day][procedure] > 0:
             self.daily_slots[day][procedure] -= 1
+            # Track procedure utilization (post-warmup only)
+            if day >= self._warmup_day:
+                self.procedure_used[procedure] = self.procedure_used.get(procedure, 0) + 1
             return True
+        # Track overflow (capacity full, post-warmup only)
+        if day >= self._warmup_day:
+            self.procedure_overflow[procedure] = self.procedure_overflow.get(procedure, 0) + 1
         return False
 
 
@@ -373,18 +263,20 @@ class SimulationRunner:
         No cycling, no mortality. Suitable for short scenario runs.
 
     Stable-population mode (use_stable_population=True)
-        A fixed cohort of cfg.SIMULATED_POPULATION established patients
-        cycles through the provider system annually. Each patient is
-        rescheduled immediately after each visit. A mortality sweep runs
-        every cfg.MORTALITY_CHECK_DAYS and removes patients who die (drawn
-        from age-adjusted US life-table rates). Deaths are replaced by new
-        drop-in entrants at a rate of cfg.NEW_PATIENT_DAILY_RATE, keeping
-        the total population stable. Exited patients are batch-flushed to a
-        SQLite database every cfg.DB_FLUSH_INTERVAL days.
+        Seeds cfg.INITIAL_POOL_SIZE established patients who cycle through
+        the provider system annually. New patients arrive via multi-source
+        ARRIVAL_SOURCES and join the cycling pool after their first visit.
+        Patients exit via mortality, attrition (EXIT_SOURCES), LTFU, or
+        ineligibility. The pool size is emergent — NOT maintained at a
+        fixed target. Exited patients are batch-flushed to SQLite.
 
-        The initial cohort is spread evenly across the first 365 days
-        (warmup), so providers are near capacity from day 1 rather than
-        ramping up slowly.
+        Life events (death, attrition, smoking cessation, HPV clearance)
+        are drawn once at patient entry and scheduled as independent
+        events in the priority queue — they fire on their scheduled day
+        regardless of visit activity.
+
+        The initial cohort is spread across cfg.WARMUP_DAYS so the
+        system reaches steady state quickly.
 
     Parameters
     ----------
@@ -415,13 +307,28 @@ class SimulationRunner:
         self._queues               = None
         self._pid                  = 0
 
-        # Stable-population state — populated by _initialize_population()
+        # Population state — pool grows/shrinks organically
         self._established_pool:          list = []   # all living established patients
         self._flush_buffer:              list = []   # exited patients awaiting DB write
-        self._pending_new_entries:       int  = 0    # replacement entrants still to create
-        self._pending_replacement_exits: int  = 0    # non-mortality exits needing replacement
-        self._last_mortality_day:        int  = 0    # last day a mortality sweep ran
+        self._pool_removals:             set  = set()  # ids of patients to purge from pool
+
+        # Daily screening demand counters (reset each workday)
+        self._day_screening_demand:  int = 0   # attempted
+        self._day_screening_supply:  int = 0   # slot consumed
+        self._day_screening_overflow:  int = 0   # overflow (no slot)
+        # Secondary (colposcopy, lung_biopsy) and treatment (leep, cone_biopsy)
+        self._day_secondary_demand:  int = 0
+        self._day_secondary_supply:  int = 0
+        self._day_secondary_overflow:  int = 0
+        self._day_treatment_demand:  int = 0
+        self._day_treatment_supply:  int = 0
+        self._day_treatment_overflow:  int = 0
         self._db:                        Optional[SimulationDB] = None
+
+        # Warmup cutoff: metrics recorded before this day are excluded from
+        # analysis.  Wait times, demand/supply/overflow tuples, and screening
+        # counters are only recorded for day >= _warmup_day.
+        self._warmup_day: int = cfg.WARMUP_YEARS * cfg.DAYS_PER_YEAR
 
     # =========================================================================
     # Public interface
@@ -445,7 +352,7 @@ class SimulationRunner:
         """
         random.seed(self.seed)
         self.metrics = initialize_metrics()
-        self._queues = PatientQueues()
+        self._queues = PatientQueues(warmup_day=self._warmup_day)
         self._pid    = 0
 
         if self.use_stable_population:
@@ -461,16 +368,39 @@ class SimulationRunner:
             self._db = SimulationDB(db_path=self.db_path)
             self._initialize_population()
 
+        self._run_start = time.time()
+        self._last_progress = 0
         for day in range(self.n_days):
             self._tick(day)
+            # Progress clock — print every 5 simulated years
+            year = day // 365
+            if year > self._last_progress and year % 5 == 0:
+                elapsed = time.time() - self._run_start
+                pool = len(self._established_pool) if self.use_stable_population else 0
+                print(f"  Year {year:>3}/{self.n_days // 365}  |  "
+                      f"pool {pool:>6,}  |  "
+                      f"mortality {self.metrics.get('mortality_count', 0):>5,}  |  "
+                      f"{elapsed:>6.1f}s elapsed")
+                self._last_progress = year
 
         # Final year checkpoint (captures year-70 stats at end of loop)
         if self.metrics.get("year_checkpoints") is not None:
             last_year = self.n_days // 365
+            day_final = self.n_days
+            due_cerv_f = due_lung_f = 0
+            if self.use_stable_population:
+                for p in self._established_pool:
+                    if p.active:
+                        if is_eligible_cervical(p) and is_due_for_screening(p, "cervical", day_final):
+                            due_cerv_f += 1
+                        if is_eligible_lung(p) and is_due_for_screening(p, "lung", day_final):
+                            due_lung_f += 1
             self.metrics["year_checkpoints"].append({
                 "year":                last_year,
-                "day":                 self.n_days,
+                "day":                 day_final,
                 "pool_size":           len(self._established_pool) if self.use_stable_population else None,
+                "due_cervical":        due_cerv_f,
+                "due_lung":            due_lung_f,
                 "cum_cervical":        self.metrics["n_screened"]["cervical"],
                 "cum_cervical_est":    self.metrics["n_screened_established"]["cervical"],
                 "cum_lung":            self.metrics["n_screened"]["lung"],
@@ -482,11 +412,26 @@ class SimulationRunner:
                 "cum_leep":            self.metrics["n_treatment"].get("leep", 0),
                 "cum_treated":         self.metrics["n_treated"],
                 "cum_ltfu":            self.metrics["n_ltfu"],
+                "cum_ltfu_queue_primary":   self.metrics["ltfu_queue_primary"],
+                "cum_ltfu_queue_secondary": self.metrics["ltfu_queue_secondary"],
+                "cum_ltfu_queue_treatment": self.metrics["ltfu_queue_treatment"],
+                "cum_ltfu_unscreened":      self.metrics["ltfu_unscreened"],
+                "cum_cervical_eligible":    self.metrics["n_eligible"].get("cervical", 0),
+                "cum_lung_eligible":        self.metrics.get("lung_eligible", 0),
+                "cum_lung_referral_placed": self.metrics.get("lung_referral_placed", 0),
+                "cum_lung_biopsy_referral": self.metrics.get("lung_biopsy_referral", 0),
                 "cum_lung_biopsy":     self.metrics["lung_biopsy_completed"],
                 "cum_lung_treatment":  self.metrics["lung_treatment_given"],
                 "cum_mortality":       self.metrics.get("mortality_count", 0),
                 "cum_n_patients":      self.metrics["n_patients"],
+                "cum_exited":          self.metrics["n_exited"],
+                "cum_exits_by_reason": dict(self.metrics["exits_by_reason"]),
+                "cum_arrivals":        sum(self.metrics["arrivals_by_source"].values()),
             })
+
+        # Expose queue/procedure utilization in metrics for stats table
+        self.metrics["procedure_used"]     = dict(self._queues.procedure_used)
+        self.metrics["procedure_overflow"] = dict(self._queues.procedure_overflow)
 
         # Final flush of any remaining exited patients
         if self.use_stable_population and self._db:
@@ -559,17 +504,26 @@ class SimulationRunner:
             print("  Exit reasons:")
             for reason, count in sorted(stats["by_exit_reason"].items()):
                 print(f"    {reason:<25} {count:,}")
+        exits_by_src = self.metrics.get("exits_by_source", {})
+        if exits_by_src:
+            print("  Exit sources (detailed):")
+            for src, count in sorted(exits_by_src.items(), key=lambda x: -x[1]):
+                print(f"    {src:<25} {count:,}")
+        arrivals_by_src = self.metrics.get("arrivals_by_source", {})
+        if arrivals_by_src:
+            print("  Arrival sources:")
+            for src, count in sorted(arrivals_by_src.items(), key=lambda x: -x[1]):
+                print(f"    {src:<25} {count:,}")
         print()
 
     def plot_pool_stability(self) -> None:
         """
         Line chart showing the established-patient pool size over time.
 
-        A flat line confirms the stable-population assumption holds —
-        mortality is balanced by replacement entrants. A declining trend
-        would indicate the replacement rate is too low; a rising trend
-        would indicate the mortality rate is too low relative to config.
-        Only meaningful when use_stable_population=True.
+        In the flow model the pool size is emergent — it grows from the
+        initial seed as organic arrivals join, and shrinks as patients exit
+        via mortality, attrition, LTFU, or ineligibility. The chart shows
+        the natural equilibrium the system reaches.
         """
         self._require_run()
         snapshots = self.metrics.get("pool_size_snapshot", [])
@@ -581,38 +535,13 @@ class SimulationRunner:
         fig, ax = plt.subplots(figsize=(10, 4))
         ax.plot(days, sizes, color="#4472C4", linewidth=1.2)
         ax.axhline(
-            cfg.SIMULATED_POPULATION, color="red", linestyle="--",
-            linewidth=1.0, label=f"Target ({cfg.SIMULATED_POPULATION:,})"
+            cfg.INITIAL_POOL_SIZE, color="gray", linestyle="--",
+            linewidth=0.8, alpha=0.5, label=f"Initial seed ({cfg.INITIAL_POOL_SIZE:,})"
         )
-        ax.set_title("Established-Patient Pool Size Over Time (Stability Check)")
+        ax.set_title("Established-Patient Pool Size Over Time")
         ax.set_xlabel("Simulation Day")
         ax.set_ylabel("Pool Size")
         ax.legend()
-        plt.tight_layout()
-        plt.show()
-
-    def plot_queues(self) -> None:
-        """Bar chart: total drop-in overflow per provider over the simulation."""
-        self._require_run()
-        import matplotlib.pyplot as plt
-        overflow = self.metrics.get("overflow", {})
-        if not overflow:
-            print("No overflow recorded.")
-            return
-        providers = list(overflow.keys())
-        totals    = [overflow[p] for p in providers]
-        fig, ax   = plt.subplots(figsize=(7, 4))
-        bars = ax.bar(providers, totals, color="#ED7D31")
-        ax.set_title("Drop-In Overflow by Provider (cumulative, all days)")
-        ax.set_ylabel("Patients overflowed")
-        ax.set_xlabel("Provider")
-        _max = max(totals) if totals else 1
-        for bar, val in zip(bars, totals):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + _max * 0.01,
-                f"{val:,}", ha="center", fontsize=9,
-            )
         plt.tight_layout()
         plt.show()
 
@@ -624,37 +553,27 @@ class SimulationRunner:
         """
         Process one simulation day in order:
 
-          Stable-population additions (runs when use_stable_population=True):
-            0a. Mortality sweep (every MORTALITY_CHECK_DAYS): age all established
-                patients, draw Bernoulli mortality for each, remove the dead,
-                queue replacement new-entrants.
-            0b. Spawn replacement new-entrants to balance mortality exits.
-            0c. Flush exited patients to SQLite (every DB_FLUSH_INTERVAL days).
+          Background (runs every day when use_stable_population=True):
+            0a. Process life events due today (mortality, attrition,
+                smoking cessation, HPV clearance) — all pre-scheduled.
+            0b. Flush exited patients to SQLite.
 
-          Standard steps (always run):
+          Clinical steps (always run, skipped on weekends):
             1. Process follow-up appointments due today.
             2. Generate new patient arrivals → route to queues.
-            3. For each provider: seat patients, route overflow, screen seen.
+            3. For each provider: collect all patients, screen them.
 
-        Weekends (day % 7 in {5, 6}) are skipped when cfg.SKIP_WEEKENDS is True —
-        the hospital does not perform screenings or appointments on Saturdays/Sundays.
-        Day 0 is treated as Monday. Mortality sweeps and DB flushes still run on
-        weekends so background processes are unaffected.
-        Source: AiP Parameters PDF — "skip_weekends: true"
+        Weekends (day % 7 in {5, 6}) are skipped when cfg.SKIP_WEEKENDS is True.
+        Day 0 is treated as Monday.
         """
         # ── Weekend skip ──────────────────────────────────────────────────────
         # Only the clinical steps (arrivals + provider queues) are suppressed.
-        # Background maintenance (mortality, DB flush, year checkpoint) still runs.
+        # Life events and DB flush still run on weekends (death doesn't wait).
         is_weekend = cfg.SKIP_WEEKENDS and (day % 7 >= 5)  # 5=Saturday, 6=Sunday
 
         if self.use_stable_population:
-            # Mortality sweep — runs every MORTALITY_CHECK_DAYS
-            if (day - self._last_mortality_day) >= cfg.MORTALITY_CHECK_DAYS:
-                self._mortality_sweep(day)
-                self._last_mortality_day = day
-
-            # Spawn new entrants to replace those who exited since last tick
-            self._spawn_replacement_entrants(day)
+            # Process life events due today
+            self._process_life_events(day)
 
             # Flush exited patients to SQLite in batches
             self._flush_exited_patients(day=day)
@@ -662,10 +581,25 @@ class SimulationRunner:
         # Annual checkpoint — record cumulative stats at each year boundary
         if day > 0 and day % 365 == 0:
             year = day // 365
+
+            # Count established patients who are *due* for screening today.
+            # This gives the correct denominator for uptake rate charts
+            # (total eligible ≠ due, because screening intervals are 3-5 yrs).
+            due_cerv = due_lung = 0
+            if self.use_stable_population:
+                for p in self._established_pool:
+                    if p.active:
+                        if is_eligible_cervical(p) and is_due_for_screening(p, "cervical", day):
+                            due_cerv += 1
+                        if is_eligible_lung(p) and is_due_for_screening(p, "lung", day):
+                            due_lung += 1
+
             self.metrics["year_checkpoints"].append({
                 "year":                year,
                 "day":                 day,
                 "pool_size":           len(self._established_pool) if self.use_stable_population else None,
+                "due_cervical":        due_cerv,
+                "due_lung":            due_lung,
                 # Screening volumes — overall and by first-stage test modality
                 "cum_cervical":        self.metrics["n_screened"]["cervical"],
                 "cum_cervical_est":    self.metrics["n_screened_established"]["cervical"],
@@ -679,12 +613,29 @@ class SimulationRunner:
                 "cum_leep":            self.metrics["n_treatment"].get("leep", 0),
                 "cum_treated":         self.metrics["n_treated"],
                 "cum_ltfu":            self.metrics["n_ltfu"],
+                # LTFU by queue stage
+                "cum_ltfu_queue_primary":   self.metrics["ltfu_queue_primary"],
+                "cum_ltfu_queue_secondary": self.metrics["ltfu_queue_secondary"],
+                "cum_ltfu_queue_treatment": self.metrics["ltfu_queue_treatment"],
+                "cum_ltfu_unscreened":      self.metrics["ltfu_unscreened"],
+                # Eligibility denominators
+                "cum_cervical_eligible":    self.metrics["n_eligible"].get("cervical", 0),
+                "cum_lung_eligible":        self.metrics.get("lung_eligible", 0),
+                "cum_lung_referral_placed": self.metrics.get("lung_referral_placed", 0),
+                "cum_lung_biopsy_referral": self.metrics.get("lung_biopsy_referral", 0),
                 # Lung pathway milestones
                 "cum_lung_biopsy":     self.metrics["lung_biopsy_completed"],
                 "cum_lung_treatment":  self.metrics["lung_treatment_given"],
                 # Population exits
                 "cum_mortality":       self.metrics.get("mortality_count", 0),
                 "cum_n_patients":      self.metrics["n_patients"],
+                "cum_exited":          self.metrics["n_exited"],
+                "cum_exits_by_reason": dict(self.metrics["exits_by_reason"]),
+                "cum_arrivals":        sum(self.metrics["arrivals_by_source"].values()),
+                # Procedure queue snapshot
+                "procedure_queue_depth": self._queues.procedure_queue_depth(day),
+                "screening_queue_depth": self._queues.screening_queue_depth(day),
+                "procedure_overflow":    dict(self._queues.procedure_overflow),
             })
 
         # Clinical steps — skipped on weekends (no hospital screenings/appointments)
@@ -696,29 +647,52 @@ class SimulationRunner:
             # 2. New arrivals
             self._generate_arrivals(day)
 
-            # 3. Provider queues
-            for provider in _ALL_PROVIDERS:
-                seen, overflow = self._queues.process_day(provider, day)
-
-                self.metrics.setdefault("overflow", defaultdict(int))
-                self.metrics["overflow"][provider] += len(overflow)
-
-                self._route_overflow(overflow, provider, day)
+            # 3. Provider queues — proportional split, no provider-level
+            #    capacity constraint.  Real bottleneck is at procedure slots.
+            #    Outpatients (PCP/GYN/Specialist) are processed BEFORE
+            #    drop-ins (ER) so they get first priority on primary
+            #    screening slots.
+            for provider in _NON_ER + ["er"]:
+                seen = self._queues.process_day(provider, day)
 
                 for p in seen:
-                    p.wait_days = day - p.day_created
-                    # No-show gate — only for scheduled outpatients at non-ER providers.
-                    # Drop-ins are walk-ins who have already arrived, so no-show doesn't apply.
-                    # ER has no scheduled outpatient slots (OUTPATIENT_FRACTION = 0).
-                    if (
-                        p.patient_type == "outpatient"
-                        and provider != "er"
-                        and random.random() < cfg.NO_SHOW_PROB.get(provider, 0.0)
-                    ):
-                        self._handle_noshow(p, provider, day)
+                    p.wait_days = 0  # reset — no queue delay until overflow
+
+                    # Provider → screening delay: screening appointment is
+                    # scheduled cfg.TURNAROUND_DAYS["provider_to_screening"]
+                    # days after the provider visit.
+                    delay = cfg.TURNAROUND_DAYS.get("provider_to_screening", 0)
+                    if delay > 0:
+                        self._queues.schedule_followup(
+                            p, {"cancer": "_all", "step": "provider_screening",
+                                 "referral_day": day}, day + delay
+                        )
                     else:
-                        p.noshow_count = 0   # reset streak on successful attendance
                         self._screen_patient(p, day)
+
+            # Flush daily demand counters (post-warmup only)
+            if day >= self._warmup_day:
+                if self._day_screening_demand > 0 or self._day_screening_supply > 0:
+                    self.metrics["daily_screening_demand"].append(
+                        (self._day_screening_demand,
+                         self._day_screening_supply,
+                         self._day_screening_overflow)
+                    )
+                if self._day_secondary_demand > 0 or self._day_secondary_supply > 0:
+                    self.metrics["daily_secondary_demand"].append(
+                        (self._day_secondary_demand,
+                         self._day_secondary_supply,
+                         self._day_secondary_overflow)
+                    )
+                if self._day_treatment_demand > 0 or self._day_treatment_supply > 0:
+                    self.metrics["daily_treatment_demand"].append(
+                        (self._day_treatment_demand,
+                         self._day_treatment_supply,
+                         self._day_treatment_overflow)
+                    )
+            self._day_screening_demand = self._day_screening_supply = self._day_screening_overflow = 0
+            self._day_secondary_demand = self._day_secondary_supply = self._day_secondary_overflow = 0
+            self._day_treatment_demand = self._day_treatment_supply = self._day_treatment_overflow = 0
 
     # =========================================================================
     # Arrivals
@@ -728,237 +702,62 @@ class SimulationRunner:
         """
         Create today's new patients and route them to provider queues.
 
-        Standard mode
-        -------------
-        Poisson draw of daily_rate new patients. Outpatients are scheduled
-        at the next free slot on or after (day + lead_time). Drop-ins and ER
-        patients go directly to today's drop-in queue.
-
-        Stable-population mode
-        ----------------------
-        Only new-entrant / replacement drop-ins are created here (at rate
-        cfg.NEW_PATIENT_DAILY_RATE). Established patients are NOT generated
-        here — they were pre-scheduled during warmup and then rescheduled
-        immediately after each visit. This separates the two flows cleanly.
+        In stable-population mode, arrivals come from distinct sources
+        defined in cfg.ARRIVAL_SOURCES — each with its own daily rate,
+        age range, and routing.  In standard mode, a single Poisson
+        process at self.daily_rate generates arrivals with mixed routing.
         """
-        if self.use_stable_population:
-            # Organic new patients: first-time visitors, women turning 21, new
-            # movers, etc. They arrive as drop-ins and are seen like any walk-in.
-            # After their first visit they join the established cycling pool
-            # (handled in _screen_patient) so they become regular annual patients.
-            # This is distinct from mortality replacements (_spawn_replacement_entrants).
-            rate = cfg.ORGANIC_NEW_PATIENT_DAILY_RATE
-        else:
-            rate = self.daily_rate
-
-        # Two-stage routing (matches NYP operational data):
-        #   1. ARRIVAL_TYPE_PROBS decides ER (20%) vs outpatient (80%)
-        #   2. Outpatients get a destination from DESTINATION_PROBS_OUTPATIENT
-        #      (0% ER — they see PCP/GYN/Specialist)
-        #   3. ER arrivals are always drop-in walk-ins
-        _arrival_keys = list(cfg.ARRIVAL_TYPE_PROBS.keys())
-        _arrival_w    = list(cfg.ARRIVAL_TYPE_PROBS.values())
         _op_dest_keys = list(cfg.DESTINATION_PROBS_OUTPATIENT.keys())
         _op_dest_w    = list(cfg.DESTINATION_PROBS_OUTPATIENT.values())
 
-        for _ in range(_poisson(rate)):
-            arrival = random.choices(_arrival_keys, weights=_arrival_w)[0]
+        if self.use_stable_population and hasattr(cfg, 'ARRIVAL_SOURCES'):
+            # ── Multi-source arrivals ─────────────────────────────────────
+            for source_name, source_cfg in cfg.ARRIVAL_SOURCES.items():
+                n = _poisson(source_cfg["daily_rate"])
+                age_range = source_cfg.get("age_range")
+                routing   = source_cfg.get("routing", "outpatient")
 
-            if arrival == "er":
-                dest  = "er"
-                ptype = "drop_in"
-                p = sample_patient(self._pid, day, dest, ptype)
-                self._pid += 1
-                self._queues.add_dropin(p, "er")
-            else:
-                dest  = random.choices(_op_dest_keys, weights=_op_dest_w)[0]
-                ptype = "outpatient"
-                p = sample_patient(self._pid, day, dest, ptype)
-                self._pid += 1
-                lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
-                earliest = day + random.randint(lo, hi)
-                self._queues.schedule_outpatient(p, dest, earliest)
+                for _ in range(n):
+                    if routing == "er":
+                        dest  = "er"
+                        ptype = "drop_in"
+                        p = sample_patient(self._pid, day, dest, ptype,
+                                           age_range=age_range)
+                        self._pid += 1
+                        self._queues.add_dropin(p, "er")
+                    else:
+                        dest  = random.choices(_op_dest_keys, weights=_op_dest_w)[0]
+                        ptype = "outpatient"
+                        p = sample_patient(self._pid, day, dest, ptype,
+                                           age_range=age_range)
+                        self._pid += 1
+                        lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
+                        earliest = day + random.randint(lo, hi)
+                        self._queues.schedule_outpatient(p, dest, earliest)
 
-    # =========================================================================
-    # Overflow routing
-    # =========================================================================
+                    self.metrics["arrivals_by_source"][source_name] += 1
+        else:
+            # ── Standard mode: single Poisson process ─────────────────────
+            _arrival_keys = list(cfg.ARRIVAL_TYPE_PROBS.keys())
+            _arrival_w    = list(cfg.ARRIVAL_TYPE_PROBS.values())
 
-    def _route_overflow(
-        self, overflow: list, provider: str, day: int
-    ) -> None:
-        """
-        Re-route patients who could not be seen today.
+            for _ in range(_poisson(self.daily_rate)):
+                arrival = random.choices(_arrival_keys, weights=_arrival_w)[0]
 
-        PCP / Gyno / Specialist:
-            → tomorrow's drop-in queue for the same provider.
-
-        ER:
-            ER_OVERFLOW_RETRY_PROB → tomorrow's ER drop-in queue.
-            otherwise              → scheduled outpatient at PCP / Gyno / Specialist,
-                                     earliest available slot.
-        """
-        for p in overflow:
-            if provider == "er":
-                if random.random() < cfg.ER_OVERFLOW_RETRY_PROB:
+                if arrival == "er":
+                    dest  = "er"
+                    ptype = "drop_in"
+                    p = sample_patient(self._pid, day, dest, ptype)
+                    self._pid += 1
                     self._queues.add_dropin(p, "er")
                 else:
-                    # Route to a non-ER provider weighted by DESTINATION_PROBS
-                    # (excluding ER's share, redistributed proportionally).
-                    # Previously used uniform random.choice — fixed to match the
-                    # population-level provider distribution.
-                    non_er_probs = {
-                        k: v for k, v in cfg.DESTINATION_PROBS.items()
-                        if k != "er"
-                    }
-                    alt      = random.choices(
-                        list(non_er_probs.keys()),
-                        weights=list(non_er_probs.values()),
-                    )[0]
-                    lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(alt, (1, 7))
+                    dest  = random.choices(_op_dest_keys, weights=_op_dest_w)[0]
+                    ptype = "outpatient"
+                    p = sample_patient(self._pid, day, dest, ptype)
+                    self._pid += 1
+                    lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
                     earliest = day + random.randint(lo, hi)
-                    self._queues.schedule_outpatient(p, alt, earliest)
-            else:
-                self._queues.add_dropin(p, provider)
-
-    # =========================================================================
-    # No-show handling
-    # =========================================================================
-
-    def _handle_noshow(self, p: Patient, provider: str, day: int) -> None:
-        """
-        Process a missed outpatient appointment for one patient.
-
-        Flow
-        ----
-        1. Increment noshow_count and record the event.
-        2. Apply cumulative exit draw (NOSHOW_CUMULATIVE_EXIT_PROB).
-           Probability rises with each consecutive miss.  If the patient exits
-           here they are classified as lost_to_followup immediately.
-        3. If they survive the cascade, draw NOT_SEEN_PROBS disposition:
-             - reschedule  → re-book at RESCHEDULE_DELAY_DAYS from today
-             - exit        → permanent lost_to_followup
-             - wait        → attempt outreach (_apply_outreach); if outreach
-                             also returns "wait", draw UNSCREENED_FATE to
-                             decide between overdue-pool entry and permanent exit
-        """
-        # Guard: dead / attrition patients may have pre-booked visits still in
-        # the queue.  Skip them silently — they already exited the system.
-        if not p.active:
-            return
-
-        p.noshow_count           += 1
-        self.metrics["n_noshow"] += 1
-        p.log(day, f"NO-SHOW at {provider} (streak={p.noshow_count})")
-
-        # ── Step 1: cumulative exit cascade ───────────────────────────────────
-        exit_probs = cfg.NOSHOW_CUMULATIVE_EXIT_PROB
-        idx        = min(p.noshow_count - 1, len(exit_probs) - 1)
-        if random.random() < exit_probs[idx]:
-            p.exit_system(day, "lost_to_followup")
-            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
-            self.metrics["n_noshow_exit"]   += 1
-            self.metrics["ltfu_unscreened"] += 1
-            if p.is_established:
-                self._flush_buffer.append(p)
-            self._pending_replacement_exits += 1
-            p.log(day, "NOSHOW CASCADE EXIT — lost_to_followup")
-            return
-
-        # ── Step 2: post-no-show disposition draw ─────────────────────────────
-        # NOT_SEEN_PROBS covers only pcp and gynecologist; fall back to pcp for others
-        probs_dict = cfg.NOT_SEEN_PROBS.get(provider, cfg.NOT_SEEN_PROBS.get("pcp", {}))
-        fate       = random.choices(
-            list(probs_dict.keys()), weights=list(probs_dict.values()), k=1
-        )[0]
-
-        if fate == "reschedule":
-            delay = cfg.RESCHEDULE_DELAY_DAYS.get(provider, cfg.RESCHEDULE_DELAY_DAYS["default"])
-            self._queues.schedule_outpatient(p, p.destination, day + delay)
-            p.log(day, f"NO-SHOW → reschedule in {delay} days")
-
-        elif fate == "exit":
-            p.exit_system(day, "lost_to_followup")
-            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
-            self.metrics["ltfu_unscreened"] += 1
-            if p.is_established:
-                self._flush_buffer.append(p)
-            self._pending_replacement_exits += 1
-            p.log(day, "NO-SHOW → immediate exit (lost_to_followup)")
-
-        else:  # "wait"
-            outreach_fate = self._apply_outreach(p, day)
-            if outreach_fate == "wait":
-                # Outreach also failed — draw UNSCREENED_FATE for long-term disposition
-                final = random.choices(
-                    list(cfg.UNSCREENED_FATE.keys()),
-                    weights=list(cfg.UNSCREENED_FATE.values()), k=1
-                )[0]
-                if final == "exit_system":
-                    p.exit_system(day, "lost_to_followup")
-                    record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
-                    self.metrics["ltfu_unscreened"] += 1
-                    if p.is_established:
-                        self._flush_buffer.append(p)
-                    self._pending_replacement_exits += 1
-                    p.log(day, "NO-SHOW → outreach wait → UNSCREENED_FATE: permanent exit")
-                else:  # "may_return_later"
-                    # Patient stays alive in pool; overdue sweep monitors for re-entry
-                    p.overdue_since_day = day
-                    p.log(day, f"NO-SHOW → outreach wait → overdue pool (entry day {day})")
-
-    # =========================================================================
-    # Outreach
-    # =========================================================================
-
-    def _apply_outreach(self, p: Patient, day: int) -> str:
-        """
-        Attempt one outreach contact for a patient who missed their appointment
-        or is sitting in the overdue pool.
-
-        The probability distribution over outcomes is read from OUTREACH_PROBS
-        keyed by WORKFLOW_MODE:
-          - "coordinated"  → "with_navigation" (higher reschedule rate)
-          - anything else  → "without_outreach" (lower reschedule rate)
-
-        Returns the fate string: "reschedule" | "exit" | "wait".
-
-        Side effects:
-          - "reschedule" → books a new appointment, clears overdue_since_day,
-                           resets noshow_count.
-          - "exit"       → exits patient as lost_to_followup, increments
-                           replacement counter.
-          - "wait"       → no side effects; caller handles the unresolved state.
-        """
-        if cfg.WORKFLOW_MODE == "coordinated":
-            probs_dict = cfg.OUTREACH_PROBS["with_navigation"]
-        else:
-            probs_dict = cfg.OUTREACH_PROBS["without_outreach"]
-
-        fate = random.choices(
-            list(probs_dict.keys()), weights=list(probs_dict.values()), k=1
-        )[0]
-
-        if fate == "reschedule":
-            self._queues.schedule_outpatient(
-                p, p.destination, day + cfg.REENTRY_DELAY_DAYS
-            )
-            p.overdue_since_day = None
-            p.noshow_count      = 0
-            p.log(day, f"OUTREACH → reschedule in {cfg.REENTRY_DELAY_DAYS} days")
-
-        elif fate == "exit":
-            p.exit_system(day, "lost_to_followup")
-            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
-            self.metrics["ltfu_unscreened"] += 1
-            if p.is_established:
-                self._flush_buffer.append(p)
-            self._pending_replacement_exits += 1
-            p.log(day, "OUTREACH → exit (lost_to_followup)")
-
-        else:  # "wait"
-            p.log(day, "OUTREACH → no response (still waiting)")
-
-        return fate
+                    self._queues.schedule_outpatient(p, dest, earliest)
 
     # =========================================================================
     # Screening
@@ -977,22 +776,28 @@ class SimulationRunner:
 
         Abnormal results trigger a follow-up appointment queued for a future day.
         """
-        # Guard: patient may have been killed by the mortality sweep between
-        # being placed in the outpatient queue and today's processing.
+        # Guard: patient may have died or exited between being scheduled and today.
         if not p.active:
             return
 
+        # Update age (arithmetic — not a draw)
+        if p.is_established:
+            p.age = p.age_at_entry + (day - p.simulation_entry_day) // 365
+
         eligible = get_eligible_screenings(p)
-        self.metrics["n_patients"] += 1
-        self.metrics["entries_by_destination"][p.destination] += 1
-        self.metrics["entries_by_type"][p.patient_type] += 1
+        _post_warmup = day >= self._warmup_day
+        if _post_warmup:
+            self.metrics["n_patients"] += 1
+            self.metrics["entries_by_destination"][p.destination] += 1
+            self.metrics["entries_by_type"][p.patient_type] += 1
 
         # Track total provider contacts for longitudinal analysis
         if self.use_stable_population:
             p.visit_count += 1
 
         if not eligible:
-            self.metrics["n_unscreened"] += 1
+            if _post_warmup:
+                self.metrics["n_unscreened"] += 1
 
             # Find the soonest day this patient will become eligible for any
             # active cancer.  Three cases:
@@ -1010,7 +815,8 @@ class SimulationRunner:
             if soonest > 0:
                 if p.is_established:
                     self._queues.schedule_outpatient(p, p.destination, day + soonest)
-                    self.metrics["n_reschedule"] += 1
+                    if _post_warmup:
+                        self.metrics["n_reschedule"] += 1
                     p.log(day, f"NOT YET ELIGIBLE — return visit scheduled in {soonest} days")
                 else:
                     # Non-established patients (organic arrivals, ER drop-ins) who
@@ -1021,36 +827,57 @@ class SimulationRunner:
                     # patients complete their one-time visit and exit; they may return
                     # naturally as a future organic arrival.
                     p.exit_system(day, "ineligible")
-                    record_exit(self.metrics, "ineligible")
+                    record_exit(self.metrics, "ineligible", patient=p, current_day=day)
                     p.log(day, f"NOT YET ELIGIBLE — non-established, exiting (soonest={soonest}d)")
                 return
             elif p.is_established:
                 # Permanently ineligible established patients (aged out of all
-                # screenings, no cervix, quit window closed) exit the pool and
-                # trigger a replacement younger entrant. This models the real
-                # inflow of women newly entering the eligible age range,
-                # keeping the pool's age distribution realistic over 70 years.
-                p.log(day, "INELIGIBLE for all cancers — exiting pool, replacement queued")
+                # screenings, no cervix, quit window closed) exit the pool.
+                p.log(day, "INELIGIBLE for all cancers — exiting pool")
                 p.exit_system(day, "ineligible")
-                record_exit(self.metrics, "ineligible")
+                record_exit(self.metrics, "ineligible", patient=p, current_day=day)
                 self._flush_buffer.append(p)
-                self._pending_new_entries += 1
             else:
                 # One-time / new patient permanently ineligible → exit silently;
                 # no LTFU revenue impact because no screening was warranted.
                 p.exit_system(day, "ineligible")
-                record_exit(self.metrics, "ineligible")
+                record_exit(self.metrics, "ineligible", patient=p, current_day=day)
             return
 
-        self.metrics["n_eligible_any"] += 1
-        for c in eligible:
-            self.metrics["n_eligible"][c] += 1
+        if _post_warmup:
+            self.metrics["n_eligible_any"] += 1
+            for c in eligible:
+                self.metrics["n_eligible"][c] += 1
 
         for cancer in eligible:
             if not p.active:
                 break
 
-            result = run_screening_step(p, cancer, day, self.metrics)
+            # Check if patient is actually due before consuming a slot.
+            # (Eligible ≠ due — cervical intervals are 3-5 years.)
+            if not is_due_for_screening(p, cancer, day):
+                continue
+
+            # Assign test modality, then check procedure slot availability.
+            # If no slot today, reschedule for tomorrow rather than skipping.
+            # Primary screenings compete for slots — PCP/GYN/Specialist are
+            # processed before ER, so scheduled patients get priority.
+            test = assign_screening_test(p, cancer)
+            self._day_screening_demand += 1
+            if not self._queues.consume_slot(test, day):
+                self._day_screening_overflow += 1
+                # Preserve original referral day across multiple retries
+                orig_ref = day - p.wait_days if p.wait_days > 0 else day  # first overflow: today; retries: original day
+                self._queues.schedule_followup(
+                    p, {"cancer": cancer, "step": "screening_retry",
+                         "referral_day": orig_ref}, day + 1
+                )
+                p.log(day, f"NO SLOT for {test} — rescheduled to day {day + 1}")
+                continue
+
+            self._day_screening_supply += 1
+            result = run_screening_step(p, cancer, day, self.metrics,
+                                        test_override=test)
 
             if result is None:
                 # Two distinct cases when run_screening_step returns None:
@@ -1074,31 +901,43 @@ class SimulationRunner:
                         # Do NOT call record_exit — that counts system-level
                         # exits and would inflate totals since the same patient
                         # can hit pathway LTFU multiple times over 70 years.
-                        # The LTFU sub-bucket (ltfu_post_abnormal, etc.) was
-                        # already incremented by the screening/followup function.
+                        # The LTFU is counted by record_exit when it fires.
                         p.active      = True
                         p.exit_reason = None
                         p.exit_day    = None
                         # Reschedule BEFORE returning so the annual cycle continues
                         self._reschedule_established(p, day)
                     else:
-                        record_exit(self.metrics, p.exit_reason)
+                        record_exit(self.metrics, p.exit_reason, patient=p, current_day=day)
                         return   # non-established exits permanently
                     return       # LTFU handled — skip remaining cancers today
                 # Case B: no exit_reason → simple skip; continue to next cancer
                 continue
 
-            record_screening(self.metrics, p, cancer, result)
-            self.metrics["wait_times"]["screening_seen"].append(p.wait_days)
+            record_screening(self.metrics, p, cancer, result, current_day=day)
+            # Wait = days queued for a procedure slot (0 if got slot on first attempt).
+            if p.wait_days > 0 and day >= self._warmup_day:
+                self.metrics["wait_times"][test].append(p.wait_days)
 
-            # ── Schedule follow-up ─────────────────────────────────────────────
+            # ── Schedule result routing after lab turnaround delay ────────────
+            # Results are not available instantly — the lab/radiology processing
+            # time from cfg.TURNAROUND_DAYS must elapse before the patient is
+            # notified and follow-up actions are scheduled.
             if cancer == "cervical":
-                self._route_cervical_followup(p, result, day)
+                turnaround = cfg.TURNAROUND_DAYS.get(test, 7)
+                self._queues.schedule_followup(
+                    p, {"cancer": "cervical", "step": "result_routing",
+                         "result": result, "referral_day": day},
+                    day + turnaround
+                )
 
             elif cancer == "lung":
-                # Result routing (communication + RADS classification) happens
-                # on the same day as LDCT.  Biopsy, if needed, is a future appt.
-                self._lung_result_routing(p, day)
+                turnaround = cfg.TURNAROUND_DAYS.get("ldct_notification", 5)
+                self._queues.schedule_followup(
+                    p, {"cancer": "lung", "step": "result_routing",
+                         "referral_day": day},
+                    day + turnaround
+                )
 
         # ── Reschedule established patients for next annual visit ──────────────
         # Runs after all cancer loops complete (whether or not screening occurred).
@@ -1107,36 +946,23 @@ class SimulationRunner:
         if self.use_stable_population and p.is_established and p.active:
             self._reschedule_established(p, day)
 
-        # ── Open-loop: convert first-time visitors into established patients ───
+        # ── Convert first-time visitors into established patients ─────────────
         # Organic new patients (from _generate_arrivals) arrive as drop-ins with
         # is_established=False. After their first successful visit, they join the
         # established cycling pool so they become regular annual patients.
-        # Pool cap (SIMULATED_POPULATION) is enforced — if the pool is already at
-        # target size (maintained by mortality replacement), the patient completes
-        # their visit but does not join the cycling cohort.
-        #
-        # To maintain demographic equilibrium, converted patients are re-stamped
-        # with a young replacement age (mean ~33) rather than keeping their
-        # Census-drawn age. This prevents the pool from aging over time, which
-        # would cause mortality to trend upward across the 70-year horizon.
+        # No pool cap — the pool size is emergent (arrivals vs. exits).
+        # Patients keep their Census-drawn age (no re-stamping).
         elif (
             self.use_stable_population
             and not p.is_established
             and p.active
-            and len(self._established_pool) < cfg.SIMULATED_POPULATION
         ):
-            # Re-stamp age to replacement distribution so conversions don't
-            # age the pool the way Census-stock arrivals (mean ~51) would.
-            from population import _sample_replacement_age
-            p.age              = _sample_replacement_age()
-            p.age_at_entry     = p.age
+            p.age_at_entry         = p.age
             p.is_established       = True
             p.simulation_entry_day = day
 
             # ER patients who join the established pool must be reassigned
-            # to a non-ER regular provider — ER is for unplanned visits only,
-            # not annual cycling.  Uses the same distribution as the initial
-            # established population (_sample_established_destination).
+            # to a non-ER regular provider — ER is for unplanned visits only.
             if p.destination == "er":
                 from population import _sample_established_destination
                 p.destination  = _sample_established_destination()
@@ -1144,11 +970,10 @@ class SimulationRunner:
 
             self._established_pool.append(p)
 
-            # Book the full ADVANCE_SCHEDULE_YEARS window from scratch, mirroring
-            # _spawn_replacement_entrants. _reschedule_established only extends
-            # the FAR END of an existing window (years 1–N already booked), so
-            # calling it here would only add year-5 and leave years 1–4 unbooked —
-            # the patient would then go 5 years without a visit.
+            # Schedule independent life events for the new established patient
+            self._schedule_life_events(p, entry_day=day)
+
+            # Book the full ADVANCE_SCHEDULE_YEARS window from scratch.
             first_visit   = day + cfg.ANNUAL_VISIT_INTERVAL
             first_booked  = self._queues.schedule_outpatient(p, p.destination, first_visit)
             p.next_visit_day = first_booked
@@ -1158,7 +983,7 @@ class SimulationRunner:
                 )
             p.log(
                 day,
-                f"FIRST VISIT COMPLETE — joined established cycling pool (age re-stamped to {p.age}); "
+                f"FIRST VISIT COMPLETE — joined established pool (age {p.age}); "
                 f"scheduled years 1–{cfg.ADVANCE_SCHEDULE_YEARS} "
                 f"(next visit day {first_booked})"
             )
@@ -1184,11 +1009,11 @@ class SimulationRunner:
         automatically pushes to the next free day — so no day is ever
         overfilled.
 
-        This generates `cfg.SIMULATED_POPULATION` patients, advancing
-        self._pid so subsequent arrivals have non-colliding IDs.
+        The pool size after seeding is NOT maintained — it grows or shrinks
+        organically as arrivals join and patients exit.
         """
         pool = generate_established_population(
-            n         = cfg.SIMULATED_POPULATION,
+            n         = cfg.INITIAL_POOL_SIZE,
             start_pid = self._pid,
             entry_day = 0,
         )
@@ -1208,125 +1033,112 @@ class SimulationRunner:
                     p, p.destination, booked_day + yr * cfg.ANNUAL_VISIT_INTERVAL
                 )
 
-        self._established_pool = pool
+            # Schedule independent life events (mortality, attrition, etc.)
+            self._schedule_life_events(p, entry_day=0)
 
-        # Verify capacity contract holds across the entire warmup schedule
-        violations = self._queues.validate_capacity(raise_on_violation=True)
-        assert not violations, f"Warmup produced {len(violations)} capacity violations."
+        self._established_pool = pool
 
         print(
             f"[INIT] Stable population: {len(pool):,} established patients "
-            f"scheduled across {warmup} warmup days.  Capacity check: OK."
+            f"scheduled across {warmup} warmup days."
         )
 
-    def _mortality_sweep(self, day: int) -> None:
+    def _process_life_events(self, day: int) -> None:
         """
-        Age all established patients and apply a Bernoulli mortality draw.
+        Process all life events scheduled for today.
 
-        Called every cfg.MORTALITY_CHECK_DAYS days. For each established patient:
-          1. Update age from age_at_entry + elapsed years (integer years only).
-          2. Draw mortality (age-adjusted annual rate scaled to sweep interval).
-          3. If the patient dies: exit them, remove from pool, buffer for DB flush.
-
-        Patients who survive the draw remain in the pool unchanged.
-
-        The number of deaths is recorded in metrics["mortality_count"] and
-        added to self._pending_new_entries so the replacement flow (
-        _spawn_replacement_entrants) can create matching new drop-ins.
+        Life events are pre-drawn at patient entry and fire independently of
+        visits.  Each event type is handled here; exited patients are collected
+        in _pool_removals and batch-purged from the pool periodically (every
+        30 days) to avoid O(n) list.remove() on every single event.
         """
-        sweep_days  = day - self._last_mortality_day if self._last_mortality_day > 0 else cfg.MORTALITY_CHECK_DAYS
-        survivors       = []
-        death_count     = 0
-        attrition_count = 0
-
-        year_fraction = sweep_days / 365.0
-
-        for p in self._established_pool:
-            # 1. Age the patient (integer years elapsed since pool entry)
-            years_elapsed = (day - p.simulation_entry_day) // 365
-            p.age = p.age_at_entry + years_elapsed
-
-            # Skip patients already exited between sweeps (e.g. aged out in _screen_patient)
+        for p, event_type in self._queues.get_due_life_events(day):
             if not p.active:
-                self._flush_buffer.append(p)
-                continue
+                continue  # already exited via an earlier event
 
-            # 2. Update time-varying attributes that affect screening eligibility
-            if p.smoker:
-                # Accumulate pack-years (1 pack-year per year of smoking)
-                p.pack_years += year_fraction
-                # Smoking cessation draw
-                if random.random() < cfg.ANNUAL_SMOKING_CESSATION_PROB * year_fraction:
-                    p.smoker          = False
-                    p.years_since_quit = 0.0
-            elif p.pack_years > 0:
-                # Former smoker — advance years-since-quit; lose lung eligibility after 15 yrs
-                p.years_since_quit += year_fraction
+            # Update age to current day (arithmetic, not a draw)
+            p.age = p.age_at_entry + (day - p.simulation_entry_day) // 365
 
-            # HPV clearance — affects cervical result probabilities
-            if p.hpv_positive:
-                if random.random() < cfg.ANNUAL_HPV_CLEARANCE_PROB * year_fraction:
-                    p.hpv_positive = False
-
-            # 3. Mortality draw
-            if draw_mortality(p, sweep_days=sweep_days):
+            if event_type == "mortality":
                 p.exit_system(day, "mortality")
                 record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                if day >= self._warmup_day:
+                    self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
+                    self.metrics["exits_by_source"]["mortality"] += 1
                 self._flush_buffer.append(p)
-                death_count += 1
-                continue
+                self._pool_removals.add(id(p))
 
-            # 3b. Non-clinical attrition (moved, switched provider, insurance change)
-            attrition_prob = cfg.ANNUAL_ATTRITION_RATE * year_fraction
-            if random.random() < attrition_prob:
-                p.exit_system(day, "attrition")
+            elif event_type == "attrition":
+                subtype = p.attrition_subtype or "attrition"
+                p.exit_system(day, f"attrition:{subtype}")
                 record_exit(self.metrics, "attrition", patient=p, current_day=day)
+                if day >= self._warmup_day:
+                    self.metrics["exits_by_source"][subtype] += 1
                 self._flush_buffer.append(p)
-                attrition_count += 1
-                continue
+                self._pool_removals.add(id(p))
 
-            # 4. Overdue pool check — patients who missed visits and are waiting
-            if p.overdue_since_day is not None:
-                days_overdue = day - p.overdue_since_day
-                max_overdue  = max(cfg.MAX_OVERDUE_DAYS.values())
-                if days_overdue > max_overdue:
-                    # Patient has been unreachable beyond the maximum — permanent exit
-                    p.exit_system(day, "lost_to_followup")
-                    record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
-                    self.metrics["n_overdue_exit"]    += 1
-                    self.metrics["ltfu_unscreened"]   += 1
-                    self._flush_buffer.append(p)
-                    self._pending_replacement_exits   += 1
-                    p.log(day, f"OVERDUE EXIT — {days_overdue} days overdue (max={max_overdue})")
-                    continue  # skip survivors.append — patient is gone
-                else:
-                    # Monthly outreach attempt for overdue patients
-                    fate = self._apply_outreach(p, day)
-                    if fate == "wait":
-                        # Outreach didn't re-engage — try spontaneous re-entry draw
-                        # Scale daily probability to the sweep interval
-                        daily_prob   = cfg.DAILY_REENTRY_PROB.get("cervical", 0.0013)
-                        reentry_prob = 1.0 - (1.0 - daily_prob) ** sweep_days
-                        if random.random() < reentry_prob:
-                            p.overdue_since_day = None
-                            self._queues.schedule_outpatient(
-                                p, p.destination, day + cfg.REENTRY_DELAY_DAYS
-                            )
-                            self.metrics["n_spontaneous_reentry"] += 1
-                            p.log(day, "OVERDUE — spontaneous re-entry; rescheduled")
-                survivors.append(p)
+            elif event_type == "smoking_cessation":
+                if p.smoker:  # guard — may have exited or already quit
+                    # Accumulate pack-years up to quit day
+                    years_smoked = (day - p.simulation_entry_day) / 365.0
+                    p.pack_years += years_smoked
+                    p.smoker           = False
+                    p.years_since_quit = 0.0
 
-        self._established_pool = survivors
-        self._pending_new_entries += death_count + attrition_count
-        # Absorb non-mortality replacement exits accumulated since last sweep
-        self._pending_new_entries       += self._pending_replacement_exits
-        self._pending_replacement_exits  = 0
+            elif event_type == "hpv_clearance":
+                if p.hpv_positive:
+                    p.hpv_positive = False
 
-        if death_count > 0:
-            self.metrics["mortality_count"] += death_count
+        # Batch-purge exited patients from the pool every 30 days
+        # (single O(n) filter pass instead of per-event O(n) remove)
+        if day % 30 == 0 and self._pool_removals:
+            self._established_pool = [
+                p for p in self._established_pool
+                if id(p) not in self._pool_removals
+            ]
+            self._pool_removals.clear()
 
-        # Snapshot pool size for longitudinal pool-stability plots
-        self.metrics["pool_size_snapshot"].append((day, len(self._established_pool)))
+        # Pool-size snapshot (sample every 30 days to keep metrics lean)
+        if day % 30 == 0:
+            self.metrics["pool_size_snapshot"].append(
+                (day, len(self._established_pool))
+            )
+
+    def _schedule_life_events(self, p: "Patient", entry_day: int) -> None:
+        """
+        Draw and schedule all independent life events for a patient at entry.
+
+        Called once per patient — at population init for established patients,
+        and at organic conversion for new arrivals.
+        """
+        n_days = self.n_days  # don't schedule beyond simulation horizon
+
+        # Mortality — Gompertz draw
+        death_day = draw_death_day(p, entry_day)
+        p.scheduled_death_day = death_day
+        if death_day < n_days:
+            self._queues.schedule_life_event(p, "mortality", death_day)
+
+        # Attrition — competing-risks draw across EXIT_SOURCES
+        att_day, att_subtype = draw_attrition_day(entry_day)
+        p.scheduled_attrition_day = att_day
+        p.attrition_subtype       = att_subtype
+        if att_day < n_days and att_day < death_day:  # no attrition after death
+            self._queues.schedule_life_event(p, "attrition", att_day)
+
+        # Smoking cessation (only for current smokers)
+        if p.smoker:
+            cess_day = draw_cessation_day(entry_day)
+            p.scheduled_cessation_day = cess_day
+            if cess_day < n_days and cess_day < min(death_day, att_day):
+                self._queues.schedule_life_event(p, "smoking_cessation", cess_day)
+
+        # HPV clearance (only for HPV-positive patients)
+        if p.hpv_positive:
+            clear_day = draw_hpv_clearance_day(entry_day)
+            p.scheduled_hpv_clear_day = clear_day
+            if clear_day < n_days and clear_day < min(death_day, att_day):
+                self._queues.schedule_life_event(p, "hpv_clearance", clear_day)
 
     def _reschedule_established(self, p: Patient, day: int) -> None:
         """
@@ -1334,12 +1146,7 @@ class SimulationRunner:
 
         Called at the end of each visit (from _screen_patient). Schedules
         the patient as an outpatient at their same destination approximately
-        cfg.ANNUAL_VISIT_INTERVAL days from today. If that day's outpatient
-        slots are full, schedule_outpatient() pushes to the next free day.
-
-        The booked day is stored in p.next_visit_day for inspection /
-        debugging. The patient object itself is placed in the future
-        outpatient queue — so no separate pool management is needed.
+        cfg.ANNUAL_VISIT_INTERVAL days from today.
         """
         # Each visit, extend the advance-schedule window by one year at the far end.
         # The near-end appointments (years 1 through ADVANCE_SCHEDULE_YEARS-1 from now)
@@ -1354,66 +1161,6 @@ class SimulationRunner:
             f"ESTABLISHED — advance window extended to day {booked_far} "
             f"(year {booked_far // 365}); next visit ~day {p.next_visit_day}"
         ))
-
-    def _spawn_replacement_entrants(self, day: int) -> None:
-        """
-        Create new established patients to replace those removed by mortality.
-
-        Each replacement patient is added directly to _established_pool and
-        scheduled as an outpatient for the near future (1–14 days ahead),
-        maintaining the pool at exactly cfg.SIMULATED_POPULATION. This is
-        what makes the simulation a stable open-loop model:
-
-            Deaths exit the pool  →  replacements immediately fill the gap
-            Pool size stays constant across all 70 simulated years
-
-        The replacement patient has is_established=True so they participate
-        in mortality sweeps and annual rescheduling going forward.
-
-        Spawning is rate-limited to cfg.NEW_PATIENT_DAILY_RATE per day to
-        spread replacements smoothly rather than adding all deaths at once
-        on the mortality-sweep day (which would create unrealistic bursts).
-        """
-        if self._pending_new_entries <= 0:
-            return
-
-        # If organic new patients (from _generate_arrivals) have already filled
-        # the pool to target, we don't need additional replacements this day.
-        if len(self._established_pool) >= cfg.SIMULATED_POPULATION:
-            self._pending_new_entries = 0
-            return
-
-        # Spread replacements: spawn up to NEW_PATIENT_DAILY_RATE per day
-        # Cap so we never over-fill beyond SIMULATED_POPULATION
-        headroom = cfg.SIMULATED_POPULATION - len(self._established_pool)
-        to_spawn = min(self._pending_new_entries, cfg.NEW_PATIENT_DAILY_RATE, headroom)
-
-        for _ in range(to_spawn):
-            from population import _sample_established_destination
-            dest = _sample_established_destination()
-            p    = sample_replacement_patient(self._pid, day, dest, "outpatient")
-            self._pid += 1
-
-            # New replacement joins the established cycling pool
-            p.is_established       = True
-            p.age_at_entry         = p.age
-            p.simulation_entry_day = day
-
-            # Schedule their first visit in the next 1–14 days, then pre-book
-            # ADVANCE_SCHEDULE_YEARS - 1 subsequent annual visits so the replacement
-            # joins the multi-year advance schedule immediately.
-            earliest  = day + random.randint(1, 14)
-            booked    = self._queues.schedule_outpatient(p, dest, earliest)
-            p.next_visit_day = booked
-
-            for yr in range(1, cfg.ADVANCE_SCHEDULE_YEARS):
-                self._queues.schedule_outpatient(
-                    p, dest, booked + yr * cfg.ANNUAL_VISIT_INTERVAL
-                )
-
-            self._established_pool.append(p)
-
-        self._pending_new_entries -= to_spawn
 
     def _flush_exited_patients(self, day: int = 0, force: bool = False) -> None:
         """
@@ -1447,18 +1194,64 @@ class SimulationRunner:
         for the next day.
         """
         if not p.active:
+            # Record abandoned wait time for patients who died/attrited in queue
+            step = context.get("step", "")
+            referral_day = context.get("referral_day", day)
+            wait = day - referral_day
+            if day >= self._warmup_day:
+                if step == "screening_retry" and wait > 0:
+                    cancer = context.get("cancer", "unknown")
+                    test = assign_screening_test(p, cancer) if cancer != "unknown" else "unknown"
+                    self.metrics["wait_times_abandoned"][test].append(wait)
+                elif step in ("leep", "cone_biopsy", "colposcopy", "lung_biopsy") and wait > 0:
+                    self.metrics["wait_times_abandoned"][step].append(wait)
             return
 
         cancer = context["cancer"]
         step   = context["step"]
 
+        if step == "provider_screening":
+            # Provider → screening delay has elapsed. Run screening now.
+            self._screen_patient(p, day)
+            return
+
+        if step == "screening_retry":
+            referral = context.get("referral_day", day)
+            # Queue LTFU: daily hazard — patient may abandon while waiting
+            cancer_q = context.get("cancer", "unknown")
+            test_q = assign_screening_test(p, cancer_q) if cancer_q != "unknown" else "unknown"
+            if self._check_queue_ltfu(p, day, referral, "primary", test_q):
+                return
+
+            # Retry a primary screening that overflowed (no slot) yesterday.
+            p.wait_days = day - referral
+            self._screen_patient(p, day)
+            return
+
+        if step == "result_routing":
+            # Delayed result notification — lab turnaround has elapsed.
+            # Now route the result to the appropriate follow-up pathway.
+            if cancer == "cervical":
+                result = context.get("result", p.cervical_result)
+                self._route_cervical_followup(p, result, day)
+            elif cancer == "lung":
+                self._lung_result_routing(p, day)
+            return
+
+        referral_day = context.get("referral_day", day)
+
         if cancer == "cervical":
-            self._cervical_followup_step(p, step, day)
+            self._cervical_followup_step(p, step, day, referral_day, context)
         elif cancer == "lung":
             if step == "biopsy":
-                self._lung_biopsy_step(p, day)
+                self._lung_biopsy_step(p, day, referral_day)
             elif step == "repeat_ldct":
-                self._lung_repeat_ldct_step(p, day)
+                scheduled_delay = context.get("scheduled_delay", 0)
+                self._lung_repeat_ldct_step(p, day, referral_day, scheduled_delay)
+            elif step == "lung_post_treatment_surveillance":
+                treatment_day = context.get("treatment_day", referral_day)
+                visit_number  = context.get("visit_number", 0)
+                self._lung_post_treatment_surveillance_step(p, day, treatment_day, visit_number)
 
         if p.exit_reason:
             record_exit(self.metrics, p.exit_reason, patient=p, current_day=day)
@@ -1483,26 +1276,59 @@ class SimulationRunner:
             if random.random() >= cfg.HPV_POSITIVE_COLPOSCOPY_PROB:
                 p.log(day, "ROUTE HPV_POSITIVE → 1-year repeat cytology (low-risk mgmt)")
                 self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "one_year_repeat"}, day + 365
+                    p, {"cancer": "cervical", "step": "one_year_repeat",
+                         "referral_day": day}, day + 365
                 )
             else:
                 p.log(day, "ROUTE HPV_POSITIVE → colposcopy")
                 due = day + cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
                 self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "colposcopy"}, due
+                    p, {"cancer": "cervical", "step": "colposcopy",
+                         "referral_day": day}, due
                 )
         else:
             # ASCUS / LSIL / ASC-H / HSIL → colposcopy
             due = day + cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
             self._queues.schedule_followup(
-                p, {"cancer": "cervical", "step": "colposcopy"}, due
+                p, {"cancer": "cervical", "step": "colposcopy",
+                     "referral_day": day}, due
             )
 
+    def _check_queue_ltfu(self, p: Patient, day: int, referral_day: int,
+                          queue_type: str, procedure: str) -> bool:
+        """
+        Daily hazard LTFU check for patients in a procedure retry queue.
+        Returns True if patient abandoned (exited), False if still active.
+        queue_type: "primary" | "secondary" | "treatment"
+        """
+        key = f"queue_{queue_type}_daily"
+        ltfu_q = cfg.LTFU_PROBS.get(key, 0)
+        if ltfu_q > 0 and random.random() < ltfu_q:
+            wait = day - referral_day
+            if day >= self._warmup_day:
+                self.metrics["wait_times_abandoned"][procedure].append(wait)
+            p.log(day, f"LTFU queue — abandoned {procedure} after {wait}d")
+            p.exit_system(day, f"ltfu_queue_{queue_type}")
+            record_exit(self.metrics, "lost_to_followup", patient=p, current_day=day)
+            if day >= self._warmup_day:
+                self.metrics["n_ltfu"] += 1
+                self.metrics[f"ltfu_queue_{queue_type}"] += 1
+            if p.is_established:
+                self._flush_buffer.append(p)
+                self._pool_removals.add(id(p))
+            return True
+        return False
+
     def _cervical_followup_step(
-        self, p: Patient, step: str, day: int
+        self, p: Patient, step: str, day: int,
+        referral_day: int = 0, context: dict = None
     ) -> None:
         """
         Execute one cervical follow-up step and schedule the next if needed.
+
+        Wait time = pure queue delay only (days overflowed and retrying).
+        Computed as (day performed − referral_day) − scheduled follow-up delay,
+        so the configured FOLLOWUP_DELAY_DAYS is excluded.
 
         Steps in order:
           one_year_repeat → (colposcopy if still abnormal)
@@ -1510,14 +1336,19 @@ class SimulationRunner:
           leep / cone_biopsy → procedure slot consumed; treatment recorded by run_treatment
         """
         if step == "one_year_repeat":
+            # Queue LTFU check for secondary retry
+            if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "cytology"):
+                return
             # 1-year repeat cytology for HPV+ low-risk path.
-            # Runs cytology regardless of the standard 3-year interval because
-            # this appointment was explicitly scheduled by the HPV+ routing above.
+            self._day_secondary_demand += 1
             if not self._queues.consume_slot("cytology", day):
+                self._day_secondary_overflow += 1
                 self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "one_year_repeat"}, day + 1
+                    p, {"cancer": "cervical", "step": "one_year_repeat",
+                         "referral_day": referral_day}, day + 1
                 )
                 return
+            self._day_secondary_supply += 1
 
             # Force cytology — HPV-alone is not appropriate for the 1-year follow-up
             test                           = "cytology"
@@ -1526,41 +1357,310 @@ class SimulationRunner:
             p.last_cervical_screen_day     = day
             p.last_cervical_screening_test = test
             p.log(day, f"ONE-YEAR REPEAT CYTOLOGY → {result}")
-            record_screening(self.metrics, p, "cervical", result)
-            self.metrics["wait_times"]["screening_seen"].append(day - p.day_created)
+            record_screening(self.metrics, p, "cervical", result, current_day=day)
+            queue_wait = (day - referral_day) - 365  # subtract scheduled 1-year delay
+            if queue_wait > 0 and day >= self._warmup_day:
+                self.metrics["wait_times"]["one_year_repeat"].append(queue_wait)
             # Route the new cytology result: normal → done; abnormal → colposcopy
             self._route_cervical_followup(p, result, day)
 
         elif step == "colposcopy":
+            # Queue LTFU check for secondary retry
+            if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "colposcopy"):
+                return
+            self._day_secondary_demand += 1
             if not self._queues.consume_slot("colposcopy", day):
-                # No slot today — push to tomorrow
+                self._day_secondary_overflow += 1
+                # No slot today — push to tomorrow (FIFO: earliest referrals served first)
                 self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "colposcopy"}, day + 1
+                    p, {"cancer": "cervical", "step": "colposcopy",
+                         "referral_day": referral_day}, day + 1
                 )
                 return
+            self._day_secondary_supply += 1
 
-            self.metrics["wait_times"]["colposcopy"].append(day - p.day_created)
+            scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
+            queue_wait = (day - referral_day) - scheduled_delay
+            if queue_wait > 0 and day >= self._warmup_day:
+                self.metrics["wait_times"]["colposcopy"].append(queue_wait)
             cin = run_colposcopy(p, day, self.metrics)
             if cin is None:
                 return
 
-            disposition = run_treatment(p, day, self.metrics)
-
-            if disposition not in ("exit", "surveillance") and p.treatment_type:
-                ttype = p.treatment_type
-                due   = day + cfg.FOLLOWUP_DELAY_DAYS.get(ttype, 14)
+            # Delay pathology result by colposcopy_result turnaround days
+            result_delay = cfg.TURNAROUND_DAYS.get("colposcopy_result", 0)
+            if result_delay > 0:
                 self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": ttype}, due
+                    p, {"cancer": "cervical", "step": "colposcopy_result",
+                         "referral_day": day}, day + result_delay
                 )
+            else:
+                self._route_colposcopy_result(p, day)
+
+        elif step == "colposcopy_result":
+            # Pathology result turnaround has elapsed — route to treatment
+            self._route_colposcopy_result(p, day)
 
         elif step in ("leep", "cone_biopsy"):
+            # Queue LTFU check for treatment retry
+            if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "treatment", step):
+                return
+            self._day_treatment_demand += 1
             if not self._queues.consume_slot(step, day):
+                self._day_treatment_overflow += 1
                 self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": step}, day + 1
+                    p, {"cancer": "cervical", "step": step,
+                         "referral_day": referral_day}, day + 1
                 )
                 return
-            self.metrics["wait_times"][step].append(day - p.day_created)
-            # Treatment already recorded by run_treatment(); slot now consumed.
+            self._day_treatment_supply += 1
+            scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get(step, 14)
+            queue_wait = (day - referral_day) - scheduled_delay
+            if queue_wait > 0 and day >= self._warmup_day:
+                self.metrics["wait_times"][step].append(queue_wait)
+
+            # Post-treatment surveillance: schedule first follow-up per ASCCP guidelines
+            # (co-test at 6 months, then per POST_TREATMENT_SURVEILLANCE_CERVICAL schedule)
+            first_interval = self._get_post_treatment_interval("cervical", 0)
+            surv_due = day + first_interval
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "post_treatment_surveillance",
+                     "referral_day": day, "treatment_day": day,
+                     "visit_number": 0},
+                surv_due
+            )
+            p.log(day, f"POST-TREATMENT surveillance scheduled: first visit day {surv_due}")
+
+        elif step == "cin1_surveillance":
+            # CIN1/normal colposcopy: annual surveillance with resolution/escalation
+            clean_count = context.get("clean_count", 0) if context else 0
+            self._cin1_surveillance_step(p, day, referral_day, clean_count)
+
+        elif step == "post_treatment_surveillance":
+            # Post-LEEP/cone surveillance visit
+            treatment_day = context.get("treatment_day", referral_day) if context else referral_day
+            visit_number  = context.get("visit_number", 0) if context else 0
+            self._post_treatment_surveillance_step(p, day, treatment_day, visit_number)
+
+    def _route_colposcopy_result(self, p: Patient, day: int) -> None:
+        """Route colposcopy pathology result to treatment or surveillance."""
+        disposition = run_treatment(p, day, self.metrics)
+
+        if disposition == "surveillance":
+            # CIN1 or normal colposcopy → schedule 1-year surveillance repeat
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "cin1_surveillance",
+                     "referral_day": day, "clean_count": 0},
+                day + cfg.CIN1_SURVEILLANCE_INTERVAL_DAYS
+            )
+        elif disposition not in ("exit",) and p.treatment_type:
+            ttype = p.treatment_type
+            due   = day + cfg.FOLLOWUP_DELAY_DAYS.get(ttype, 14)
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": ttype,
+                     "referral_day": day}, due
+            )
+
+    def _cin1_surveillance_step(self, p: Patient, day: int,
+                                referral_day: int, clean_count: int) -> None:
+        """
+        CIN1 / normal colposcopy surveillance: annual cytology repeat.
+
+        At each visit, draw resolution vs escalation vs persistence:
+          - Resolved (clean): increment clean_count; if ≥ CIN1_MAX_CLEAN_VISITS,
+            return to routine screening via provider cycle.
+          - Escalated to CIN2/3: route to treatment (LEEP/cone).
+          - Persistent CIN1: schedule another surveillance visit in 1 year.
+        """
+        if not p.active:
+            return
+
+        # Consume a cytology slot for the surveillance visit
+        self._day_secondary_demand += 1
+        if not self._queues.consume_slot("cytology", day):
+            self._day_secondary_overflow += 1
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "cin1_surveillance",
+                     "referral_day": referral_day, "clean_count": clean_count},
+                day + 1
+            )
+            return
+        self._day_secondary_supply += 1
+
+        # Draw outcome
+        r = random.random()
+        if r < cfg.CIN1_RESOLUTION_PROB_PER_VISIT:
+            # Resolved
+            clean_count += 1
+            p.log(day, f"CIN1 SURVEILLANCE — resolved (clean {clean_count}/"
+                        f"{cfg.CIN1_MAX_CLEAN_VISITS_BEFORE_ROUTINE})")
+            record_screening(self.metrics, p, "cervical", "NORMAL", current_day=day)
+            if clean_count >= cfg.CIN1_MAX_CLEAN_VISITS_BEFORE_ROUTINE:
+                p.log(day, "CIN1 SURVEILLANCE — cleared, returning to routine screening")
+                p.current_stage = "routine"
+                p.colposcopy_result = None
+                # Patient returns to routine via normal annual provider cycle
+                return
+            # Not enough clean visits yet — schedule another surveillance
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "cin1_surveillance",
+                     "referral_day": day, "clean_count": clean_count},
+                day + cfg.CIN1_SURVEILLANCE_INTERVAL_DAYS
+            )
+
+        elif r < cfg.CIN1_RESOLUTION_PROB_PER_VISIT + cfg.CIN1_ESCALATION_PROB_PER_VISIT:
+            # Escalated to CIN2/3 — route to treatment
+            p.colposcopy_result = random.choice(["CIN2", "CIN3"])
+            p.log(day, f"CIN1 SURVEILLANCE — escalated to {p.colposcopy_result}")
+            record_screening(self.metrics, p, "cervical", p.colposcopy_result, current_day=day)
+            self._route_colposcopy_result(p, day)
+
+        else:
+            # Persistent CIN1 — schedule next surveillance
+            p.log(day, "CIN1 SURVEILLANCE — persistent, repeat in 1 year")
+            record_screening(self.metrics, p, "cervical", "CIN1", current_day=day)
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "cin1_surveillance",
+                     "referral_day": day, "clean_count": 0},
+                day + cfg.CIN1_SURVEILLANCE_INTERVAL_DAYS
+            )
+
+    def _post_treatment_surveillance_step(self, p: Patient, day: int,
+                                           treatment_day: int,
+                                           visit_number: int) -> None:
+        """
+        Post-LEEP/cone surveillance: co-test at intervals per ASCCP guidelines.
+
+        Uses POST_TREATMENT_SURVEILLANCE_CERVICAL schedule from config.
+        Each visit draws a normal vs recurrent result. Recurrence routes
+        back to colposcopy. Normal results continue the surveillance schedule
+        until POST_TREATMENT_ACTIVE_YEARS_CERVICAL is reached, then the
+        patient returns to routine screening.
+        """
+        if not p.active:
+            return
+
+        years_since_treatment = (day - treatment_day) / 365.0
+
+        # Check if surveillance period is complete
+        if years_since_treatment >= cfg.POST_TREATMENT_ACTIVE_YEARS_CERVICAL:
+            p.log(day, "POST-TREATMENT surveillance complete — returning to routine")
+            p.current_stage = "routine"
+            return
+
+        # Consume a cytology slot for the surveillance co-test
+        self._day_secondary_demand += 1
+        if not self._queues.consume_slot("cytology", day):
+            self._day_secondary_overflow += 1
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "post_treatment_surveillance",
+                     "referral_day": day, "treatment_day": treatment_day,
+                     "visit_number": visit_number},
+                day + 1
+            )
+            return
+        self._day_secondary_supply += 1
+
+        visit_number += 1
+        # Draw recurrence: use prior_cin risk factor — simplified model
+        # Post-treatment recurrence rate ~5–10% per visit (PLACEHOLDER)
+        recurrence_prob = 0.07  # PLACEHOLDER — calibrate to NYP/ASCCP data
+        if random.random() < recurrence_prob:
+            p.cervical_result = random.choice(["ASCUS", "HSIL"])
+            p.log(day, f"POST-TREATMENT surveillance visit {visit_number} — "
+                        f"RECURRENCE ({p.cervical_result}), referring to colposcopy")
+            record_screening(self.metrics, p, "cervical", p.cervical_result, current_day=day)
+            due = day + cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
+            self._queues.schedule_followup(
+                p, {"cancer": "cervical", "step": "colposcopy",
+                     "referral_day": day}, due
+            )
+            return
+
+        # Normal result — schedule next surveillance visit per schedule
+        p.cervical_result = "NORMAL"
+        p.last_cervical_screen_day = day
+        record_screening(self.metrics, p, "cervical", "NORMAL", current_day=day)
+        next_interval = self._get_post_treatment_interval("cervical", years_since_treatment)
+        p.log(day, f"POST-TREATMENT surveillance visit {visit_number} — normal, "
+                    f"next in {next_interval} days")
+        self._queues.schedule_followup(
+            p, {"cancer": "cervical", "step": "post_treatment_surveillance",
+                 "referral_day": day, "treatment_day": treatment_day,
+                 "visit_number": visit_number},
+            day + next_interval
+        )
+
+    def _get_post_treatment_interval(self, cancer: str, years_since: float) -> int:
+        """
+        Look up the correct surveillance interval (in days) from the config
+        schedule based on years since treatment.
+        """
+        if cancer == "cervical":
+            schedule = cfg.POST_TREATMENT_SURVEILLANCE_CERVICAL
+        else:
+            schedule = cfg.POST_TREATMENT_SURVEILLANCE_LUNG
+        for max_year, interval_months in schedule:
+            if years_since < max_year:
+                return interval_months * 30  # approximate months → days
+        # Past all schedule entries — annual
+        return 365
+
+    def _lung_post_treatment_surveillance_step(self, p: Patient, day: int,
+                                                treatment_day: int,
+                                                visit_number: int) -> None:
+        """
+        Post-lung-treatment surveillance: repeat LDCT at intervals per NCCN.
+
+        Uses POST_TREATMENT_SURVEILLANCE_LUNG schedule from config.
+        """
+        if not p.active:
+            return
+
+        years_since_treatment = (day - treatment_day) / 365.0
+
+        if years_since_treatment >= cfg.POST_TREATMENT_ACTIVE_YEARS_LUNG:
+            p.log(day, "LUNG POST-TREATMENT surveillance complete — returning to routine")
+            p.current_stage = "routine"
+            return
+
+        # Consume an LDCT slot
+        if not self._queues.consume_slot("ldct", day):
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "lung_post_treatment_surveillance",
+                     "referral_day": day, "treatment_day": treatment_day,
+                     "visit_number": visit_number},
+                day + 1
+            )
+            return
+
+        visit_number += 1
+        result = draw_lung_rads_result()
+        p.lung_result = result
+        p.last_lung_screen_day = day
+        p.log(day, f"LUNG POST-TREATMENT surveillance visit {visit_number} → {result}")
+        if day >= self._warmup_day:
+            self.metrics["lung_rads_distribution"][result] += 1
+        record_screening(self.metrics, p, "lung", result, current_day=day)
+
+        # If suspicious, escalate to biopsy pathway
+        if result in ("RADS_4A", "RADS_4B_4X"):
+            due = day + cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "biopsy",
+                     "referral_day": day}, due
+            )
+            return
+
+        # Otherwise schedule next surveillance visit
+        next_interval = self._get_post_treatment_interval("lung", years_since_treatment)
+        p.log(day, f"LUNG POST-TREATMENT next surveillance in {next_interval} days")
+        self._queues.schedule_followup(
+            p, {"cancer": "lung", "step": "lung_post_treatment_surveillance",
+                 "referral_day": day, "treatment_day": treatment_day,
+                 "visit_number": visit_number},
+            day + next_interval
+        )
 
     def _lung_result_routing(self, p: Patient, day: int) -> None:
         """
@@ -1583,46 +1683,68 @@ class SimulationRunner:
                 record_exit(self.metrics, p.exit_reason, patient=p, current_day=day)
             return
 
-        if p.lung_result in ("RADS_4A", "RADS_4B_4X"):
+        if disposition == "lung_treated":
+            # Schedule post-treatment surveillance per NCCN guidelines
+            first_interval = self._get_post_treatment_interval("lung", 0)
+            surv_due = day + first_interval
+            self._queues.schedule_followup(
+                p, {"cancer": "lung", "step": "lung_post_treatment_surveillance",
+                     "referral_day": day, "treatment_day": day,
+                     "visit_number": 0},
+                surv_due
+            )
+            p.log(day, f"LUNG POST-TREATMENT surveillance scheduled: first visit day {surv_due}")
+        elif p.lung_result in ("RADS_4A", "RADS_4B_4X"):
             due = day + cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
             self._queues.schedule_followup(
-                p, {"cancer": "lung", "step": "biopsy"}, due
+                p, {"cancer": "lung", "step": "biopsy",
+                     "referral_day": day}, due
             )
         elif disposition in ("repeat_ldct_1_3mo", "repeat_ldct_6mo", "repeat_ldct_12mo"):
             # Schedule the repeat scan at the Lung-RADS–specified interval.
             repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(p.lung_result, 365)
             self._queues.schedule_followup(
-                p, {"cancer": "lung", "step": "repeat_ldct"}, day + repeat_days
+                p, {"cancer": "lung", "step": "repeat_ldct",
+                     "referral_day": day,
+                     "scheduled_delay": repeat_days}, day + repeat_days
             )
 
-    def _lung_biopsy_step(self, p: Patient, day: int) -> None:
+    def _lung_biopsy_step(self, p: Patient, day: int,
+                          referral_day: int = 0) -> None:
         """
-        Process a lung biopsy appointment.
+        Process a lung biopsy appointment (FIFO).
         If no slot available today, push to tomorrow.
         """
+        # Queue LTFU check for secondary retry
+        if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "lung_biopsy"):
+            return
+        self._day_secondary_demand += 1
         if not self._queues.consume_slot("lung_biopsy", day):
+            self._day_secondary_overflow += 1
             self._queues.schedule_followup(
-                p, {"cancer": "lung", "step": "biopsy"}, day + 1
+                p, {"cancer": "lung", "step": "biopsy",
+                     "referral_day": referral_day}, day + 1
             )
             return
-        self.metrics["wait_times"]["lung_biopsy"].append(day - p.day_created)
+        self._day_secondary_supply += 1
+        scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
+        queue_wait = (day - referral_day) - scheduled_delay
+        if queue_wait > 0 and day >= self._warmup_day:
+            self.metrics["wait_times"]["lung_biopsy"].append(queue_wait)
 
-    def _lung_repeat_ldct_step(self, p: Patient, day: int) -> None:
+    def _lung_repeat_ldct_step(self, p: Patient, day: int,
+                              referral_day: int = 0,
+                              scheduled_delay: int = 0) -> None:
         """
         Process a Lung-RADS–mandated follow-up LDCT (RADS 0/1/2/3 path).
 
-        This bypasses the standard screening interval check.  A RADS 3 patient
-        needs a repeat in 6 months; is_due_for_screening would block that because
-        the LDCT interval is 12 months.  We draw the result directly, update the
-        patient, then call _lung_result_routing to handle the new result (which
-        may schedule another repeat or escalate to biopsy).
-
-        Consumes an LDCT procedure slot; if none is available today, pushes to
-        the next day rather than losing the appointment.
+        Bypasses the standard screening interval check.  Consumes an LDCT
+        procedure slot; if none available today, pushes to next day (FIFO).
         """
         if not self._queues.consume_slot("ldct", day):
             self._queues.schedule_followup(
-                p, {"cancer": "lung", "step": "repeat_ldct"}, day + 1
+                p, {"cancer": "lung", "step": "repeat_ldct",
+                     "referral_day": referral_day}, day + 1
             )
             return
 
@@ -1630,22 +1752,27 @@ class SimulationRunner:
         p.lung_result          = result
         p.last_lung_screen_day = day
         p.log(day, f"LUNG REPEAT LDCT → {result}")
-        self.metrics["lung_rads_distribution"][result] += 1
-        record_screening(self.metrics, p, "lung", result)
-        self.metrics["wait_times"]["screening_seen"].append(day - p.day_created)
-        # Re-route the new result inline — do NOT call record_exit here because
-        # _run_followup is the single caller of record_exit for all follow-up steps.
+        if day >= self._warmup_day:
+            self.metrics["lung_rads_distribution"][result] += 1
+        record_screening(self.metrics, p, "lung", result, current_day=day)
+        queue_wait = (day - referral_day) - scheduled_delay
+        if queue_wait > 0 and day >= self._warmup_day:
+            self.metrics["wait_times"]["ldct"].append(queue_wait)
+        # Re-route the new result — may schedule another repeat or escalate to biopsy.
         disposition = run_lung_followup(p, day, self.metrics)
         if p.active:
             if p.lung_result in ("RADS_4A", "RADS_4B_4X"):
                 due = day + cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
                 self._queues.schedule_followup(
-                    p, {"cancer": "lung", "step": "biopsy"}, due
+                    p, {"cancer": "lung", "step": "biopsy",
+                         "referral_day": day}, due
                 )
             elif disposition in ("repeat_ldct_1_3mo", "repeat_ldct_6mo", "repeat_ldct_12mo"):
                 repeat_days = cfg.LUNG_RADS_REPEAT_INTERVALS.get(p.lung_result, 365)
                 self._queues.schedule_followup(
-                    p, {"cancer": "lung", "step": "repeat_ldct"}, day + repeat_days
+                    p, {"cancer": "lung", "step": "repeat_ldct",
+                         "referral_day": day,
+                         "scheduled_delay": repeat_days}, day + repeat_days
                 )
 
     # =========================================================================

@@ -37,9 +37,10 @@ RANDOM_SEED = None   # None = non-deterministic (different result each run).
                      # Set to an integer (e.g. 42) to reproduce a specific run.
 
 # ── Simulation Horizon ────────────────────────────────────────────────────────
-SIM_YEARS      = 70                      # full 70-year longitudinal horizon
+SIM_YEARS      = 80                      # full 80-year longitudinal horizon
+WARMUP_YEARS   = 10                      # years 0–9 are warmup; analysis starts at year 10
 DAYS_PER_YEAR  = 365
-SIM_DAYS       = SIM_YEARS * DAYS_PER_YEAR   # = 25,550 days
+SIM_DAYS       = SIM_YEARS * DAYS_PER_YEAR   # = 29,200 days
 NUM_REPS       = 10       # number of replications for variance analysis
 
 # Skip weekends — hospital screenings and appointments only occur Monday–Friday.
@@ -59,8 +60,6 @@ ACTIVE_CANCERS = ["cervical", "lung"]
 # Total daily screening capacity = 200 patients across all providers.
 # PLACEHOLDER — replace with NYP scheduling / capacity data.
 DAILY_PATIENTS = 200
-
-PATIENT_TYPE_PROBS = {"outpatient": 0.70, "drop_in": 0.30}
 
 DESTINATION_PROBS = {
     "pcp":          0.35,
@@ -82,61 +81,25 @@ ARRIVAL_TYPE_PROBS = {
     "er":         0.20,
 }
 
-OUTPATIENT_SHOW_PROB = 1.00   # raise to model no-shows
-
-# No-show rates by provider type
-# PCP: Kheirkhah et al. (2016, BMC Health Services Research)
-# GYN: Percac-Lima et al. (2010); Engelstad et al. (2001)
-# Specialist/ER: ASSUMPTION — no published NYC-specific data
-NO_SHOW_PROB = {
-    "pcp":          0.23,   # Kheirkhah et al. 2016, BMC Health Services Research
-    "gynecologist": 0.26,   # Percac-Lima et al. 2010; Engelstad et al. 2001
-    "specialist":   0.20,   # ASSUMPTION — placeholder
-    "er":           0.00,   # ER has no scheduled appointments
-}
-
-# Post-no-show disposition probabilities: what happens to a patient who misses their appointment
-# Source: Hwang et al. (2015, J Health Care Poor Underserved); AiP Parameters PDF
-NOT_SEEN_PROBS = {
-    "pcp": {
-        "reschedule": 0.50,   # Source: AiP Parameters PDF (Hwang et al. 2015)
-        "exit":       0.15,   # Source: AiP Parameters PDF
-        "wait":       0.35,   # Source: AiP Parameters PDF
-    },
-    "gynecologist": {
-        "reschedule": 0.40,   # Source: AiP Parameters PDF (Hwang et al. 2015)
-        "exit":       0.20,   # Source: AiP Parameters PDF
-        "wait":       0.40,   # Source: AiP Parameters PDF
-    },
-}
-
-# Cumulative exit probability by number of missed appointments (no-shows)
-# Source: AiP Parameters PDF — "15% exit after 1st no-show, 30% after 2nd, 60–80% after 3rd, rest after 4th"
-NOSHOW_CUMULATIVE_EXIT_PROB = [0.15, 0.30, 0.70, 1.00]  # after 1st, 2nd, 3rd, 4th no-show
-
-# Outreach scenario: with active navigation vs without
-# Source: AiP Parameters PDF — Cochrane reviews; Everett et al. 2011
-OUTREACH_PROBS = {
-    "with_navigation":    {"reschedule": 0.60, "exit": 0.10, "wait": 0.30},
-    "without_outreach":   {"reschedule": 0.35, "exit": 0.25, "wait": 0.40},
-}
-
 # ── Provider Daily Capacities ─────────────────────────────────────────────────
-# Scaled so total = DAILY_PATIENTS = 200. Distribution is proportional to
-# DESTINATION_PROBS. PLACEHOLDER — replace with NYP capacity data.
+# Proportional distribution — patients are split to providers by these
+# proportions.  There is no provider-level capacity constraint (no provider
+# overflow).  The real bottleneck is at procedure slots (CAPACITIES above).
+# PLACEHOLDER — replace with NYP capacity data.
 PROVIDER_CAPACITY = {
-    "pcp":          70,   # 35% of 200
-    "gynecologist": 52,   # 26% of 200
-    "specialist":   35,   # 17% of 200
-    "er":           43,   # 22% of 200
+    "pcp":          70,   # PLACEHOLDER — 35% of 200
+    "gynecologist": 52,   # PLACEHOLDER — 26% of 200
+    "specialist":   35,   # PLACEHOLDER — 17% of 200
+    "er":           43,   # PLACEHOLDER — 22% of 200
 }
 
-# Fraction of each provider's daily capacity reserved for scheduled outpatients.
-# Remainder is available to drop-ins. ER = 0 (drop-in only).
+# NOTE: OUTPATIENT_FRACTION is no longer used for capacity enforcement
+# (provider routing is proportional, not capacity-constrained).
+# Kept for reference / future scenario analysis.
 OUTPATIENT_FRACTION = {
-    "pcp":          0.75,   # 30 outpatient slots, 10 drop-in slots
-    "gynecologist": 0.73,   # 22 outpatient slots,  8 drop-in slots
-    "specialist":   0.75,   # 15 outpatient slots,  5 drop-in slots
+    "pcp":          0.75,   # PLACEHOLDER
+    "gynecologist": 0.73,   # PLACEHOLDER
+    "specialist":   0.75,   # PLACEHOLDER
     "er":           0.00,   # ER is entirely drop-in
 }
 
@@ -148,9 +111,9 @@ OUTPATIENT_LEAD_DAYS = {
     "specialist":   (14, 28),
 }
 
-# ER overflow routing: fraction of patients who retry ER tomorrow vs.
-# convert to an outpatient appointment at PCP / Gynecologist / Specialist.
-ER_OVERFLOW_RETRY_PROB = 0.70   # PLACEHOLDER
+# NOTE: ER_OVERFLOW_RETRY_PROB is no longer used — provider routing is
+# proportional, overflow happens at procedure slots not providers.
+ER_OVERFLOW_RETRY_PROB = 0.70   # UNUSED
 
 # Fraction of ER arrivals flagged as critical (return next day for follow-up).
 ER_CRITICAL_PROB = 0.50         # PLACEHOLDER
@@ -297,13 +260,23 @@ CERVICAL_RESULT_PROBS = {
 # Lab/result turnaround times (calendar days)
 # Source: AiP Parameters PDF
 TURNAROUND_DAYS = {
+    # Provider → primary screening scheduling delay
+    "provider_to_screening": 10,    # PLACEHOLDER — days from provider visit to screening appointment
+
+    # Lab / radiology processing times
     "cytology":               7,    # Pap cytology alone; Source: AiP Parameters PDF
     "co_test":               10,    # HPV co-testing; Source: AiP Parameters PDF
     "hpv_alone":              5,    # Primary HPV alone; Source: AiP Parameters PDF
-    "notification_normal":   10,    # Total days to patient notification (normal); Source: AiP Parameters PDF
-    "notification_abnormal": 14,    # Total days to patient notification (abnormal); Source: AiP Parameters PDF
     "ldct_notification":      5,    # LDCT result to patient notification; Source: AiP Parameters PDF
     "ldct_to_workup":        21,    # Positive LDCT result to diagnostic workup; Source: AiP Parameters PDF
+
+    # Patient notification delays
+    "notification_normal":   10,    # Total days to patient notification (normal); Source: AiP Parameters PDF
+    "notification_abnormal": 14,    # Total days to patient notification (abnormal); Source: AiP Parameters PDF
+
+    # Secondary screening → result turnaround
+    "colposcopy_result":     10,    # PLACEHOLDER — days from colposcopy to pathology result
+    "lung_biopsy_result":    10,    # PLACEHOLDER — days from lung biopsy to pathology result
 }
 
 # ── Lung-RADS Result Distribution (v2022) ────────────────────────────────────
@@ -366,62 +339,21 @@ LUNG_RADS_REPEAT_INTERVALS = {
 
 # ── Loss-to-Follow-Up Probabilities ──────────────────────────────────────────
 LTFU_PROBS = {
-    # Cervical
-    # P(colposcopy completed | abnormal result): 75.3% within 12 months; Source: PMC9808794
-    # Note: marked "Most likely irrelevant to NYP" in AiP PDF — use with caution
-    "post_abnormal_to_colposcopy":  0.247,   # 1 - 0.753; Source: PMC9808794 (pmc.ncbi.nlm.nih.gov/articles/PMC9808794/)
-
-    # CIN2/3: 50% exit post-colposcopy before treatment; Source: AiP Parameters PDF
-    "post_colposcopy_to_treatment": 0.50,    # Source: AiP Parameters PDF ("50% Exit")
+    # ── Queue LTFU (daily hazard) ────────────────────────────────────────────
+    # Each day a patient overflows procedure capacity and retries, there is a
+    # small probability they abandon the queue (geometric/exponential model).
+    # Median days in queue before abandoning ≈ ln(2) / daily_prob.
+    #   primary:   0.002/day → median ~346 days  PLACEHOLDER
+    #   secondary: 0.005/day → median ~139 days  PLACEHOLDER
+    #   treatment: 0.003/day → median ~231 days  PLACEHOLDER
+    "queue_primary_daily":   0.002,    # PLACEHOLDER — primary screening retry queue
+    "queue_secondary_daily": 0.005,    # PLACEHOLDER — colposcopy / lung biopsy retry queue
+    "queue_treatment_daily": 0.003,    # PLACEHOLDER — LEEP / cone biopsy retry queue
 
     # Unscreened re-engagement: yes_schedule default = 0.40
     # Source: AiP Parameters PDF; Cochrane reviews; Everett et al. 2011
     # Outreach modality ranges: letter ~15–20%, phone ~30–40%, in-person ~40–55%
     "unscreened_will_reschedule":   0.40,    # Source: AiP Parameters PDF (Everett et al. 2011)
-}
-
-# Fate of patients who decline outreach / don't reschedule
-# Source: NHIS/BRFSS longitudinal data; AiP Parameters PDF
-# "40–60% eventually screen within 5 years due to life events"
-UNSCREENED_FATE = {
-    "may_return_later": 0.60,   # Source: NHIS/BRFSS; AiP Parameters PDF
-    "exit_system":      0.40,   # Source: AiP Parameters PDF
-}
-
-# Scenario overrides for outreach testing
-# Source: AiP Parameters PDF
-UNSCREENED_REENTRY_SCENARIOS = {
-    "robust_navigation": 0.55,   # yes_schedule; Source: AiP Parameters PDF
-    "minimal_outreach":  0.25,   # yes_schedule; Source: AiP Parameters PDF
-}
-
-# Re-entry delay after outreach acceptance
-REENTRY_DELAY_DAYS = 30   # Source: AiP Parameters PDF
-
-# Overdue grace period before patient is flagged as non-adherent
-# Source: AiP Parameters PDF
-# Rationale: EHR BPAs typically fire at 1–3 months past due; CMS quality measure uses 12-month interval
-OVERDUE_GRACE_DAYS = {
-    "cervical_3yr": 90,    # Source: AiP Parameters PDF (EHR BPA fire window)
-    "cervical_5yr": 180,   # Source: AiP Parameters PDF (longer interval tolerates drift)
-    "lung":         90,    # Source: AiP Parameters PDF (CMS quality measure)
-}
-
-# Daily probability of spontaneous re-entry from overdue pool
-# Source: AiP Parameters PDF; NHIS/BRFSS longitudinal data
-# Implied median return: cervical ~18 months, lung ~12 months
-# Sensitivity: cervical 0.0007–0.0025; lung 0.0010–0.0035
-DAILY_REENTRY_PROB = {
-    "cervical": 0.0013,   # Source: AiP Parameters PDF
-    "lung":     0.0019,   # Source: AiP Parameters PDF
-}
-
-# Maximum days overdue before patient permanently exits (without active re-entry)
-# Source: AiP Parameters PDF
-MAX_OVERDUE_DAYS = {
-    "cervical_3yr": 1095,   # 3 years; Source: AiP Parameters PDF
-    "cervical_5yr": 1825,   # 5 years; Source: AiP Parameters PDF
-    "lung":          730,   # 2 years; Source: AiP Parameters PDF
 }
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────
@@ -490,14 +422,24 @@ POST_TREATMENT_DELAY_DAYS = {
     "lung":     365,
 }
 
-# ── Screening / Procedure Resource Capacities ─────────────────────────────────
+# ── Screening / Procedure Resource Capacities (daily slots) ──────────────────
+# Primary screenings compete for slots — PCP/GYN/Specialist patients get
+# priority over ER walk-ins.  When capacity is exceeded, patients are
+# rescheduled to the next workday (overflow).
+# Secondary screenings and treatment follow FIFO — only patients with
+# abnormal primary results enter these queues.
 CAPACITIES = {
-    "cytology":    8,
-    "hpv_alone":   8,
-    "ldct":        4,
-    "colposcopy":  8,
-    "leep":        5,
-    "cone_biopsy": 3,
+    # Primary screening slots
+    "cytology":    8,     # PLACEHOLDER — replace with NYP lab throughput
+    "hpv_alone":   8,     # PLACEHOLDER — replace with NYP lab throughput
+    "co_test":     8,     # PLACEHOLDER — HPV + cytology combo; replace with NYP lab throughput
+    "ldct":        4,     # PLACEHOLDER — replace with NYP radiology capacity
+    # Secondary / diagnostic slots
+    "colposcopy":  8,     # PLACEHOLDER — replace with NYP GYN procedure data
+    "lung_biopsy": 2,     # PLACEHOLDER — replace with NYP IR capacity
+    # Treatment slots
+    "leep":        5,     # PLACEHOLDER — replace with NYP OR scheduling data
+    "cone_biopsy": 3,     # PLACEHOLDER — replace with NYP OR scheduling data
 }
 
 # ── Unscreened Re-entry Delay (days) ──────────────────────────────────────────
@@ -506,23 +448,24 @@ CAPACITIES = {
 RESCHEDULE_DELAY_DAYS = {
     "pcp":          28,   # Source: AiP Parameters PDF
     "gynecologist": 38,   # Source: AiP Parameters PDF
-    "specialist":   30,   # ASSUMPTION
-    "er":            7,   # ASSUMPTION
-    "default":      30,   # ASSUMPTION — fallback if provider not specified
+    "specialist":   30,   # PLACEHOLDER
+    "er":            7,   # PLACEHOLDER
+    "default":      30,   # PLACEHOLDER — fallback if provider not specified
 }
 
 # ── Inter-Step Scheduling Delays (days) ───────────────────────────────────────
 # Time between referral and the next appointment at each step.
-# These drive SimPy timeouts and are a key lever in scenario analysis
+# These drive wait-time metrics and are a key lever in scenario analysis
 # (coordinated care reduces these delays).
-# PLACEHOLDER — replace with NYP scheduling data.
+# These are scheduling delays, NOT queue wait times. Queue wait = additional
+# days beyond this window caused by slot overflow and retry.
 FOLLOWUP_DELAY_DAYS = {
-    "colposcopy":        50,    # default: abnormal result → colposcopy; Source: AiP Parameters PDF (was 30 — ASSUMPTION)
+    "colposcopy":        50,    # Source: AiP Parameters PDF
     "colposcopy_hsil":   32,    # HSIL-expedited colposcopy; Source: AiP Parameters PDF
-    "leep":              14,    # colposcopy → LEEP; ASSUMPTION
-    "cone_biopsy":       21,    # colposcopy → cone biopsy; ASSUMPTION
+    "leep":              14,    # colposcopy → LEEP; PLACEHOLDER
+    "cone_biopsy":       21,    # colposcopy → cone biopsy; PLACEHOLDER
     "lung_biopsy":       21,    # RADS 4 → diagnostic workup; Source: AiP Parameters PDF
-    "lung_treatment":    21,    # malignancy confirmed → treatment start; ASSUMPTION
+    "lung_treatment":    21,    # malignancy confirmed → treatment start; PLACEHOLDER
 }
 
 # Time-to-colposcopy guidelines by result severity
@@ -533,27 +476,28 @@ ABNORMAL_FOLLOWUP_DAYS = {
 }
 
 # =============================================================================
-# STABLE POPULATION MODEL
+# POPULATION MODEL
 # =============================================================================
 #
 # HOW IT WORKS
 # ─────────────────────────────────────────────────────────────────────────────
-# The stable-population model maintains a fixed cohort of ~SIMULATED_POPULATION
-# established patients who cycle through the provider system annually. Each
-# year, some patients are removed (mortality, permanent LTFU) and replaced by
-# an equal number of new entrants (drop-ins), keeping the total population
-# roughly constant across the 70-year simulation horizon.
+# The population model seeds an initial cohort of INITIAL_POOL_SIZE patients
+# who cycle through the provider system annually. The pool then evolves
+# organically: new patients arrive via ARRIVAL_SOURCES (multi-source),
+# and patients exit via mortality, attrition (EXIT_SOURCES), LTFU, or
+# ineligibility. The pool size is EMERGENT — NOT maintained at a fixed target.
 #
 #   Established patients → visit once per ANNUAL_VISIT_INTERVAL days →
-#       rescheduled immediately for next year → age updated each sweep
+#       rescheduled immediately for next year → age updated at each visit
 #
-#   Mortality sweep → runs every MORTALITY_CHECK_DAYS → Bernoulli draw per
-#       patient with age-adjusted annual probability →  dead patients exit,
-#       are flushed to SQLite, and replaced by new entrants
+#   Mortality → at entry, a death day is drawn from the Gompertz hazard
+#       conditional on age → event fires independently → patient exits
 #
-#   Warmup → at day 0, SIMULATED_POPULATION established patients are spread
-#       evenly across days 0…ANNUAL_VISIT_INTERVAL so providers start near
-#       capacity from day 1 (no cold-start bias in year-1 metrics)
+#   Arrivals → organic new patients arrive daily, join the cycling pool
+#       after their first visit
+#
+#   Warmup → at day 0, INITIAL_POOL_SIZE patients are spread across the
+#       warmup window so providers start near capacity from day 1
 #
 # SCALE FACTOR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -562,44 +506,83 @@ ABNORMAL_FOLLOWUP_DAYS = {
 # All metrics scale by this factor when extrapolating to real-world counts.
 # =============================================================================
 
-# ── Stable population size and scale ─────────────────────────────────────────
+# ── Population scale ─────────────────────────────────────────────────────────
 POPULATION_SCALE_FACTOR = 100          # 1 sim patient = 100 NYC women
-SIMULATED_POPULATION    = 15_000       # established cycling patients in pool
 
-# ── Patient flow into the system (open-loop model) ───────────────────────────
-#
-# There are TWO distinct flows of new patients. The simulation is NOT a closed
-# system — patients continuously enter throughout all 70 years.
-#
-# 1. ORGANIC NEW ENTRANTS (ORGANIC_NEW_PATIENT_DAILY_RATE)
-#    Women who are genuinely new to NYP: first-time visitors, recent movers,
-#    women turning 21, patients switching providers. They arrive as drop-ins,
-#    get screened at their first visit, then join the established cycling pool
-#    for annual follow-ups (up to SIMULATED_POPULATION cap).
-#    PLACEHOLDER — calibrate to NYP patient acquisition data.
-#
-# 2. MORTALITY REPLACEMENTS (NEW_PATIENT_DAILY_RATE)
-#    Patients spawned specifically to replace mortality exits and keep the pool
-#    at exactly SIMULATED_POPULATION. Separate from organic flow — they enter
-#    directly as established cycling patients, not as drop-ins.
-#    Rate-limited to spread replacements across days rather than spawning all
-#    deaths at once on the mortality-sweep day.
+# ── Initial seed population ──────────────────────────────────────────────────
+# Number of established patients to seed at day 0.  The pool then grows or
+# shrinks organically as arrivals join and patients exit via mortality,
+# attrition, LTFU, or ineligibility.  Set to 0 for a pure cold-start.
+INITIAL_POOL_SIZE = 15_000
 
-ORGANIC_NEW_PATIENT_DAILY_RATE = 10   # ~10 new first-time patients/day ≈ 3,650/year
-NEW_PATIENT_DAILY_RATE         = 4    # mortality-replacement rate (max per day)
+# ── Patient arrival sources ──────────────────────────────────────────────────
+# Each source represents a distinct pathway into NYP's screening system.
+# Patients from different sources have different age profiles and routing.
+#
+# Fields:
+#   daily_rate  — mean Poisson arrivals/day for this source
+#   age_range   — (min, max) age constraint; sampled within this range
+#   routing     — "outpatient" | "er" | "census" (census = use ARRIVAL_TYPE_PROBS)
+#
+# The total arrival rate is the sum across all sources.  Pool size emerges
+# from total arrivals vs. total exits (mortality + attrition + LTFU + ineligible).
+#
+# Sources:
+#   aging_in       — women reaching screening eligibility age (turning 21)
+#                    Source: ~4.3M US women turn 21/year; NYC share ~1.4%;
+#                    NYP market share ~5% → ~3/day at scale factor 100
+#                    PLACEHOLDER — calibrate to NYP panel acquisition data
+#   new_mover      — women relocating to NYC or switching into NYP network
+#                    Source: NYC net domestic migration + international inflow
+#                    PLACEHOLDER — calibrate to NYP new-patient registration data
+#   er_walkin      — unplanned ER visits where screening may be opportunistic
+#                    Source: NYP ER volume ~620K/year, ~50% female, ~30% eligible age
+#                    PLACEHOLDER — calibrate to NYP ER screening data
+#   referral       — sent by external provider specifically for screening
+#                    PLACEHOLDER — calibrate to NYP referral data
+# Total Poisson arrival rate (λ) and routing split
+TOTAL_DAILY_ARRIVALS = 1.6                # λ_total — mean Poisson arrivals/day
+_OUTPATIENT_SHARE    = 0.80               # 80% outpatient (NYP Facts & Figures)
+_ER_SHARE            = 0.20               # 20% drop-in ER
+
+# Outpatient sub-source shares (must sum to 1.0 within outpatient)
+_OP_AGING_IN  = 0.4141                    # aging_in  share of outpatient
+_OP_NEW_MOVER = 0.3359                    # new_mover share of outpatient
+_OP_REFERRAL  = 0.2500                    # referral  share of outpatient
+
+ARRIVAL_SOURCES = {
+    # Outpatient sources: λ = TOTAL_DAILY_ARRIVALS × _OUTPATIENT_SHARE × sub-share
+    #   aging_in  → Poisson(1.6 × 0.80 × 0.4141) = Poisson(0.53)
+    #   new_mover → Poisson(1.6 × 0.80 × 0.3359) = Poisson(0.43)
+    #   referral  → Poisson(1.6 × 0.80 × 0.2500) = Poisson(0.32)
+    # ER source:    λ = TOTAL_DAILY_ARRIVALS × _ER_SHARE
+    #   er_walkin → Poisson(1.6 × 0.20)           = Poisson(0.32)
+    "aging_in": {
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _OUTPATIENT_SHARE * _OP_AGING_IN,
+        "age_range":  (21, 25),
+        "routing":    "outpatient",
+    },
+    "new_mover": {
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _OUTPATIENT_SHARE * _OP_NEW_MOVER,
+        "age_range":  (21, 85),     # Census age distribution within range
+        "routing":    "outpatient",
+    },
+    "er_walkin": {
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _ER_SHARE,
+        "age_range":  (21, 85),
+        "routing":    "er",
+    },
+    "referral": {
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _OUTPATIENT_SHARE * _OP_REFERRAL,
+        "age_range":  (30, 75),     # referred patients skew middle-aged
+        "routing":    "outpatient",
+    },
+}
 
 # ── NYP MODEL ASSUMPTION: Age-based drop-in queue priority ───────────────────
-# Hospital preference for revenue maximization: when drop-in capacity is limited
-# and some walk-in patients must be deferred to the next day, women aged 40+
-# receive priority and are seen before younger patients.
-#
-# RATIONALE: The 40+ cohort is disproportionately associated with higher-revenue
-# procedures — colposcopy, LEEP, cone biopsy, and LDCT — so prioritizing them
-# maximises expected procedure revenue per available drop-in slot.
-#
-# This applies ONLY to drop-in queue ordering. All scheduled outpatients retain
-# their guaranteed slot regardless of age (capacity contract is unchanged).
-AGE_PRIORITY_THRESHOLD = 40           # women aged >= this receive drop-in priority
+# NOTE: AGE_PRIORITY_THRESHOLD is no longer used — provider-level queueing
+# was removed; overflow now happens at procedure slots.
+AGE_PRIORITY_THRESHOLD = 40           # UNUSED
 
 # ── Visit scheduling ──────────────────────────────────────────────────────────
 ANNUAL_VISIT_INTERVAL  = 365           # days between established patient visits
@@ -616,49 +599,68 @@ ADVANCE_SCHEDULE_YEARS = 5
 # and the system reaches near-steady-state by Year 4.
 WARMUP_DAYS            = 1825          # 5-year warmup
 
-# ── Mortality sweep cadence ───────────────────────────────────────────────────
-MORTALITY_CHECK_DAYS   = 30            # run mortality Bernoulli draws every N days
-
-# ── Annual patient attribute transition rates (PLACEHOLDER) ──────────────────
-# Applied each mortality sweep (scaled to sweep interval).
-# All values are annual probabilities — replace with NYP / literature values.
-ANNUAL_SMOKING_CESSATION_PROB = 0.05   # prob a current smoker quits in a given year
-ANNUAL_HPV_CLEARANCE_PROB     = 0.30   # prob HPV-positive patient clears in a given year
-
-# ── Age-specific annual mortality rates for US women ──────────────────────────
-# Source: CDC WONDER / NCHS Life Tables 2020 (females, all causes).
-# Keys: (age_lo, age_hi) inclusive; value: annual probability of death.
-# Extended through age 99 to avoid flat fallback for elderly patients.
-# PLACEHOLDER — replace with NYC-specific mortality data if available.
-ANNUAL_MORTALITY_RATE = {
-    (21,  29): 0.0006,    # Source: NCHS Life Tables 2020
-    (30,  39): 0.0009,    # Source: NCHS Life Tables 2020
-    (40,  49): 0.0020,    # Source: NCHS Life Tables 2020
-    (50,  59): 0.0045,    # Source: NCHS Life Tables 2020
-    (60,  69): 0.0100,    # Source: NCHS Life Tables 2020
-    (70,  79): 0.0230,    # Source: NCHS Life Tables 2020
-    (80,  84): 0.0550,    # Source: NCHS Life Tables 2020 (5-yr bracket)
-    (85,  89): 0.1200,    # Source: NCHS Life Tables 2020 (5-yr bracket)
-    (90,  94): 0.2200,    # Source: NCHS Life Tables 2020 (5-yr bracket)
-    (95,  99): 0.3500,    # Source: NCHS Life Tables 2020 (5-yr bracket)
-}
+# ── Gompertz mortality parameters ─────────────────────────────────────────────
+# Mortality is modeled as a Gompertz hazard: h(t) = a * exp(b * t), where t is
+# age in years. At patient entry, a time-to-death is drawn from the conditional
+# Gompertz survival function and scheduled as an independent event.
+#
+# Parameters fitted to US female life tables (Missov et al. 2015):
+#   a (GOMPERTZ_A) — baseline hazard at age 0 (very small)
+#   b (GOMPERTZ_B) — exponential growth rate of mortality with age
+#
+# The hazard doubles roughly every 8.5 years (= ln(2) / b ≈ 8.46).
+GOMPERTZ_A = 0.0000592      # baseline hazard (per year)
+GOMPERTZ_B = 0.0819          # exponential aging coefficient
 
 # Mortality multiplier for current smokers (all-cause, both sexes).
 # Source: Jha et al. 2013 (NEJM); CDC "Health Effects of Cigarette Smoking"
 # Smokers have ~2.5x all-cause mortality vs never-smokers; former smokers ~1.4x.
-# Applied multiplicatively to the age-bracket rate in draw_mortality().
-SMOKER_MORTALITY_MULTIPLIER      = 2.5    # current smokers
-FORMER_SMOKER_MORTALITY_MULTIPLIER = 1.4  # quit but pack_years > 0
+# Applied multiplicatively to the Gompertz baseline `a` at draw time.
+SMOKER_MORTALITY_MULTIPLIER        = 2.5    # current smokers
+FORMER_SMOKER_MORTALITY_MULTIPLIER = 1.4    # quit but pack_years > 0
 
-# ── Annual attrition (non-clinical churn) ─────────────────────────────────────
-# Probability that an established patient leaves the system each year for
-# non-clinical reasons: moving out of area, switching providers, insurance
-# change, etc. Without this, the only way out of the pool is death or
-# screening ineligibility, which is too slow to offset aging — the pool
-# drifts older over the 70-year horizon. A 5% annual attrition rate is
-# conservative for a large urban health system.
-# Source: industry benchmarks for patient panel churn (5–15% annually).
-ANNUAL_ATTRITION_RATE = 0.05
+# Hard cap — no patient survives past this age regardless of draw
+MORTALITY_AGE_CAP = 100
+
+# ── Annual life-event transition rates ────────────────────────────────────────
+# At patient entry, each rate is converted to an exponentially-distributed
+# event day and scheduled independently.  The event fires whether or not
+# the patient has any upcoming visits.
+ANNUAL_SMOKING_CESSATION_PROB = 0.05   # prob a current smoker quits in a given year
+ANNUAL_HPV_CLEARANCE_PROB     = 0.30   # prob HPV-positive patient clears in a given year
+
+# ── Exit sources (non-clinical churn) ─────────────────────────────────────────
+# Mirrors ARRIVAL_SOURCES: each exit source has its own annual rate.
+# At entry, a single attrition day is drawn from Exponential(sum of rates)
+# (competing-risks model).  When the event fires, the sub-type is assigned
+# proportional to the individual rates.
+#
+# Clinical exits (LTFU, treated, ineligible) are pathway outcomes
+# and are NOT modelled as independent rates — they stay in the care pathway.
+#
+#   relocation      — patient moves out of NYC catchment area
+#                     Source: ACS geographic mobility tables (~3% annual
+#                     inter-county migration for NYC women); PLACEHOLDER
+#   insurance_loss  — patient loses or switches insurance away from NYP
+#                     Source: KFF uninsured rate churn estimates; PLACEHOLDER
+#   provider_switch — patient voluntarily switches to a non-NYP provider
+#                     Source: industry patient panel churn benchmarks; PLACEHOLDER
+#
+# Combined rate = sum of sub-rates ≈ 0.05
+EXIT_SOURCES = {
+    "relocation": {
+        "annual_rate": 0.025,   # PLACEHOLDER — calibrate to NYC migration data
+    },
+    "insurance_loss": {
+        "annual_rate": 0.015,   # PLACEHOLDER — calibrate to NYP payer-mix data
+    },
+    "provider_switch": {
+        "annual_rate": 0.010,   # PLACEHOLDER — calibrate to NYP panel churn data
+    },
+}
+
+# Derived: total annual attrition rate (sum of competing risks)
+ANNUAL_ATTRITION_RATE = sum(s["annual_rate"] for s in EXIT_SOURCES.values())
 
 # ── Database persistence ──────────────────────────────────────────────────────
 DB_PATH           = "nyp_simulation.db"  # SQLite file path (relative to working dir)
@@ -684,24 +686,30 @@ POST_TREATMENT_SURVEILLANCE_LUNG = [
 ]
 POST_TREATMENT_ACTIVE_YEARS_LUNG = 5   # standard of care; Source: AiP Parameters PDF
 
-# Untreated patient re-engagement probabilities
-# Source: AiP Parameters PDF
-UNTREATED_REENGAGEMENT = {
-    "cervical_cin23": {
-        "reengage":        0.70,   # Source: AiP Parameters PDF; sensitivity 0.55–0.85
-        "remain_overdue":  0.20,   # Source: AiP Parameters PDF; sensitivity 0.10–0.25
-        "exit":            0.10,   # Source: AiP Parameters PDF; sensitivity 0.05–0.20
-    },
-    "lung": {
-        "reengage":        0.55,   # Source: AiP Parameters PDF; sensitivity 0.35–0.70
-        "remain_overdue":  0.15,   # Source: AiP Parameters PDF; sensitivity 0.05–0.20
-        "exit":            0.30,   # Source: AiP Parameters PDF; sensitivity 0.15–0.40
-    },
-}
-
 # ── Procedure Revenue (per event, USD) ────────────────────────────────────────
 # PLACEHOLDER — replace with NYP finance / contract rates.
 # CPT references provided for calibration.
+# ── Disease-Specific Mortality ────────────────────────────────────────────────
+# Annual excess mortality risk given a confirmed diagnosis.
+# These are ADDITIVE to the baseline Gompertz mortality — they represent the
+# additional risk of death attributable to the disease itself.
+#
+# PLACEHOLDER — set to None until NYP/SEER data is available.
+# When populated, the runner should draw a disease-specific death day
+# at diagnosis time and add it to the life-event queue.
+DISEASE_MORTALITY = {
+    # Cervical — by CIN grade at diagnosis
+    "CIN1":  None,   # negligible excess mortality; placeholder
+    "CIN2":  None,   # annual excess mortality rate (e.g., 0.001)
+    "CIN3":  None,   # annual excess mortality rate (e.g., 0.005)
+
+    # Lung — by biopsy result
+    "lung_malignant": None,   # annual excess mortality rate (e.g., 0.15)
+
+    # Combined (any confirmed cancer diagnosis — cervical or lung)
+    "any_cancer":     None,   # overall annual cancer mortality if not using per-type
+}
+
 PROCEDURE_REVENUE = {
     # Cervical screening
     "cytology":       156,    # CPT 88175 (liquid-based cytology)
