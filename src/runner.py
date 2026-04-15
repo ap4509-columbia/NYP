@@ -7,18 +7,18 @@
 # one full day: new arrivals, provider visits, procedure slot allocation,
 # and any follow-up appointments that fall due.
 #
-# Provider routing
-# ----------------
-# Patients are distributed to providers proportionally based on config
-# probabilities.  Outpatients (PCP / GYN / Specialist) are scheduled;
-# drop-ins (ER) are walk-ins.  There is no provider-level capacity
-# constraint — the distribution is proportional, not a queue.
+# Provider capacity (first bottleneck)
+# -------------------------------------
+# Each day, at most cfg.DAILY_PATIENTS patients are seen across all
+# provider types (PCP / GYN / Specialist / ER).  Outpatients are
+# prioritised over ER drop-ins.  If demand exceeds the daily cap,
+# overflow patients are rescheduled to the next workday.
 #
-# Procedure slot queueing
-# -----------------------
-# The real capacity bottleneck lives at procedure slots (consume_slot).
-# Primary screenings (cytology, HPV, LDCT) are served with priority:
-# outpatients (PCP/GYN/Specialist) before drop-ins (ER).
+# Procedure slot queueing (second bottleneck)
+# --------------------------------------------
+# After seeing a provider, patients compete for procedure slots
+# (consume_slot).  Primary screenings (cytology, HPV, LDCT) are served
+# with outpatient priority over ER.
 # When a slot overflows, the patient is rescheduled to the next workday.
 #
 # Secondary screenings (colposcopy, biopsy) and treatment (LEEP, cone)
@@ -103,9 +103,11 @@ class PatientQueues:
     """
     Day-by-day queue manager for patient visits and procedure slots.
 
-    Provider routing is proportional (no provider-level capacity constraint).
-    The real bottleneck lives at procedure slots (consume_slot), where
-    primary screenings get priority for scheduled patients over ER walk-ins.
+    Two bottleneck levels:
+      1. Provider capacity — total patients seen/day capped at DAILY_PATIENTS.
+         Enforced in SimulationRunner._tick(), not here.
+      2. Procedure slots — primary screenings capped per procedure type.
+         Enforced here via consume_slot().
 
     Attributes
     ----------
@@ -137,6 +139,13 @@ class PatientQueues:
         # Event types: "mortality", "attrition", "smoking_cessation", "hpv_clearance"
         self.life_events  = defaultdict(list)
 
+        # ── Intake queue (FIFO) ──────────────────────────────────────────────
+        # New arrivals wait here until a provider slot opens.  Each day,
+        # SimulationRunner._tick() pulls patients from the front of this
+        # queue (FIFO) to fill remaining provider capacity after established
+        # patients are served.
+        self.intake_queue = []   # [(Patient, provider_key), ...]
+
     # ── Outpatient scheduling ─────────────────────────────────────────────────
 
     def schedule_outpatient(
@@ -164,14 +173,14 @@ class PatientQueues:
         """
         Return all patients scheduled or walking in for this provider today.
 
-        Provider distribution is proportional — there is no provider-level
-        capacity constraint, so there is never overflow.  Outpatients are
-        returned before drop-ins so that downstream procedure-slot logic
-        can prioritise scheduled patients over ER walk-ins.
+        Returns the raw demand — the caller (SimulationRunner._tick) is
+        responsible for enforcing the total daily provider cap.  Outpatients
+        are returned before drop-ins so that the cap prioritises scheduled
+        patients over ER walk-ins.
 
         Returns
         -------
-        seen : list[Patient] — all patients to be processed today
+        seen : list[Patient] — all patients wanting to be seen today
         """
         seen_outpts  = self.outpatient[provider].pop(day, [])
         today_dropins = self.dropin.pop(provider, [])
@@ -427,6 +436,9 @@ class SimulationRunner:
                 "cum_exited":          self.metrics["n_exited"],
                 "cum_exits_by_reason": dict(self.metrics["exits_by_reason"]),
                 "cum_arrivals":        sum(self.metrics["arrivals_by_source"].values()),
+                "cum_provider_demand":   self.metrics["provider_demand"],
+                "cum_provider_served":   self.metrics["provider_served"],
+                "cum_provider_overflow": self.metrics["provider_overflow"],
             })
 
         # Expose queue/procedure utilization in metrics for stats table
@@ -632,6 +644,11 @@ class SimulationRunner:
                 "cum_exited":          self.metrics["n_exited"],
                 "cum_exits_by_reason": dict(self.metrics["exits_by_reason"]),
                 "cum_arrivals":        sum(self.metrics["arrivals_by_source"].values()),
+                # Provider capacity
+                "cum_provider_demand":   self.metrics["provider_demand"],
+                "cum_provider_served":   self.metrics["provider_served"],
+                "cum_provider_overflow": self.metrics["provider_overflow"],
+                "intake_queue_depth":    len(self._queues.intake_queue),
                 # Procedure queue snapshot
                 "procedure_queue_depth": self._queues.procedure_queue_depth(day),
                 "screening_queue_depth": self._queues.screening_queue_depth(day),
@@ -647,28 +664,87 @@ class SimulationRunner:
             # 2. New arrivals
             self._generate_arrivals(day)
 
-            # 3. Provider queues — proportional split, no provider-level
-            #    capacity constraint.  Real bottleneck is at procedure slots.
-            #    Outpatients (PCP/GYN/Specialist) are processed BEFORE
-            #    drop-ins (ER) so they get first priority on primary
-            #    screening slots.
+            # 3. Provider capacity — two stages:
+            #
+            #    A) ESTABLISHED patients with scheduled visits today are
+            #       collected first (they already have provider slots).
+            #    B) NEW arrivals from the INTAKE QUEUE fill remaining
+            #       provider capacity (FIFO, up to DAILY_PATIENTS total).
+            #
+            #    Once a new arrival sees a provider, they officially join
+            #    the patient pool and begin annual cycling.
+            #
+            #    This is the FIRST bottleneck: patients must see a
+            #    provider before reaching screening procedure slots.
+
+            daily_cap  = cfg.DAILY_PATIENTS
+            n_served   = 0
+
+            # ── A) Established patients with scheduled visits ────────────
+            established_today = []
             for provider in _NON_ER + ["er"]:
-                seen = self._queues.process_day(provider, day)
+                for p in self._queues.process_day(provider, day):
+                    established_today.append((p, provider))
 
-                for p in seen:
-                    p.wait_days = 0  # reset — no queue delay until overflow
+            # Established patients get priority — cap still applies
+            est_served  = established_today[:daily_cap]
+            est_overflow = established_today[daily_cap:]
 
-                    # Provider → screening delay: screening appointment is
-                    # scheduled cfg.TURNAROUND_DAYS["provider_to_screening"]
-                    # days after the provider visit.
-                    delay = cfg.TURNAROUND_DAYS.get("provider_to_screening", 0)
-                    if delay > 0:
-                        self._queues.schedule_followup(
-                            p, {"cancer": "_all", "step": "provider_screening",
-                                 "referral_day": day}, day + delay
-                        )
-                    else:
-                        self._screen_patient(p, day)
+            for p, _prov in est_served:
+                p.wait_days = 0
+                delay = cfg.TURNAROUND_DAYS.get("provider_to_screening", 0)
+                if delay > 0:
+                    self._queues.schedule_followup(
+                        p, {"cancer": "_all", "step": "provider_screening",
+                             "referral_day": day}, day + delay
+                    )
+                else:
+                    self._screen_patient(p, day)
+            n_served += len(est_served)
+
+            # Reschedule established overflow to next workday
+            for p, prov in est_overflow:
+                next_day = day + 1
+                if cfg.SKIP_WEEKENDS:
+                    while next_day % 7 >= 5:
+                        next_day += 1
+                self._queues.schedule_outpatient(p, prov, next_day)
+                p.wait_days += 1
+                p.log(day, f"PROVIDER FULL — rescheduled to day {next_day}")
+
+            # ── B) New arrivals from intake queue (FIFO) ─────────────────
+            remaining_cap = daily_cap - n_served
+            intake_served = 0
+
+            while remaining_cap > 0 and self._queues.intake_queue:
+                p, dest = self._queues.intake_queue.pop(0)
+
+                # Patient is seeing a provider for the first time
+                p.wait_days = 0
+                p.log(day, f"INTAKE — seen by {dest} (waited in queue)")
+
+                delay = cfg.TURNAROUND_DAYS.get("provider_to_screening", 0)
+                if delay > 0:
+                    self._queues.schedule_followup(
+                        p, {"cancer": "_all", "step": "provider_screening",
+                             "referral_day": day}, day + delay
+                    )
+                else:
+                    self._screen_patient(p, day)
+
+                remaining_cap -= 1
+                intake_served += 1
+                n_served += 1
+
+            # Track provider demand (post-warmup)
+            total_demand = len(established_today) + intake_served + len(self._queues.intake_queue)
+            if day >= self._warmup_day:
+                self.metrics["provider_demand"]   += len(established_today) + intake_served
+                self.metrics["provider_served"]   += n_served
+                self.metrics["provider_overflow"] += len(est_overflow)
+                self.metrics["daily_provider_demand"].append(
+                    (len(established_today) + intake_served, n_served, len(est_overflow))
+                )
 
             # Flush daily demand counters (post-warmup only)
             if day >= self._warmup_day:
@@ -700,64 +776,43 @@ class SimulationRunner:
 
     def _generate_arrivals(self, day: int) -> None:
         """
-        Create today's new patients and route them to provider queues.
+        Create today's new patients and place them in the intake queue.
 
-        In stable-population mode, arrivals come from distinct sources
-        defined in cfg.ARRIVAL_SOURCES — each with its own daily rate,
-        age range, and routing.  In standard mode, a single Poisson
-        process at self.daily_rate generates arrivals with mixed routing.
+        Arrivals are generated from cfg.ARRIVAL_SOURCES — each source has
+        its own Poisson rate and age range.  After generation, each patient
+        is independently routed to outpatient or ER via cfg.ARRIVAL_TYPE_PROBS.
+
+        Patients enter a FIFO intake queue.  SimulationRunner._tick() pulls
+        from this queue to fill remaining provider capacity (up to
+        cfg.DAILY_PATIENTS per day) after established patients are seated.
         """
+        _arrival_keys = list(cfg.ARRIVAL_TYPE_PROBS.keys())
+        _arrival_w    = list(cfg.ARRIVAL_TYPE_PROBS.values())
         _op_dest_keys = list(cfg.DESTINATION_PROBS_OUTPATIENT.keys())
         _op_dest_w    = list(cfg.DESTINATION_PROBS_OUTPATIENT.values())
 
-        if self.use_stable_population and hasattr(cfg, 'ARRIVAL_SOURCES'):
-            # ── Multi-source arrivals ─────────────────────────────────────
-            for source_name, source_cfg in cfg.ARRIVAL_SOURCES.items():
-                n = _poisson(source_cfg["daily_rate"])
-                age_range = source_cfg.get("age_range")
-                routing   = source_cfg.get("routing", "outpatient")
+        for source_name, source_cfg in cfg.ARRIVAL_SOURCES.items():
+            n = _poisson(source_cfg["daily_rate"])
+            age_range = source_cfg.get("age_range")
 
-                for _ in range(n):
-                    if routing == "er":
-                        dest  = "er"
-                        ptype = "drop_in"
-                        p = sample_patient(self._pid, day, dest, ptype,
-                                           age_range=age_range)
-                        self._pid += 1
-                        self._queues.add_dropin(p, "er")
-                    else:
-                        dest  = random.choices(_op_dest_keys, weights=_op_dest_w)[0]
-                        ptype = "outpatient"
-                        p = sample_patient(self._pid, day, dest, ptype,
-                                           age_range=age_range)
-                        self._pid += 1
-                        lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
-                        earliest = day + random.randint(lo, hi)
-                        self._queues.schedule_outpatient(p, dest, earliest)
+            for _ in range(n):
+                # Route: outpatient (80%) vs ER drop-in (20%)
+                arrival_type = random.choices(_arrival_keys, weights=_arrival_w)[0]
 
-                    self.metrics["arrivals_by_source"][source_name] += 1
-        else:
-            # ── Standard mode: single Poisson process ─────────────────────
-            _arrival_keys = list(cfg.ARRIVAL_TYPE_PROBS.keys())
-            _arrival_w    = list(cfg.ARRIVAL_TYPE_PROBS.values())
-
-            for _ in range(_poisson(self.daily_rate)):
-                arrival = random.choices(_arrival_keys, weights=_arrival_w)[0]
-
-                if arrival == "er":
+                if arrival_type == "er":
                     dest  = "er"
                     ptype = "drop_in"
-                    p = sample_patient(self._pid, day, dest, ptype)
-                    self._pid += 1
-                    self._queues.add_dropin(p, "er")
                 else:
                     dest  = random.choices(_op_dest_keys, weights=_op_dest_w)[0]
                     ptype = "outpatient"
-                    p = sample_patient(self._pid, day, dest, ptype)
-                    self._pid += 1
-                    lo, hi   = cfg.OUTPATIENT_LEAD_DAYS.get(dest, (1, 7))
-                    earliest = day + random.randint(lo, hi)
-                    self._queues.schedule_outpatient(p, dest, earliest)
+
+                p = sample_patient(self._pid, day, dest, ptype,
+                                   age_range=age_range)
+                self._pid += 1
+
+                # All new arrivals enter the intake queue (FIFO)
+                self._queues.intake_queue.append((p, dest))
+                self.metrics["arrivals_by_source"][source_name] += 1
 
     # =========================================================================
     # Screening

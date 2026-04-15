@@ -56,8 +56,11 @@ WORKFLOW_MODE = "fragmented"
 # ── Active Cancer Pathways ────────────────────────────────────────────────────
 ACTIVE_CANCERS = ["cervical", "lung"]
 
-# ── Arrivals (mirrors Sophia's parameters) ────────────────────────────────────
-# Total daily screening capacity = 200 patients across all providers.
+# ── Provider Throughput Cap ───────────────────────────────────────────────────
+# Maximum patients seen by ALL providers per day (PCP + GYN + Specialist + ER).
+# This is the FIRST bottleneck: patients must see a provider before reaching
+# screening procedure slots.  If more patients are scheduled than the cap,
+# overflow patients are rescheduled to the next workday.
 # PLACEHOLDER — replace with NYP scheduling / capacity data.
 DAILY_PATIENTS = 200
 
@@ -82,9 +85,9 @@ ARRIVAL_TYPE_PROBS = {
 }
 
 # ── Provider Daily Capacities ─────────────────────────────────────────────────
-# Proportional distribution — patients are split to providers by these
-# proportions.  There is no provider-level capacity constraint (no provider
-# overflow).  The real bottleneck is at procedure slots (CAPACITIES above).
+# Reference breakdown of DAILY_PATIENTS by provider type.  The actual
+# bottleneck is enforced as a TOTAL cap (DAILY_PATIENTS) — not per-provider.
+# Outpatients (PCP/GYN/Specialist) get priority; ER fills remaining slots.
 # PLACEHOLDER — replace with NYP capacity data.
 PROVIDER_CAPACITY = {
     "pcp":          70,   # PLACEHOLDER — 35% of 200
@@ -496,66 +499,51 @@ NYC_ELIGIBLE_POPULATION = 1_500_000
 INITIAL_POOL_SIZE = 1_500
 
 # ── Patient arrival sources ──────────────────────────────────────────────────
-# Each source represents a distinct pathway into NYP's screening system.
-# Patients from different sources have different age profiles and routing.
+# Each source is a Poisson process that generates eligible women seeking care.
+# All arrivals enter the intake queue (FIFO).  Outpatient vs ER routing is
+# determined AFTER arrival by ARRIVAL_TYPE_PROBS — NOT per-source.
 #
 # Fields:
-#   daily_rate  — mean Poisson arrivals/day for this source
+#   daily_rate  — mean Poisson arrivals/day (sim scale) for this source
 #   age_range   — (min, max) age constraint; sampled within this range
-#   routing     — "outpatient" | "er" | "census" (census = use ARRIVAL_TYPE_PROBS)
 #
 # The total arrival rate is the sum across all sources.  Pool size emerges
-# from total arrivals vs. total exits (mortality + attrition + LTFU + ineligible).
+# from total arrivals vs. total exits (mortality + attrition + LTFU + aging out).
 #
 # Sources:
-#   aging_in       — women reaching screening eligibility age (turning 21)
-#                    Source: ~4.3M US women turn 21/year; NYC share ~1.4%;
-#                    NYP market share ~5% → ~3/day at scale factor 100
-#                    PLACEHOLDER — calibrate to NYP panel acquisition data
-#   new_mover      — women relocating to NYC or switching into NYP network
-#                    Source: NYC net domestic migration + international inflow
-#                    PLACEHOLDER — calibrate to NYP new-patient registration data
-#   er_walkin      — unplanned ER visits where screening may be opportunistic
-#                    Source: NYP ER volume ~620K/year, ~50% female, ~30% eligible age
-#                    PLACEHOLDER — calibrate to NYP ER screening data
-#   referral       — sent by external provider specifically for screening
-#                    PLACEHOLDER — calibrate to NYP referral data
-# Total Poisson arrival rate (λ) and routing split
-TOTAL_DAILY_ARRIVALS = 1.6                # λ_total — mean Poisson arrivals/day
-_OUTPATIENT_SHARE    = 0.80               # 80% outpatient (NYP Facts & Figures)
-_ER_SHARE            = 0.20               # 20% drop-in ER
+#   aging_in   — women reaching screening eligibility age (turning 21)
+#                Source: ~4.3M US women turn 21/yr; NYC share ~1.4%;
+#                PLACEHOLDER — calibrate to NYP panel acquisition data
+#   new_mover  — women relocating to NYC or switching into NYP network
+#                Source: NYC net domestic migration + international inflow
+#                PLACEHOLDER — calibrate to NYP new-patient registration data
+#   referral   — sent by external provider specifically for screening
+#                PLACEHOLDER — calibrate to NYP referral data
+#
+# NOTE: ER walk-ins are NOT a separate Poisson source.  Instead, each
+# arriving patient is independently routed to outpatient (80%) or ER (20%)
+# via ARRIVAL_TYPE_PROBS.  This ensures the ER fraction is a proportion of
+# total arrivals, not an additive arrival stream.
+#
+TOTAL_DAILY_ARRIVALS = 1.6                # λ_total — mean Poisson arrivals/day (sim scale)
 
-# Outpatient sub-source shares (must sum to 1.0 within outpatient)
-_OP_AGING_IN  = 0.4141                    # aging_in  share of outpatient
-_OP_NEW_MOVER = 0.3359                    # new_mover share of outpatient
-_OP_REFERRAL  = 0.2500                    # referral  share of outpatient
+# Sub-source shares (must sum to 1.0)
+_SRC_AGING_IN  = 0.40                     # aging_in  share of total arrivals
+_SRC_NEW_MOVER = 0.35                     # new_mover share of total arrivals
+_SRC_REFERRAL  = 0.25                     # referral  share of total arrivals
 
 ARRIVAL_SOURCES = {
-    # Outpatient sources: λ = TOTAL_DAILY_ARRIVALS × _OUTPATIENT_SHARE × sub-share
-    #   aging_in  → Poisson(1.6 × 0.80 × 0.4141) = Poisson(0.53)
-    #   new_mover → Poisson(1.6 × 0.80 × 0.3359) = Poisson(0.43)
-    #   referral  → Poisson(1.6 × 0.80 × 0.2500) = Poisson(0.32)
-    # ER source:    λ = TOTAL_DAILY_ARRIVALS × _ER_SHARE
-    #   er_walkin → Poisson(1.6 × 0.20)           = Poisson(0.32)
     "aging_in": {
-        "daily_rate": TOTAL_DAILY_ARRIVALS * _OUTPATIENT_SHARE * _OP_AGING_IN,
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _SRC_AGING_IN,   # Poisson(0.64)
         "age_range":  (21, 25),
-        "routing":    "outpatient",
     },
     "new_mover": {
-        "daily_rate": TOTAL_DAILY_ARRIVALS * _OUTPATIENT_SHARE * _OP_NEW_MOVER,
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _SRC_NEW_MOVER,  # Poisson(0.56)
         "age_range":  (21, 85),     # Census age distribution within range
-        "routing":    "outpatient",
-    },
-    "er_walkin": {
-        "daily_rate": TOTAL_DAILY_ARRIVALS * _ER_SHARE,
-        "age_range":  (21, 85),
-        "routing":    "er",
     },
     "referral": {
-        "daily_rate": TOTAL_DAILY_ARRIVALS * _OUTPATIENT_SHARE * _OP_REFERRAL,
+        "daily_rate": TOTAL_DAILY_ARRIVALS * _SRC_REFERRAL,   # Poisson(0.40)
         "age_range":  (30, 75),     # referred patients skew middle-aged
-        "routing":    "outpatient",
     },
 }
 

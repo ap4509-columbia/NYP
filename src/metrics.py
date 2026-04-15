@@ -127,6 +127,12 @@ def initialize_metrics() -> dict:
         "mortality_count":    0,   # total patients removed by mortality events
         "pool_size_snapshot": [],  # (day, pool_size) snapshots for longitudinal plot
 
+        # ── Provider capacity ─────────────────────────────────────────────────
+        "provider_demand":     0,   # total patients who tried to see a provider
+        "provider_served":     0,   # patients seen (within daily cap)
+        "provider_overflow":   0,   # patients turned away (rescheduled to next day)
+        "daily_provider_demand": [],   # [(demand, served, overflow), ...] per workday
+
         # ── Multi-source tracking ─────────────────────────────────────────────
         "arrivals_by_source":  defaultdict(int),   # arrival source → count
         "exits_by_source":     defaultdict(int),   # exit source/subtype → count
