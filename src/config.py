@@ -57,7 +57,7 @@ WORKFLOW_MODE = "fragmented"
 ACTIVE_CANCERS = ["cervical", "lung"]
 
 # ── Provider Throughput Cap ───────────────────────────────────────────────────
-# Maximum patients seen by ALL providers per day (PCP + GYN + Specialist + ER).
+# Maximum patients seen by ALL providers per day (PCP + GYN + ER).
 # This is the FIRST bottleneck: patients must see a provider before reaching
 # screening procedure slots.  If more patients are scheduled than the cap,
 # overflow patients are rescheduled to the next workday.
@@ -77,26 +77,6 @@ ARRIVAL_TYPE_PROBS = {
     "er":         0.20,
 }
 
-# ── Provider Daily Capacities ─────────────────────────────────────────────────
-# Reference breakdown of DAILY_PATIENTS by provider type.  The actual
-# bottleneck is enforced as a TOTAL cap (DAILY_PATIENTS) — not per-provider.
-# Outpatients (PCP/GYN/Specialist) get priority; ER fills remaining slots.
-# PLACEHOLDER — replace with NYP capacity data.
-PROVIDER_CAPACITY = {
-    "pcp":          70,   # PLACEHOLDER — 35% of 200
-    "gynecologist": 52,   # PLACEHOLDER — 26% of 200
-    "er":           43,   # PLACEHOLDER — 22% of 200
-}
-
-# Scheduling lead time for new outpatient appointments (uniform lo–hi days ahead).
-# PLACEHOLDER — replace with NYP scheduling data.
-OUTPATIENT_LEAD_DAYS = {
-    "pcp":          (1,  7),
-    "gynecologist": (7,  21),
-}
-
-# Fraction of ER arrivals flagged as critical (return next day for follow-up).
-ER_CRITICAL_PROB = 0.50         # PLACEHOLDER
 
 # ── Age Strata ────────────────────────────────────────────────────────────────
 AGE_STRATA = {
@@ -234,19 +214,11 @@ CERVICAL_RESULT_PROBS = {
 # Lab/result turnaround times (calendar days)
 # Source: AiP Parameters PDF
 TURNAROUND_DAYS = {
-    # Provider → primary screening scheduling delay
-    "provider_to_screening": 10,    # PLACEHOLDER — days from provider visit to screening appointment
-
-    # Lab / radiology processing times
+    # Lab / radiology processing times (procedure → result available)
     "cytology":               7,    # Pap cytology alone; Source: AiP Parameters PDF
     "co_test":               10,    # HPV co-testing; Source: AiP Parameters PDF
     "hpv_alone":              5,    # Primary HPV alone; Source: AiP Parameters PDF
     "ldct_notification":     10,    # PLACEHOLDER — LDCT result to patient notification
-    "ldct_to_workup":        21,    # Positive LDCT result to diagnostic workup; Source: AiP Parameters PDF
-
-    # Patient notification delays
-    "notification_normal":   10,    # Total days to patient notification (normal); Source: AiP Parameters PDF
-    "notification_abnormal": 14,    # Total days to patient notification (abnormal); Source: AiP Parameters PDF
 
     # Secondary screening → result turnaround
     "colposcopy_result":     10,    # PLACEHOLDER — days from colposcopy to pathology result
