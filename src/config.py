@@ -468,25 +468,32 @@ ABNORMAL_FOLLOWUP_DAYS = {
 # SCALE FACTOR
 # ─────────────────────────────────────────────────────────────────────────────
 # 1 simulated patient represents POPULATION_SCALE_FACTOR real patients.
-# NYC eligible women ~1.5M → 1.5M / 100 = 15,000 simulated patients.
 # All metrics scale by this factor when extrapolating to real-world counts.
 # =============================================================================
 
 # ── Population scale ─────────────────────────────────────────────────────────
 POPULATION_SCALE_FACTOR = 100          # 1 sim patient = 100 NYC women
 
-# Total eligible women in NYC (real-world estimate).
-# Used to compute population capture rate and foregone revenue from the
-# uncaptured population (eligible but not in the patient pool).
+# Total eligible women in NYC metro area (real-world estimate).
+# This is the FULL eligible population (all providers, not just NYP).
+# Used to compute NYP's population capture rate and foregone revenue
+# from uncaptured women (eligible but not in NYP's patient pool).
 # Source: ACS 2020 5-Year Estimates — NYC women aged 21–80 ≈ 1.5M
-# PLACEHOLDER — replace with NYP-specific catchment area estimate
+# PLACEHOLDER — replace with refined NYC metro catchment estimate
 NYC_ELIGIBLE_POPULATION = 1_500_000
 
 # ── Initial seed population ──────────────────────────────────────────────────
-# Number of established patients to seed at day 0.  The pool then grows or
-# shrinks organically as arrivals join and patients exit via mortality,
-# attrition, LTFU, or ineligibility.  Set to 0 for a pure cold-start.
-INITIAL_POOL_SIZE = 15_000
+# Number of NYP established patients to seed at day 0.  This represents
+# NYP's existing patient panel — a FRACTION of NYC_ELIGIBLE_POPULATION.
+# The pool then grows or shrinks organically as arrivals join and patients
+# exit via mortality, attrition, LTFU, or ineligibility.
+#
+# At POPULATION_SCALE_FACTOR=100:
+#   1,500 sim patients = 150,000 real women ≈ 10% of 1.5M eligible
+#
+# PLACEHOLDER — replace with NYP's actual established patient panel size.
+# Set to 0 for a pure cold-start.
+INITIAL_POOL_SIZE = 1_500
 
 # ── Patient arrival sources ──────────────────────────────────────────────────
 # Each source represents a distinct pathway into NYP's screening system.
