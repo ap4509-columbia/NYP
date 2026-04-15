@@ -7,12 +7,13 @@
 # one full day: new arrivals, provider visits, procedure slot allocation,
 # and any follow-up appointments that fall due.
 #
-# Provider capacity (first bottleneck)
-# -------------------------------------
-# Each day, at most cfg.DAILY_PATIENTS patients are seen across all
-# provider types (PCP / GYN / Specialist / ER).  Outpatients are
-# prioritised over ER drop-ins.  If demand exceeds the daily cap,
-# overflow patients are rescheduled to the next workday.
+# Provider capacity (intake bottleneck)
+# --------------------------------------
+# New patients from the intake queue compete for cfg.DAILY_PATIENTS
+# provider slots per day.  Established patients bypass this — they
+# already have a provider and go directly to screening.
+# If intake demand exceeds the daily cap, overflow patients stay in
+# the FIFO queue until the next workday.
 #
 # Procedure slot queueing (second bottleneck)
 # --------------------------------------------
@@ -104,8 +105,9 @@ class PatientQueues:
     Day-by-day queue manager for patient visits and procedure slots.
 
     Two bottleneck levels:
-      1. Provider capacity — total patients seen/day capped at DAILY_PATIENTS.
-         Enforced in SimulationRunner._tick(), not here.
+      1. Intake queue — new patients compete for DAILY_PATIENTS provider
+         slots per day.  Established patients bypass this entirely.
+         Enforced in SimulationRunner._tick().
       2. Procedure slots — primary screenings capped per procedure type.
          Enforced here via consume_slot().
 
@@ -668,88 +670,41 @@ class SimulationRunner:
             # 2. New arrivals
             self._generate_arrivals(day)
 
-            # 3. Provider capacity — two stages:
-            #
-            #    A) ESTABLISHED patients with scheduled visits today are
-            #       collected first (they already have provider slots).
-            #    B) NEW arrivals from the INTAKE QUEUE fill remaining
-            #       provider capacity (FIFO, up to DAILY_PATIENTS total).
-            #
-            #    Once a new arrival sees a provider, they officially join
-            #    the patient pool and begin annual cycling.
-            #
-            #    This is the FIRST bottleneck: patients must see a
-            #    provider before reaching screening procedure slots.
-
-            daily_cap  = cfg.DAILY_PATIENTS
-            n_served   = 0
-
-            # ── A) Established patients with scheduled visits ────────────
-            established_today = []
+            # 3A. ESTABLISHED patients — go directly to screening.
+            #     They already have a provider relationship; no need for
+            #     a new provider visit.  No capacity cap applies here.
             for provider in _NON_ER + ["er"]:
                 for p in self._queues.process_day(provider, day):
-                    established_today.append((p, provider))
-
-            # Established patients get priority — cap still applies
-            est_served  = established_today[:daily_cap]
-            est_overflow = established_today[daily_cap:]
-
-            for p, _prov in est_served:
-                p.wait_days = 0
-                delay = cfg.TURNAROUND_DAYS.get("provider_to_screening", 0)
-                if delay > 0:
-                    self._queues.schedule_followup(
-                        p, {"cancer": "_all", "step": "provider_screening",
-                             "referral_day": day}, day + delay
-                    )
-                else:
+                    p.wait_days = 0
                     self._screen_patient(p, day)
-            n_served += len(est_served)
 
-            # Reschedule established overflow to next workday
-            for p, prov in est_overflow:
-                next_day = day + 1
-                if cfg.SKIP_WEEKENDS:
-                    while next_day % 7 >= 5:
-                        next_day += 1
-                self._queues.schedule_outpatient(p, prov, next_day)
-                p.wait_days += 1
-                p.log(day, f"PROVIDER FULL — rescheduled to day {next_day}")
-
-            # ── B) New arrivals from intake queue (FIFO) ─────────────────
-            remaining_cap = daily_cap - n_served
+            # 3B. NEW arrivals from INTAKE QUEUE — provider bottleneck.
+            #     Up to DAILY_PATIENTS (200) new patients per day are
+            #     pulled FIFO from the intake queue, see a provider for
+            #     the first time, then proceed to screening.
+            #     Patients remaining in the queue wait for the next day.
+            daily_cap     = cfg.DAILY_PATIENTS
             intake_served = 0
 
-            while remaining_cap > 0 and self._queues.intake_queue:
+            while intake_served < daily_cap and self._queues.intake_queue:
                 p, dest = self._queues.intake_queue.pop(0)
 
-                # Patient is seeing a provider for the first time
                 p.wait_days = 0
-                p.log(day, f"INTAKE — seen by {dest} (waited in queue)")
+                p.log(day, f"INTAKE — seen by {dest}, entering screening")
+                self._screen_patient(p, day)
 
-                delay = cfg.TURNAROUND_DAYS.get("provider_to_screening", 0)
-                if delay > 0:
-                    self._queues.schedule_followup(
-                        p, {"cancer": "_all", "step": "provider_screening",
-                             "referral_day": day}, day + delay
-                    )
-                else:
-                    self._screen_patient(p, day)
-
-                remaining_cap -= 1
                 intake_served += 1
-                n_served += 1
 
             self.metrics["intake_queue_served"] += intake_served
 
             # Track provider demand (post-warmup)
-            total_demand = len(established_today) + intake_served + len(self._queues.intake_queue)
+            intake_waiting = len(self._queues.intake_queue)
             if day >= self._warmup_day:
-                self.metrics["provider_demand"]   += len(established_today) + intake_served
-                self.metrics["provider_served"]   += n_served
-                self.metrics["provider_overflow"] += len(est_overflow)
+                self.metrics["provider_demand"]   += intake_served + intake_waiting
+                self.metrics["provider_served"]   += intake_served
+                self.metrics["provider_overflow"] += intake_waiting
                 self.metrics["daily_provider_demand"].append(
-                    (len(established_today) + intake_served, n_served, len(est_overflow))
+                    (intake_served + intake_waiting, intake_served, intake_waiting)
                 )
 
             # Flush daily demand counters (post-warmup only)
