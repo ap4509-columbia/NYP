@@ -70,6 +70,7 @@ DAILY_PATIENTS = 2                        # PLACEHOLDER — sim scale (× POPULA
 DESTINATION_PROBS_OUTPATIENT = {
     "pcp":          0.852,   # Source: AiP Parameters PDF
     "gynecologist": 0.148,   # Source: AiP Parameters PDF
+    "specialist":   0.00,    # Source: AiP Parameters PDF
 }
 # Arrival type split (Source: NYP Facts & Figures — 2.5M outpatient + 620K ER annually; https://www.nyp.org/about/facts-and-figures)
 ARRIVAL_TYPE_PROBS = {
@@ -378,6 +379,7 @@ CAPACITIES = {
 RESCHEDULE_DELAY_DAYS = {
     "pcp":          28,   # Source: AiP Parameters PDF
     "gynecologist": 38,   # Source: AiP Parameters PDF
+    "specialist":   30,   # PLACEHOLDER
     "er":            7,   # PLACEHOLDER
     "default":      30,   # PLACEHOLDER — fallback if provider not specified
 }

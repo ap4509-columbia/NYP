@@ -83,7 +83,7 @@ from metrics import (
 )
 from db import SimulationDB
 
-_NON_ER       = ["pcp", "gynecologist"]
+_NON_ER       = ["pcp", "gynecologist", "specialist"]
 _ALL_PROVIDERS = _NON_ER + ["er"]
 
 
