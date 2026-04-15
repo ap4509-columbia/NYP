@@ -436,6 +436,8 @@ class SimulationRunner:
                 "cum_exited":          self.metrics["n_exited"],
                 "cum_exits_by_reason": dict(self.metrics["exits_by_reason"]),
                 "cum_arrivals":        sum(self.metrics["arrivals_by_source"].values()),
+                "cum_intake_total":      self.metrics["intake_queue_total"],
+                "cum_intake_served":     self.metrics["intake_queue_served"],
                 "cum_provider_demand":   self.metrics["provider_demand"],
                 "cum_provider_served":   self.metrics["provider_served"],
                 "cum_provider_overflow": self.metrics["provider_overflow"],
@@ -645,10 +647,12 @@ class SimulationRunner:
                 "cum_exits_by_reason": dict(self.metrics["exits_by_reason"]),
                 "cum_arrivals":        sum(self.metrics["arrivals_by_source"].values()),
                 # Provider capacity
+                "cum_intake_total":      self.metrics["intake_queue_total"],
+                "cum_intake_served":     self.metrics["intake_queue_served"],
+                "intake_queue_depth":    len(self._queues.intake_queue),
                 "cum_provider_demand":   self.metrics["provider_demand"],
                 "cum_provider_served":   self.metrics["provider_served"],
                 "cum_provider_overflow": self.metrics["provider_overflow"],
-                "intake_queue_depth":    len(self._queues.intake_queue),
                 # Procedure queue snapshot
                 "procedure_queue_depth": self._queues.procedure_queue_depth(day),
                 "screening_queue_depth": self._queues.screening_queue_depth(day),
@@ -736,6 +740,8 @@ class SimulationRunner:
                 intake_served += 1
                 n_served += 1
 
+            self.metrics["intake_queue_served"] += intake_served
+
             # Track provider demand (post-warmup)
             total_demand = len(established_today) + intake_served + len(self._queues.intake_queue)
             if day >= self._warmup_day:
@@ -812,6 +818,7 @@ class SimulationRunner:
 
                 # All new arrivals enter the intake queue (FIFO)
                 self._queues.intake_queue.append((p, dest))
+                self.metrics["intake_queue_total"] += 1
                 self.metrics["arrivals_by_source"][source_name] += 1
 
     # =========================================================================

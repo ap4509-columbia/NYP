@@ -511,8 +511,9 @@ INITIAL_POOL_SIZE = 1_500
 # from total arrivals vs. total exits (mortality + attrition + LTFU + aging out).
 #
 # Sources:
-#   aging_in   — women reaching screening eligibility age (turning 21)
-#                Source: ~4.3M US women turn 21/yr; NYC share ~1.4%;
+#   aging_in   — eligible women (21+) from the NYC population seeking care
+#                at NYP for the first time.  Covers the full eligible age
+#                range — not just women turning 21.
 #                PLACEHOLDER — calibrate to NYP panel acquisition data
 #   new_mover  — women relocating to NYC or switching into NYP network
 #                Source: NYC net domestic migration + international inflow
@@ -535,11 +536,11 @@ _SRC_REFERRAL  = 0.25                     # referral  share of total arrivals
 ARRIVAL_SOURCES = {
     "aging_in": {
         "daily_rate": TOTAL_DAILY_ARRIVALS * _SRC_AGING_IN,   # Poisson(0.64)
-        "age_range":  (21, 25),
+        "age_range":  (21, 80),     # full eligible age range
     },
     "new_mover": {
         "daily_rate": TOTAL_DAILY_ARRIVALS * _SRC_NEW_MOVER,  # Poisson(0.56)
-        "age_range":  (21, 85),     # Census age distribution within range
+        "age_range":  (21, 80),     # full eligible age range
     },
     "referral": {
         "daily_rate": TOTAL_DAILY_ARRIVALS * _SRC_REFERRAL,   # Poisson(0.40)

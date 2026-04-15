@@ -127,6 +127,10 @@ def initialize_metrics() -> dict:
         "mortality_count":    0,   # total patients removed by mortality events
         "pool_size_snapshot": [],  # (day, pool_size) snapshots for longitudinal plot
 
+        # ── Intake queue (unserved demand tracking) ─────────────────────────
+        "intake_queue_total":  0,   # cumulative patients added to intake queue
+        "intake_queue_served": 0,   # cumulative patients pulled from queue → seen
+
         # ── Provider capacity ─────────────────────────────────────────────────
         "provider_demand":     0,   # total patients who tried to see a provider
         "provider_served":     0,   # patients seen (within daily cap)
@@ -496,62 +500,37 @@ def compute_revenue(metrics: dict) -> dict:
     }
     foregone_total = sum(foregone.values())
 
-    # ── Uncaptured population revenue ────────────────────────────────────────
-    # Eligible NYC women who are NOT in the patient pool at all.
-    # These women never entered the system — distinct from LTFU (entered but
-    # dropped out).  Estimated from the gap between NYC_ELIGIBLE_POPULATION
-    # and the average pool size × POPULATION_SCALE_FACTOR.
+    # ── Unserved demand revenue ─────────────────────────────────────────────
+    # "Unserved demand" = patients who entered the intake queue but were
+    # never screened over the full simulation.  These are real women who
+    # sought care at NYP but remained in the queue at simulation end.
     #
-    # Revenue estimate: each uncaptured woman represents one missed screening
-    # per screening interval (cervical every 3 yrs, lung every 1 yr).
-    # We annualize the missed screening revenue.
+    # Revenue estimate: each unserved patient represents one missed screening.
+    # We use cervical screening revenue as the baseline (most common).
 
-    # Get average pool size from year-end checkpoints
-    year_chk = metrics.get("year_checkpoints", [])
-    pool_sizes = [c.get("pool_size", 0) for c in year_chk if c.get("pool_size") is not None]
-    avg_pool_sim = sum(pool_sizes) / len(pool_sizes) if pool_sizes else 0
-    avg_pool_real = avg_pool_sim * cfg.POPULATION_SCALE_FACTOR
+    intake_total  = metrics.get("intake_queue_total", 0)
+    intake_served = metrics.get("intake_queue_served", 0)
+    unserved_sim  = max(intake_total - intake_served, 0)
+    unserved_real = unserved_sim * cfg.POPULATION_SCALE_FACTOR
 
-    uncaptured_women = max(cfg.NYC_ELIGIBLE_POPULATION - avg_pool_real, 0)
+    # Each unserved patient missed at least one screening visit
+    unserved_total = unserved_sim * avg_cerv_screen
 
-    # Annualized missed screening revenue per uncaptured woman:
-    # - Cervical: eligible ages 21-65; screened every 3 years → 1/3 per year
-    # - Lung: eligible ages 50-80, smokers only; screened annually
-    # Use population prevalence estimates for eligibility fractions
-    cerv_eligible_frac = 0.80    # PLACEHOLDER — fraction of eligible-age women due for cervical
-    lung_eligible_frac = 0.04    # PLACEHOLDER — fraction meeting lung screening criteria
-    cerv_interval_yrs  = 3.0
-    lung_interval_yrs  = 1.0
-
-    uncaptured_annual_cerv = (
-        uncaptured_women * cerv_eligible_frac / cerv_interval_yrs * avg_cerv_screen
-    )
-    uncaptured_annual_lung = (
-        uncaptured_women * lung_eligible_frac / lung_interval_yrs * rev["ldct"]
-    )
-    uncaptured_annual_total = uncaptured_annual_cerv + uncaptured_annual_lung
-
-    # Scale to simulation duration (post-warmup years)
-    sim_years = max((cfg.SIM_YEARS - cfg.WARMUP_YEARS), 1)
-    uncaptured_total = uncaptured_annual_total * sim_years
-
-    uncaptured = {
-        "cervical_screening": uncaptured_annual_cerv * sim_years,
-        "lung_ldct":          uncaptured_annual_lung * sim_years,
-    }
+    # Capture rate: fraction of intake demand that was actually served
+    demand_capture_rate = intake_served / max(intake_total, 1)
 
     return {
         "realized_total":        realized_total,
         "foregone_total":        foregone_total,
         "realized_by_procedure": realized,
         "foregone_by_node":      foregone,
-        # Population capture
-        "uncaptured_total":      uncaptured_total,
-        "uncaptured_by_cancer":  uncaptured,
-        "uncaptured_women":      uncaptured_women,
-        "avg_pool_real":         avg_pool_real,
-        "nyc_eligible":          cfg.NYC_ELIGIBLE_POPULATION,
-        "capture_rate":          avg_pool_real / max(cfg.NYC_ELIGIBLE_POPULATION, 1),
+        # Unserved demand (intake queue)
+        "unserved_total":        unserved_total,
+        "unserved_count_sim":    unserved_sim,
+        "unserved_count_real":   unserved_real,
+        "intake_total_sim":      intake_total,
+        "intake_served_sim":     intake_served,
+        "demand_capture_rate":   demand_capture_rate,
     }
 
 
