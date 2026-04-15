@@ -306,14 +306,12 @@ LUNG_RADS_REPEAT_INTERVALS = {
 LTFU_PROBS = {
     # ── Queue LTFU (daily hazard) ────────────────────────────────────────────
     # Each day a patient overflows procedure capacity and retries, there is a
-    # small probability they abandon the queue (geometric/exponential model).
+    # probability they abandon the queue (geometric/exponential model).
     # Median days in queue before abandoning ≈ ln(2) / daily_prob.
-    #   primary:   0.002/day → median ~346 days  PLACEHOLDER
-    #   secondary: 0.005/day → median ~139 days  PLACEHOLDER
-    #   treatment: 0.003/day → median ~231 days  PLACEHOLDER
-    "queue_primary_daily":   0.002,    # PLACEHOLDER — primary screening retry queue
-    "queue_secondary_daily": 0.005,    # PLACEHOLDER — colposcopy / lung biopsy retry queue
-    "queue_treatment_daily": 0.003,    # PLACEHOLDER — LEEP / cone biopsy retry queue
+    #   all queues: 0.10/day → median ~6.9 days
+    "queue_primary_daily":   0.10,     # primary screening retry queue
+    "queue_secondary_daily": 0.10,     # colposcopy / lung biopsy retry queue
+    "queue_treatment_daily": 0.10,     # LEEP / cone biopsy retry queue
 
     # ── Reschedule probability ──────────────────────────────────────────────
     # P(patient cannot make it today and reschedules to the next day).
