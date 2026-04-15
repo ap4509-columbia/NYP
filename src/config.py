@@ -397,16 +397,16 @@ POST_TREATMENT_DELAY_DAYS = {
 # abnormal primary results enter these queues.
 CAPACITIES = {
     # Primary screening slots
-    "cytology":    8,     # PLACEHOLDER — replace with NYP lab throughput
-    "hpv_alone":   8,     # PLACEHOLDER — replace with NYP lab throughput
-    "co_test":     8,     # PLACEHOLDER — HPV + cytology combo; replace with NYP lab throughput
+    "cytology":    4,     # PLACEHOLDER — replace with NYP lab throughput
+    "hpv_alone":   4,     # PLACEHOLDER — replace with NYP lab throughput
+    "co_test":     4,     # PLACEHOLDER — HPV + cytology combo; replace with NYP lab throughput
     "ldct":        4,     # PLACEHOLDER — replace with NYP radiology capacity
     # Secondary / diagnostic slots
-    "colposcopy":  8,     # PLACEHOLDER — replace with NYP GYN procedure data
-    "lung_biopsy": 2,     # PLACEHOLDER — replace with NYP IR capacity
+    "colposcopy":  4,     # PLACEHOLDER — replace with NYP GYN procedure data
+    "lung_biopsy": 4,     # PLACEHOLDER — replace with NYP IR capacity
     # Treatment slots
-    "leep":        5,     # PLACEHOLDER — replace with NYP OR scheduling data
-    "cone_biopsy": 3,     # PLACEHOLDER — replace with NYP OR scheduling data
+    "leep":        4,     # PLACEHOLDER — replace with NYP OR scheduling data
+    "cone_biopsy": 4,     # PLACEHOLDER — replace with NYP OR scheduling data
 }
 
 # ── Unscreened Re-entry Delay (days) ──────────────────────────────────────────
@@ -524,7 +524,7 @@ INITIAL_POOL_SIZE = 1_500
 # via ARRIVAL_TYPE_PROBS.  This ensures the ER fraction is a proportion of
 # total arrivals, not an additive arrival stream.
 #
-TOTAL_DAILY_ARRIVALS = 3.2                # PLACEHOLDER — λ_total mean Poisson arrivals/day (sim scale)
+TOTAL_DAILY_ARRIVALS = 6.4                # PLACEHOLDER — λ_total mean Poisson arrivals/day (sim scale)
 
 # Sub-source shares (must sum to 1.0)
 _SRC_AGING_IN  = 0.40                     # PLACEHOLDER — aging_in  share of total arrivals
