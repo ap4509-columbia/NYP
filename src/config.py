@@ -524,7 +524,7 @@ INITIAL_POOL_SIZE = 1_500
 # via ARRIVAL_TYPE_PROBS.  This ensures the ER fraction is a proportion of
 # total arrivals, not an additive arrival stream.
 #
-TOTAL_DAILY_ARRIVALS = 1.6                # λ_total — mean Poisson arrivals/day (sim scale)
+TOTAL_DAILY_ARRIVALS = 3.2                # PLACEHOLDER — λ_total mean Poisson arrivals/day (sim scale)
 
 # Sub-source shares (must sum to 1.0)
 _SRC_AGING_IN  = 0.40                     # PLACEHOLDER — aging_in  share of total arrivals
