@@ -250,7 +250,7 @@ TURNAROUND_DAYS = {
     "cytology":               7,    # Pap cytology alone; Source: AiP Parameters PDF
     "co_test":               10,    # HPV co-testing; Source: AiP Parameters PDF
     "hpv_alone":              5,    # Primary HPV alone; Source: AiP Parameters PDF
-    "ldct_notification":      5,    # LDCT result to patient notification; Source: AiP Parameters PDF
+    "ldct_notification":     10,    # PLACEHOLDER — LDCT result to patient notification
     "ldct_to_workup":        21,    # Positive LDCT result to diagnostic workup; Source: AiP Parameters PDF
 
     # Patient notification delays
