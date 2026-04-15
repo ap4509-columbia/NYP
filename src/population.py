@@ -442,7 +442,10 @@ def _sample_established_destination() -> str:
     ER visits are unplanned and handled via the drop-in flow. Redistributes
     ER's weight proportionally across the three non-ER providers.
     """
-    non_er = {k: v for k, v in cfg.DESTINATION_PROBS.items() if k != "er"}
+    # Use DESTINATION_PROBS_OUTPATIENT (specialist=0, er=0) — NOT the
+    # legacy DESTINATION_PROBS which still has specialist at 20%.
+    non_er = {k: v for k, v in cfg.DESTINATION_PROBS_OUTPATIENT.items()
+              if k != "er" and v > 0}
     keys    = list(non_er.keys())
     weights = list(non_er.values())
     return random.choices(keys, weights=weights, k=1)[0]

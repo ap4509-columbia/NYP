@@ -64,19 +64,12 @@ ACTIVE_CANCERS = ["cervical", "lung"]
 # PLACEHOLDER — replace with NYP scheduling / capacity data.
 DAILY_PATIENTS = 2                        # PLACEHOLDER — sim scale (× POPULATION_SCALE_FACTOR = 200 real/day)
 
-DESTINATION_PROBS = {
-    "pcp":          0.35,
-    "gynecologist": 0.25,
-    "specialist":   0.20,
-    "er":           0.20,
-}
-
 # Outpatient routing: PCP vs GYN (Source: AiP Parameters PDF; NYP operational data)
+# Specialist = 0% (not used for primary screening routing).
+# ER routing is handled separately via ARRIVAL_TYPE_PROBS (20% of arrivals).
 DESTINATION_PROBS_OUTPATIENT = {
     "pcp":          0.852,   # Source: AiP Parameters PDF
     "gynecologist": 0.148,   # Source: AiP Parameters PDF
-    "specialist":   0.00,    # Source: AiP Parameters PDF
-    "er":           0.00,    # Source: AiP Parameters PDF
 }
 # Arrival type split (Source: NYP Facts & Figures — 2.5M outpatient + 620K ER annually; https://www.nyp.org/about/facts-and-figures)
 ARRIVAL_TYPE_PROBS = {
@@ -92,7 +85,6 @@ ARRIVAL_TYPE_PROBS = {
 PROVIDER_CAPACITY = {
     "pcp":          70,   # PLACEHOLDER — 35% of 200
     "gynecologist": 52,   # PLACEHOLDER — 26% of 200
-    "specialist":   35,   # PLACEHOLDER — 17% of 200
     "er":           43,   # PLACEHOLDER — 22% of 200
 }
 
@@ -101,7 +93,6 @@ PROVIDER_CAPACITY = {
 OUTPATIENT_LEAD_DAYS = {
     "pcp":          (1,  7),
     "gynecologist": (7,  21),
-    "specialist":   (14, 28),
 }
 
 # Fraction of ER arrivals flagged as critical (return next day for follow-up).
@@ -415,7 +406,6 @@ CAPACITIES = {
 RESCHEDULE_DELAY_DAYS = {
     "pcp":          28,   # Source: AiP Parameters PDF
     "gynecologist": 38,   # Source: AiP Parameters PDF
-    "specialist":   30,   # PLACEHOLDER
     "er":            7,   # PLACEHOLDER
     "default":      30,   # PLACEHOLDER — fallback if provider not specified
 }

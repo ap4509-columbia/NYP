@@ -83,7 +83,7 @@ from metrics import (
 )
 from db import SimulationDB
 
-_NON_ER       = ["pcp", "gynecologist", "specialist"]
+_NON_ER       = ["pcp", "gynecologist"]
 _ALL_PROVIDERS = _NON_ER + ["er"]
 
 
@@ -904,7 +904,8 @@ class SimulationRunner:
                 orig_ref = day - p.wait_days if p.wait_days > 0 else day
                 self._queues.schedule_followup(
                     p, {"cancer": cancer, "step": "screening_retry",
-                         "referral_day": orig_ref}, day + 1
+                         "referral_day": orig_ref,
+                         "first_attempt_day": orig_ref}, day + 1
                 )
                 p.log(day, f"RESCHEDULE {test} — patient unavailable, moved to day {day + 1}")
                 continue
@@ -915,7 +916,8 @@ class SimulationRunner:
                 orig_ref = day - p.wait_days if p.wait_days > 0 else day
                 self._queues.schedule_followup(
                     p, {"cancer": cancer, "step": "screening_retry",
-                         "referral_day": orig_ref}, day + 1
+                         "referral_day": orig_ref,
+                         "first_attempt_day": orig_ref}, day + 1
                 )
                 p.log(day, f"NO SLOT for {test} — rescheduled to day {day + 1}")
                 continue
@@ -1239,16 +1241,18 @@ class SimulationRunner:
         for the next day.
         """
         if not p.active:
-            # Record abandoned wait time for patients who died/attrited in queue
+            # Record abandoned wait time for patients who died/attrited in queue.
+            # Wait = pure queue overflow days only (uses first_attempt_day, NOT
+            # referral_day, so that scheduled clinical delays are excluded).
             step = context.get("step", "")
-            referral_day = context.get("referral_day", day)
-            wait = day - referral_day
-            if day >= self._warmup_day:
-                if step == "screening_retry" and wait > 0:
+            first_attempt = context.get("first_attempt_day", day)
+            wait = day - first_attempt
+            if day >= self._warmup_day and wait > 0:
+                if step == "screening_retry":
                     cancer = context.get("cancer", "unknown")
                     test = assign_screening_test(p, cancer) if cancer != "unknown" else "unknown"
                     self.metrics["wait_times_abandoned"][test].append(wait)
-                elif step in ("leep", "cone_biopsy", "colposcopy", "lung_biopsy") and wait > 0:
+                elif step in ("leep", "cone_biopsy", "colposcopy", "lung_biopsy"):
                     self.metrics["wait_times_abandoned"][step].append(wait)
             return
 
@@ -1289,10 +1293,9 @@ class SimulationRunner:
             self._cervical_followup_step(p, step, day, referral_day, context)
         elif cancer == "lung":
             if step == "biopsy":
-                self._lung_biopsy_step(p, day, referral_day)
+                self._lung_biopsy_step(p, day, referral_day, context)
             elif step == "repeat_ldct":
-                scheduled_delay = context.get("scheduled_delay", 0)
-                self._lung_repeat_ldct_step(p, day, referral_day, scheduled_delay)
+                self._lung_repeat_ldct_step(p, day, referral_day, context)
             elif step == "lung_post_treatment_surveillance":
                 treatment_day = context.get("treatment_day", referral_day)
                 visit_number  = context.get("visit_number", 0)
@@ -1339,17 +1342,22 @@ class SimulationRunner:
                      "referral_day": day}, due
             )
 
-    def _check_queue_ltfu(self, p: Patient, day: int, referral_day: int,
+    def _check_queue_ltfu(self, p: Patient, day: int, first_attempt_day: int,
                           queue_type: str, procedure: str) -> bool:
         """
         Daily hazard LTFU check for patients in a procedure retry queue.
         Returns True if patient abandoned (exited), False if still active.
+
+        first_attempt_day: the day the patient FIRST tried to get a slot
+        (i.e., their scheduled appointment day). Wait = pure queue overflow
+        days only, excluding any scheduled clinical delay.
+
         queue_type: "primary" | "secondary" | "treatment"
         """
         key = f"queue_{queue_type}_daily"
         ltfu_q = cfg.LTFU_PROBS.get(key, 0)
         if ltfu_q > 0 and random.random() < ltfu_q:
-            wait = day - referral_day
+            wait = day - first_attempt_day
             if day >= self._warmup_day:
                 self.metrics["wait_times_abandoned"][procedure].append(wait)
             p.log(day, f"LTFU queue — abandoned {procedure} after {wait}d")
@@ -1381,15 +1389,19 @@ class SimulationRunner:
           leep / cone_biopsy → procedure slot consumed; treatment recorded by run_treatment
         """
         if step == "one_year_repeat":
-            # Queue LTFU check for secondary retry
-            if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "cytology"):
+            first_attempt = context.get("first_attempt_day", day)
+            # Queue LTFU check — only on retries (after slot overflow)
+            if context.get("is_retry") and self._check_queue_ltfu(
+                    p, day, first_attempt, "secondary", "cytology"):
                 return
             # 1-year repeat cytology for HPV+ low-risk path.
             # Reschedule check: patient may not make it today
             if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
                 self._queues.schedule_followup(
                     p, {"cancer": "cervical", "step": "one_year_repeat",
-                         "referral_day": referral_day}, day + 1
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
                 )
                 p.log(day, "RESCHEDULE cytology repeat — patient unavailable, moved to next day")
                 return
@@ -1398,7 +1410,9 @@ class SimulationRunner:
                 self._day_secondary_overflow += 1
                 self._queues.schedule_followup(
                     p, {"cancer": "cervical", "step": "one_year_repeat",
-                         "referral_day": referral_day}, day + 1
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
                 )
                 return
             self._day_secondary_supply += 1
@@ -1411,21 +1425,25 @@ class SimulationRunner:
             p.last_cervical_screening_test = test
             p.log(day, f"ONE-YEAR REPEAT CYTOLOGY → {result}")
             record_screening(self.metrics, p, "cervical", result, current_day=day)
-            queue_wait = (day - referral_day) - 365  # subtract scheduled 1-year delay
+            queue_wait = day - first_attempt
             if queue_wait > 0 and day >= self._warmup_day:
                 self.metrics["wait_times"]["one_year_repeat"].append(queue_wait)
             # Route the new cytology result: normal → done; abnormal → colposcopy
             self._route_cervical_followup(p, result, day)
 
         elif step == "colposcopy":
-            # Queue LTFU check for secondary retry
-            if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "colposcopy"):
+            first_attempt = context.get("first_attempt_day", day)
+            # Queue LTFU check — only on retries (after slot overflow)
+            if context.get("is_retry") and self._check_queue_ltfu(
+                    p, day, first_attempt, "secondary", "colposcopy"):
                 return
             # Reschedule check: patient may not make it today
             if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
                 self._queues.schedule_followup(
                     p, {"cancer": "cervical", "step": "colposcopy",
-                         "referral_day": referral_day}, day + 1
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
                 )
                 p.log(day, "RESCHEDULE colposcopy — patient unavailable, moved to next day")
                 return
@@ -1434,13 +1452,14 @@ class SimulationRunner:
                 self._day_secondary_overflow += 1
                 self._queues.schedule_followup(
                     p, {"cancer": "cervical", "step": "colposcopy",
-                         "referral_day": referral_day}, day + 1
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
                 )
                 return
             self._day_secondary_supply += 1
 
-            scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get("colposcopy", 30)
-            queue_wait = (day - referral_day) - scheduled_delay
+            queue_wait = day - first_attempt
             if queue_wait > 0 and day >= self._warmup_day:
                 self.metrics["wait_times"]["colposcopy"].append(queue_wait)
             cin = run_colposcopy(p, day, self.metrics)
@@ -1462,20 +1481,23 @@ class SimulationRunner:
             self._route_colposcopy_result(p, day)
 
         elif step in ("leep", "cone_biopsy"):
-            # Queue LTFU check for treatment retry
-            if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "treatment", step):
+            first_attempt = context.get("first_attempt_day", day)
+            # Queue LTFU check — only on retries (after slot overflow)
+            if context.get("is_retry") and self._check_queue_ltfu(
+                    p, day, first_attempt, "treatment", step):
                 return
             self._day_treatment_demand += 1
             if not self._queues.consume_slot(step, day):
                 self._day_treatment_overflow += 1
                 self._queues.schedule_followup(
                     p, {"cancer": "cervical", "step": step,
-                         "referral_day": referral_day}, day + 1
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
                 )
                 return
             self._day_treatment_supply += 1
-            scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get(step, 14)
-            queue_wait = (day - referral_day) - scheduled_delay
+            queue_wait = day - first_attempt
             if queue_wait > 0 and day >= self._warmup_day:
                 self.metrics["wait_times"][step].append(queue_wait)
 
@@ -1791,19 +1813,26 @@ class SimulationRunner:
             )
 
     def _lung_biopsy_step(self, p: Patient, day: int,
-                          referral_day: int = 0) -> None:
+                          referral_day: int = 0,
+                          context: dict = None) -> None:
         """
         Process a lung biopsy appointment (FIFO).
         If no slot available today, push to tomorrow.
         """
-        # Queue LTFU check for secondary retry
-        if day > referral_day and self._check_queue_ltfu(p, day, referral_day, "secondary", "lung_biopsy"):
+        if context is None:
+            context = {}
+        first_attempt = context.get("first_attempt_day", day)
+        # Queue LTFU check — only on retries (after slot overflow)
+        if context.get("is_retry") and self._check_queue_ltfu(
+                p, day, first_attempt, "secondary", "lung_biopsy"):
             return
         # Reschedule check: patient may not make it today
         if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
             self._queues.schedule_followup(
                 p, {"cancer": "lung", "step": "biopsy",
-                     "referral_day": referral_day}, day + 1
+                     "referral_day": referral_day,
+                     "first_attempt_day": first_attempt,
+                     "is_retry": True}, day + 1
             )
             p.log(day, "RESCHEDULE lung biopsy — patient unavailable, moved to next day")
             return
@@ -1812,36 +1841,44 @@ class SimulationRunner:
             self._day_secondary_overflow += 1
             self._queues.schedule_followup(
                 p, {"cancer": "lung", "step": "biopsy",
-                     "referral_day": referral_day}, day + 1
+                     "referral_day": referral_day,
+                     "first_attempt_day": first_attempt,
+                     "is_retry": True}, day + 1
             )
             return
         self._day_secondary_supply += 1
-        scheduled_delay = cfg.FOLLOWUP_DELAY_DAYS.get("lung_biopsy", 14)
-        queue_wait = (day - referral_day) - scheduled_delay
+        queue_wait = day - first_attempt
         if queue_wait > 0 and day >= self._warmup_day:
             self.metrics["wait_times"]["lung_biopsy"].append(queue_wait)
 
     def _lung_repeat_ldct_step(self, p: Patient, day: int,
                               referral_day: int = 0,
-                              scheduled_delay: int = 0) -> None:
+                              context: dict = None) -> None:
         """
         Process a Lung-RADS–mandated follow-up LDCT (RADS 0/1/2/3 path).
 
         Bypasses the standard screening interval check.  Consumes an LDCT
         procedure slot; if none available today, pushes to next day (FIFO).
         """
+        if context is None:
+            context = {}
+        first_attempt = context.get("first_attempt_day", day)
         # Reschedule check: patient may not make it today
         if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
             self._queues.schedule_followup(
                 p, {"cancer": "lung", "step": "repeat_ldct",
-                     "referral_day": referral_day}, day + 1
+                     "referral_day": referral_day,
+                     "first_attempt_day": first_attempt,
+                     "is_retry": True}, day + 1
             )
             p.log(day, "RESCHEDULE LDCT (repeat) — patient unavailable, moved to next day")
             return
         if not self._queues.consume_slot("ldct", day):
             self._queues.schedule_followup(
                 p, {"cancer": "lung", "step": "repeat_ldct",
-                     "referral_day": referral_day}, day + 1
+                     "referral_day": referral_day,
+                     "first_attempt_day": first_attempt,
+                     "is_retry": True}, day + 1
             )
             return
 
@@ -1852,7 +1889,7 @@ class SimulationRunner:
         if day >= self._warmup_day:
             self.metrics["lung_rads_distribution"][result] += 1
         record_screening(self.metrics, p, "lung", result, current_day=day)
-        queue_wait = (day - referral_day) - scheduled_delay
+        queue_wait = day - first_attempt
         if queue_wait > 0 and day >= self._warmup_day:
             self.metrics["wait_times"]["ldct"].append(queue_wait)
         # Re-route the new result — may schedule another repeat or escalate to biopsy.
