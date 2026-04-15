@@ -575,9 +575,11 @@ class SimulationRunner:
             0b. Flush exited patients to SQLite.
 
           Clinical steps (always run, skipped on weekends):
-            1. Process follow-up appointments due today.
-            2. Generate new patient arrivals → route to queues.
-            3. For each provider: collect all patients, screen them.
+            1. Process follow-ups due today — established patient annual
+               visits + screening retries + result routing + post-treatment
+               surveillance.  These consume procedure slots FIRST.
+            2. Generate new patient arrivals → intake queue.
+            3. Pull new arrivals from intake queue (DAILY_PATIENTS cap).
 
         Weekends (day % 7 in {5, 6}) are skipped when cfg.SKIP_WEEKENDS is True.
         Day 0 is treated as Monday.
@@ -670,15 +672,10 @@ class SimulationRunner:
             # 2. New arrivals
             self._generate_arrivals(day)
 
-            # 3A. ESTABLISHED patients — go directly to screening.
-            #     They already have a provider relationship; no need for
-            #     a new provider visit.  No capacity cap applies here.
-            for provider in _NON_ER + ["er"]:
-                for p in self._queues.process_day(provider, day):
-                    p.wait_days = 0
-                    self._screen_patient(p, day)
-
-            # 3B. NEW arrivals from INTAKE QUEUE — provider bottleneck.
+            # 3. NEW arrivals from INTAKE QUEUE — provider bottleneck.
+            #    Established patients are already in the follow-up queue
+            #    (step 1) via schedule_followup with step="provider_screening",
+            #    so they consume procedure slots BEFORE new arrivals.
             #     Up to DAILY_PATIENTS (200) new patients per day are
             #     pulled FIFO from the intake queue, see a provider for
             #     the first time, then proceed to screening.
@@ -831,7 +828,9 @@ class SimulationRunner:
 
             if soonest > 0:
                 if p.is_established:
-                    self._queues.schedule_outpatient(p, p.destination, day + soonest)
+                    self._queues.schedule_followup(
+                        p, {"cancer": "all", "step": "provider_screening"}, day + soonest
+                    )
                     if _post_warmup:
                         self.metrics["n_reschedule"] += 1
                     p.log(day, f"NOT YET ELIGIBLE — return visit scheduled in {soonest} days")
@@ -1001,19 +1000,20 @@ class SimulationRunner:
             # Schedule independent life events for the new established patient
             self._schedule_life_events(p, entry_day=day)
 
-            # Book the full ADVANCE_SCHEDULE_YEARS window from scratch.
-            first_visit   = day + cfg.ANNUAL_VISIT_INTERVAL
-            first_booked  = self._queues.schedule_outpatient(p, p.destination, first_visit)
-            p.next_visit_day = first_booked
+            # Book the full ADVANCE_SCHEDULE_YEARS window in the follow-up queue.
+            _ctx = {"cancer": "all", "step": "provider_screening"}
+            first_visit = day + cfg.ANNUAL_VISIT_INTERVAL
+            self._queues.schedule_followup(p, dict(_ctx), first_visit)
+            p.next_visit_day = first_visit
             for yr in range(1, cfg.ADVANCE_SCHEDULE_YEARS):
-                self._queues.schedule_outpatient(
-                    p, p.destination, first_booked + yr * cfg.ANNUAL_VISIT_INTERVAL
+                self._queues.schedule_followup(
+                    p, dict(_ctx), first_visit + yr * cfg.ANNUAL_VISIT_INTERVAL
                 )
             p.log(
                 day,
                 f"FIRST VISIT COMPLETE — joined established pool (age {p.age}); "
                 f"scheduled years 1–{cfg.ADVANCE_SCHEDULE_YEARS} "
-                f"(next visit day {first_booked})"
+                f"(next visit day {first_visit})"
             )
 
     # =========================================================================
@@ -1048,17 +1048,18 @@ class SimulationRunner:
         self._pid += len(pool)
 
         warmup = max(1, cfg.WARMUP_DAYS)
+        _ctx = {"cancer": "all", "step": "provider_screening"}
         for i, p in enumerate(pool):
             # Spread first appointments evenly across the warmup window
             target_day = int(i * warmup / len(pool))
-            booked_day = self._queues.schedule_outpatient(p, p.destination, target_day)
-            p.next_visit_day = booked_day
+            self._queues.schedule_followup(p, dict(_ctx), target_day)
+            p.next_visit_day = target_day
 
             # Pre-book ADVANCE_SCHEDULE_YEARS - 1 additional annual visits so
-            # providers are booked out years in advance from day 0.
+            # the follow-up queue is loaded years in advance from day 0.
             for yr in range(1, cfg.ADVANCE_SCHEDULE_YEARS):
-                self._queues.schedule_outpatient(
-                    p, p.destination, booked_day + yr * cfg.ANNUAL_VISIT_INTERVAL
+                self._queues.schedule_followup(
+                    p, dict(_ctx), target_day + yr * cfg.ANNUAL_VISIT_INTERVAL
                 )
 
             # Schedule independent life events (mortality, attrition, etc.)
@@ -1170,24 +1171,22 @@ class SimulationRunner:
 
     def _reschedule_established(self, p: Patient, day: int) -> None:
         """
-        Book an established patient's next annual visit.
+        Book an established patient's next annual visit in the follow-up queue.
 
         Called at the end of each visit (from _screen_patient). Schedules
-        the patient as an outpatient at their same destination approximately
-        cfg.ANNUAL_VISIT_INTERVAL days from today.
+        the patient as a follow-up (step="provider_screening") so they are
+        processed in step 1 of _tick(), before any new arrivals.
         """
-        # Each visit, extend the advance-schedule window by one year at the far end.
-        # The near-end appointments (years 1 through ADVANCE_SCHEDULE_YEARS-1 from now)
-        # were already pre-booked from the previous visit's rescheduling or warmup.
-        # We only need to add the appointment at the new far horizon.
-        far_day    = day + cfg.ADVANCE_SCHEDULE_YEARS * cfg.ANNUAL_VISIT_INTERVAL
-        booked_far = self._queues.schedule_outpatient(p, p.destination, far_day)
+        _ctx = {"cancer": "all", "step": "provider_screening"}
+        # Extend the advance-schedule window by one year at the far end.
+        far_day = day + cfg.ADVANCE_SCHEDULE_YEARS * cfg.ANNUAL_VISIT_INTERVAL
+        self._queues.schedule_followup(p, dict(_ctx), far_day)
 
-        # next_visit_day tracks the NEXT actual visit (1 year from now), not the far booking
+        # next_visit_day tracks the NEXT actual visit (1 year from now)
         p.next_visit_day = day + cfg.ANNUAL_VISIT_INTERVAL
         p.log(day, (
-            f"ESTABLISHED — advance window extended to day {booked_far} "
-            f"(year {booked_far // 365}); next visit ~day {p.next_visit_day}"
+            f"ESTABLISHED — advance window extended to day {far_day} "
+            f"(year {far_day // 365}); next visit ~day {p.next_visit_day}"
         ))
 
     def _flush_exited_patients(self, day: int = 0, force: bool = False) -> None:
