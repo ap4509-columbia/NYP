@@ -212,8 +212,9 @@ def record_exit(metrics: dict, reason: str, patient=None, current_day: int = 0) 
 
     if reason == "treated":
         metrics["n_treated"] += 1
-    elif reason == "lost_to_followup":
-        metrics["n_ltfu"] += 1
+    # n_ltfu is incremented directly in runner._check_queue_ltfu alongside
+    # the per-queue breakdown counters — do NOT also increment here to
+    # avoid double-counting.
 
     if patient is not None and current_day > 0:
         retention = current_day - getattr(patient, "day_created", current_day)
