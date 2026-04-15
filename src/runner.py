@@ -141,12 +141,13 @@ class PatientQueues:
         # Event types: "mortality", "attrition", "smoking_cessation", "hpv_clearance"
         self.life_events  = defaultdict(list)
 
-        # ── Intake queue (FIFO) ──────────────────────────────────────────────
+        # ── Intake queues (FIFO) ─────────────────────────────────────────────
         # New arrivals wait here until a provider slot opens.  Each day,
-        # SimulationRunner._tick() pulls patients from the front of this
-        # queue (FIFO) to fill remaining provider capacity after established
+        # SimulationRunner._tick() pulls outpatients first, then ER
+        # drop-ins, to fill remaining provider capacity after established
         # patients are served.
-        self.intake_queue = []   # [(Patient, provider_key), ...]
+        self.intake_outpatient = []   # [(Patient, provider_key), ...] — outpatients (priority)
+        self.intake_er         = []   # [(Patient, provider_key), ...] — ER drop-ins (last)
 
     # ── Outpatient scheduling ─────────────────────────────────────────────────
 
@@ -653,7 +654,7 @@ class SimulationRunner:
                 # Provider capacity
                 "cum_intake_total":      self.metrics["intake_queue_total"],
                 "cum_intake_served":     self.metrics["intake_queue_served"],
-                "intake_queue_depth":    len(self._queues.intake_queue),
+                "intake_queue_depth":    len(self._queues.intake_outpatient) + len(self._queues.intake_er),
                 "cum_provider_demand":   self.metrics["provider_demand"],
                 "cum_provider_served":   self.metrics["provider_served"],
                 "cum_provider_overflow": self.metrics["provider_overflow"],
@@ -673,29 +674,32 @@ class SimulationRunner:
             self._generate_arrivals(day)
 
             # 3. NEW arrivals from INTAKE QUEUE — provider bottleneck.
-            #    Established patients are already in the follow-up queue
-            #    (step 1) via schedule_followup with step="provider_screening",
-            #    so they consume procedure slots BEFORE new arrivals.
-            #     Up to DAILY_PATIENTS (200) new patients per day are
-            #     pulled FIFO from the intake queue, see a provider for
-            #     the first time, then proceed to screening.
-            #     Patients remaining in the queue wait for the next day.
+            #    Outpatients are served first (FIFO), then ER drop-ins
+            #    with whatever provider slots remain.
+            #    Up to DAILY_PATIENTS new patients per day.
             daily_cap     = cfg.DAILY_PATIENTS
             intake_served = 0
 
-            while intake_served < daily_cap and self._queues.intake_queue:
-                p, dest = self._queues.intake_queue.pop(0)
-
+            # 3a. Outpatients first
+            while intake_served < daily_cap and self._queues.intake_outpatient:
+                p, dest = self._queues.intake_outpatient.pop(0)
                 p.wait_days = 0
                 p.log(day, f"INTAKE — seen by {dest}, entering screening")
                 self._screen_patient(p, day)
+                intake_served += 1
 
+            # 3b. ER drop-ins last
+            while intake_served < daily_cap and self._queues.intake_er:
+                p, dest = self._queues.intake_er.pop(0)
+                p.wait_days = 0
+                p.log(day, f"INTAKE ER — seen by {dest}, entering screening")
+                self._screen_patient(p, day)
                 intake_served += 1
 
             self.metrics["intake_queue_served"] += intake_served
 
             # Track provider demand (post-warmup)
-            intake_waiting = len(self._queues.intake_queue)
+            intake_waiting = len(self._queues.intake_outpatient) + len(self._queues.intake_er)
             if day >= self._warmup_day:
                 self.metrics["provider_demand"]   += intake_served + intake_waiting
                 self.metrics["provider_served"]   += intake_served
@@ -768,8 +772,11 @@ class SimulationRunner:
                                    age_range=age_range)
                 self._pid += 1
 
-                # All new arrivals enter the intake queue (FIFO)
-                self._queues.intake_queue.append((p, dest))
+                # Route to intake queue: outpatients first, ER last
+                if arrival_type == "er":
+                    self._queues.intake_er.append((p, dest))
+                else:
+                    self._queues.intake_outpatient.append((p, dest))
                 self.metrics["intake_queue_total"] += 1
                 self.metrics["arrivals_by_source"][source_name] += 1
 
