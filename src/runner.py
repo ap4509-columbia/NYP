@@ -696,6 +696,17 @@ class SimulationRunner:
                 self._screen_patient(p, day)
                 intake_served += 1
 
+            # 3c. Promote denied ER patients into follow-up queue for
+            #     tomorrow — they become "established" and get seen in
+            #     step 1 (follow-ups due today) on the next workday,
+            #     ahead of any new intake arrivals.
+            while self._queues.intake_er:
+                p, dest = self._queues.intake_er.pop(0)
+                p.log(day, f"ER denied intake — promoted to follow-up queue for day {day + 1}")
+                self._queues.schedule_followup(
+                    p, {"cancer": "all", "step": "provider_screening"}, day + 1
+                )
+
             self.metrics["intake_queue_served"] += intake_served
 
             # Track provider demand (post-warmup)
