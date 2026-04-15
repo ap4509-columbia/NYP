@@ -62,7 +62,7 @@ ACTIVE_CANCERS = ["cervical", "lung"]
 # screening procedure slots.  If more patients are scheduled than the cap,
 # overflow patients are rescheduled to the next workday.
 # PLACEHOLDER — replace with NYP scheduling / capacity data.
-DAILY_PATIENTS = 200
+DAILY_PATIENTS = 2                        # PLACEHOLDER — sim scale (× POPULATION_SCALE_FACTOR = 200 real/day)
 
 DESTINATION_PROBS = {
     "pcp":          0.35,
