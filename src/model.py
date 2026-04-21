@@ -846,10 +846,23 @@ def draw_colposcopy_result(p: Patient) -> str:
     """
     Draw a CIN grade from colposcopy, conditional on the result that triggered it.
     The key format matches COLPOSCOPY_RESULT_PROBS in config (e.g. 'from_HSIL').
-    Every colposcopy trigger (ASCUS/LSIL/ASC-H/HSIL/HPV_POSITIVE) has a
-    specific distribution, so no fallback is required.
+
+    Normal routing should only reach this function with an abnormal
+    `p.cervical_result` (ASCUS / LSIL / ASC-H / HSIL / HPV_POSITIVE). If a
+    queued colposcopy fires for a patient whose last cervical_result is
+    NORMAL/HPV_NEGATIVE (e.g. stale queue entry after post-treatment
+    surveillance reset), treat the trigger as "from_ASCUS" (the lowest-
+    severity abnormal trigger) rather than crash. This preserves the sim's
+    ability to complete while keeping clinical semantics reasonable.
     """
-    key = f"from_{p.cervical_result}"   # e.g. "from_HSIL", "from_HPV_POSITIVE"
+    key = f"from_{p.cervical_result}"
+    if key not in cfg.COLPOSCOPY_RESULT_PROBS:
+        p.log(
+            getattr(p, "last_cervical_screen_day", -1),
+            f"COLPOSCOPY fallback — no specific distribution for "
+            f"cervical_result='{p.cervical_result}'; using from_ASCUS",
+        )
+        key = "from_ASCUS"
     probs = cfg.COLPOSCOPY_RESULT_PROBS[key]
     return random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
 
