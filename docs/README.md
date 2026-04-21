@@ -10,7 +10,7 @@ A discrete-event simulation of NYP's multi-cancer women's health screening progr
 import sys
 sys.path.insert(0, '/path/to/NYP/src')
 
-import config as cfg
+import parameters as cfg
 from runner import SimulationRunner
 
 sim = SimulationRunner(

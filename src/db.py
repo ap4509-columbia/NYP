@@ -34,7 +34,7 @@
 import sqlite3
 from typing import List, Optional
 
-import config as cfg
+import parameters as cfg
 
 # ── DDL statements ─────────────────────────────────────────────────────────────
 

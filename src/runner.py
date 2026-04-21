@@ -46,17 +46,17 @@ import time
 from collections import defaultdict
 from typing import Optional
 
-import config as cfg
+import parameters as cfg
 from patient import Patient
-from population import (
+from model import (
+    # population
     sample_patient,
     generate_established_population,
     draw_death_day,
     draw_attrition_day,
     draw_cessation_day,
     draw_hpv_clearance_day,
-)
-from screening import (
+    # screening
     get_eligible_screenings,
     is_eligible_cervical,
     is_eligible_lung,
@@ -66,14 +66,12 @@ from screening import (
     days_until_eligible,
     draw_cervical_result,
     draw_lung_rads_result,
-)
-from followup import (
+    # followup
     route_cervical_result,
     run_colposcopy,
     run_treatment,
     run_lung_followup,
-)
-from metrics import (
+    # metrics
     initialize_metrics,
     record_screening,
     record_exit,
@@ -1011,7 +1009,7 @@ class SimulationRunner:
             # ER patients who join the established pool must be reassigned
             # to a non-ER regular provider — ER is for unplanned visits only.
             if p.destination == "er":
-                from population import _sample_established_destination
+                from model import _sample_established_destination
                 p.destination  = _sample_established_destination()
                 p.patient_type = "outpatient"
 

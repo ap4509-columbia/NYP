@@ -1,6 +1,6 @@
 # =============================================================================
-# config.py
-# NYP Women's Health Screening Simulation — Central Configuration
+# parameters.py
+# NYP Women's Health Screening Simulation — Simulation Input Parameters
 # =============================================================================
 #
 # DESIGN PHILOSOPHY
@@ -93,11 +93,6 @@ ELIGIBILITY = {
     "lung":     {"age_min": 50, "age_max": 80, "min_pack_years": 20, "max_years_since_quit": 15},
 }
 
-# P(patient aged 50–80 meets USPSTF lung eligibility: ≥20 pack-years, current/quit <15yr)
-# Source: CDC BRFSS NYC smoking data; Fedewa et al. 2022
-# NYC smoking prevalence ~12% vs national ~14%; eligible subset ~40% of ever-smokers age 50–80
-# Sensitivity range: 0.04–0.07
-LUNG_ELIGIBLE_BASE_PROB = 0.055   # Source: CDC BRFSS; Fedewa et al. 2022; AiP Parameters PDF
 
 # Screening initiation rates — hybrid per-visit probability model
 # Formula: P(screen at visit k) = min(P_base + (k-1) * P_increment, P_cap)
@@ -136,15 +131,6 @@ NEVER_SCREENER_FRAC = {
     "lung":     0.65,    # Source: AiP Parameters PDF (midpoint of 60–70%)
 }
 
-# Calibration targets from AiP Parameters PDF:
-# Cervical: model should yield ~73–83% of women up-to-date over a 3-year interval (NHIS/BRFSS)
-# Lung: annual rate ~20% (15–25%) at academic centers with dedicated programs (Fedewa et al. 2022)
-# Visits before initiation: cervical ~1.5 (range 1–3); lung ~4 (range 2–6)
-# Source: Triplette et al. JAMA Netw Open 2022 (lung visits before LDCT ordered)
-SCREENING_VISITS_BEFORE_INITIATION = {
-    "cervical": 1.5,   # Source: AiP Parameters PDF; Kepka et al. 2014
-    "lung":     4.0,   # Source: AiP Parameters PDF; Triplette et al. JAMA Netw Open 2022
-}
 
 # Cervical test type selection for ages 30–65
 # Co-test dominant at academic centers; primary HPV emerging post-2024 USPSTF draft
@@ -439,17 +425,9 @@ ABNORMAL_FOLLOWUP_DAYS = {
 # ── Population scale ─────────────────────────────────────────────────────────
 POPULATION_SCALE_FACTOR = 100          # 1 sim patient = 100 NYC women
 
-# Total eligible women in NYC metro area (real-world estimate).
-# This is the FULL eligible population (all providers, not just NYP).
-# Used to compute NYP's population capture rate and foregone revenue
-# from uncaptured women (eligible but not in NYP's patient pool).
-# Source: ACS 2020 5-Year Estimates — NYC women aged 21–80 ≈ 1.5M
-# PLACEHOLDER — replace with refined NYC metro catchment estimate
-NYC_ELIGIBLE_POPULATION = 1_500_000
-
 # ── Initial seed population ──────────────────────────────────────────────────
 # Number of NYP established patients to seed at day 0.  This represents
-# NYP's existing patient panel — a FRACTION of NYC_ELIGIBLE_POPULATION.
+# NYP's existing patient panel.
 # The pool then grows or shrinks organically as arrivals join and patients
 # exit via mortality, attrition, LTFU, or ineligibility.
 #
