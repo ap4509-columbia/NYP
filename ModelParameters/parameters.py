@@ -16,18 +16,17 @@
 # SECTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 #   1. Simulation horizon & replication settings
-#   2. Workflow mode toggle (fragmented vs. coordinated care)
-#   3. Arrivals (mirrors Sophia's parameters)
-#   4. Provider capacities and scheduling lead times
-#   5. Eligibility criteria (USPSTF guidelines)
-#   6. Test modalities and screening intervals
-#   7. Result probability tables (cervical cytology, HPV-alone, Lung-RADS)
-#   8. Lung pathway step probabilities (referral, scheduling, biopsy, treatment)
-#   9. Loss-to-follow-up probabilities
-#  10. Colposcopy result probabilities (ASCCP risk tables)
-#  11. Treatment assignment by CIN grade
-#  12. Resource capacities (SimPy)
-#  13. Procedure revenue (CPT-based placeholders)
+#   2. Arrivals (mirrors Sophia's parameters)
+#   3. Provider capacities and scheduling lead times
+#   4. Eligibility criteria (USPSTF guidelines)
+#   5. Test modalities and screening intervals
+#   6. Result probability tables (cervical cytology, HPV-alone, Lung-RADS)
+#   7. Lung pathway step probabilities (referral, scheduling, biopsy, treatment)
+#   8. Loss-to-follow-up probabilities
+#   9. Colposcopy result probabilities (ASCCP risk tables)
+#  10. Treatment assignment by CIN grade
+#  11. Resource capacities (SimPy)
+#  12. Procedure revenue (CPT-based placeholders)
 #
 # All values marked PLACEHOLDER must be replaced with NYP EHR-derived rates
 # before the model is used for operational or planning decisions.
@@ -47,11 +46,6 @@ NUM_REPS       = 10       # number of replications for variance analysis
 # Day 0 of the simulation is treated as Monday (day % 7: 0=Mon … 4=Fri, 5=Sat, 6=Sun).
 # Source: AiP Parameters PDF — "skip_weekends: true"
 SKIP_WEEKENDS  = True
-
-# ── Workflow Mode ─────────────────────────────────────────────────────────────
-# "fragmented"  = current state (separate appointments per specialty)
-# "coordinated" = future state (bundled multi-screening program)
-WORKFLOW_MODE = "fragmented"
 
 # ── Active Cancer Pathways ────────────────────────────────────────────────────
 ACTIVE_CANCERS = ["cervical", "lung"]
@@ -78,13 +72,6 @@ ARRIVAL_TYPE_PROBS = {
     "er":         0.20,
 }
 
-
-# ── Age Strata ────────────────────────────────────────────────────────────────
-AGE_STRATA = {
-    "young":  (21, 29),
-    "middle": (30, 65),
-    "older":  (66, 99),
-}
 
 # ── Screening Eligibility Rules ───────────────────────────────────────────────
 ELIGIBILITY = {
@@ -121,12 +108,6 @@ SCREENING_INTERVALS_DAYS = {
     "co_test":   365 * 3,   # co-test interval same as cytology per USPSTF; ASSUMPTION
     "ldct":      365 * 1,
 }
-
-# P(cervical test completed | test ordered at visit) — test happens in-office during PCP/GYN visit
-# Source: AiP Parameters PDF (Google Doc reference); note this is NOT the population-level uptake rate
-# Population-level: 72.5% of eligible women complete cervical screening (PMC8390589)
-# Per-visit: 97.1% complete once ordered — different denominator
-CERVICAL_TEST_COMPLETION_PROB = 0.97108   # Source: AiP Parameters PDF (Google Doc)
 
 # ── Cervical Result Probabilities ─────────────────────────────────────────────
 # PLACEHOLDER — replace with NYP EHR rates / ASCCP risk table values
@@ -187,14 +168,6 @@ LUNG_RADS_PROBS = {
     "RADS_3":    0.102,   # probably benign; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.60)
     "RADS_4A":   0.046,   # suspicious; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.27)
     "RADS_4B_4X": 0.022,  # very suspicious; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.13)
-}
-
-# Malignancy rate by Lung-RADS category (among patients in that category)
-# Source: Pinsky et al. 2015 (NLST/Lung-RADS); McKee et al. 2015; ACR Lung-RADS v1.1; Hammer et al. 2020
-LUNG_RADS_MALIGNANCY_RATE = {
-    "RADS_3":    0.03,   # Source: Pinsky et al. 2015; McKee et al. 2015
-    "RADS_4A":   0.08,   # Source: ACR Lung-RADS v1.1; Hammer et al. 2020
-    "RADS_4B_4X": 0.35,  # Source: Pinsky et al. 2015; ACR Lung-RADS v1.1
 }
 
 # ── Lung Pathway Clinical Probabilities ─────────────────────────────────────
@@ -283,10 +256,6 @@ TREATMENT_ASSIGNMENT = {
     "CIN3":   "leep",
 }
 
-# CIN2/3 treatment outcome split
-# Source: AiP Parameters PDF — "50% Treated, 50% Exit"
-CIN23_TREATMENT_RATE = 0.50   # P(treated | CIN2/3 diagnosed); Source: AiP Parameters PDF
-
 # CIN1 surveillance parameters
 # Source: ASCCP 2019 (High confidence); Castle et al. 2009; Ostor 1993; ALTS trial; Cox et al. 2003
 CIN1_SURVEILLANCE_INTERVAL_DAYS  = 365    # 12-month follow-up interval; Source: ASCCP 2019
@@ -294,12 +263,6 @@ CIN1_MAX_CLEAN_VISITS_BEFORE_ROUTINE = 2  # consecutive clean visits before retu
 CIN1_RESOLUTION_PROB_PER_VISIT    = 0.40  # Source: Castle et al. 2009; Ostor 1993
 CIN1_ESCALATION_PROB_PER_VISIT    = 0.07  # escalation to CIN2/3; Source: ALTS trial; Cox et al. 2003
 CIN1_PERSISTENCE_PROB_PER_VISIT   = 0.53  # calculated: 1 - 0.40 - 0.07; Source: AiP Parameters PDF
-
-# ── Post-Treatment / Post-Negative Re-entry Delays (days) ─────────────────────
-POST_TREATMENT_DELAY_DAYS = {
-    "cervical": 180,
-    "lung":     365,
-}
 
 # ── Screening / Procedure Resource Capacities (daily slots) ──────────────────
 # Primary screenings compete for slots — PCP/GYN/Specialist patients get
@@ -321,17 +284,6 @@ CAPACITIES = {
     "cone_biopsy": 4,     # PLACEHOLDER — replace with NYP OR scheduling data
 }
 
-# ── Unscreened Re-entry Delay (days) ──────────────────────────────────────────
-# Reschedule delay by provider type
-# Source: AiP Parameters PDF
-RESCHEDULE_DELAY_DAYS = {
-    "pcp":          28,   # Source: AiP Parameters PDF
-    "gynecologist": 38,   # Source: AiP Parameters PDF
-    "specialist":   30,   # PLACEHOLDER
-    "er":            7,   # PLACEHOLDER
-    "default":      30,   # PLACEHOLDER — fallback if provider not specified
-}
-
 # ── Inter-Step Scheduling Delays (days) ───────────────────────────────────────
 # Time between referral and the next appointment at each step.
 # These drive wait-time metrics and are a key lever in scenario analysis
@@ -345,13 +297,6 @@ FOLLOWUP_DELAY_DAYS = {
     "cone_biopsy":       21,    # colposcopy → cone biopsy; PLACEHOLDER
     "lung_biopsy":       21,    # RADS 4 → diagnostic workup; Source: AiP Parameters PDF
     "lung_treatment":    21,    # malignancy confirmed → treatment start; PLACEHOLDER
-}
-
-# Time-to-colposcopy guidelines by result severity
-# Source: 2019 ASCCP Risk-Based Management Consensus Guidelines (Perkins et al., J Low Genit Tract Dis 2020)
-ABNORMAL_FOLLOWUP_DAYS = {
-    "ASCUS_LSIL": 90,    # within 3 months; Source: ASCCP 2019 (Perkins et al. 2020)
-    "HSIL_ASCH":  30,    # expedited, within 1 month; Source: ASCCP 2019 (Perkins et al. 2020)
 }
 
 # =============================================================================
@@ -555,27 +500,6 @@ POST_TREATMENT_ACTIVE_YEARS_LUNG = 5   # standard of care; Source: AiP Parameter
 # ── Procedure Revenue (per event, USD) ────────────────────────────────────────
 # PLACEHOLDER — replace with NYP finance / contract rates.
 # CPT references provided for calibration.
-# ── Disease-Specific Mortality ────────────────────────────────────────────────
-# Annual excess mortality risk given a confirmed diagnosis.
-# These are ADDITIVE to the baseline Gompertz mortality — they represent the
-# additional risk of death attributable to the disease itself.
-#
-# PLACEHOLDER — set to None until NYP/SEER data is available.
-# When populated, the runner should draw a disease-specific death day
-# at diagnosis time and add it to the life-event queue.
-DISEASE_MORTALITY = {
-    # Cervical — by CIN grade at diagnosis
-    "CIN1":  None,   # negligible excess mortality; placeholder
-    "CIN2":  None,   # annual excess mortality rate (e.g., 0.001)
-    "CIN3":  None,   # annual excess mortality rate (e.g., 0.005)
-
-    # Lung — by biopsy result
-    "lung_malignant": None,   # annual excess mortality rate (e.g., 0.15)
-
-    # Combined (any confirmed cancer diagnosis — cervical or lung)
-    "any_cancer":     None,   # overall annual cancer mortality if not using per-type
-}
-
 PROCEDURE_REVENUE = {
     # Cervical screening
     "cytology":       156,    # CPT 88175 (liquid-based cytology)
