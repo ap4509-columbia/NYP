@@ -33,125 +33,9 @@ _WARMUP_DAY = cfg.WARMUP_YEARS * cfg.DAYS_PER_YEAR
 #                                                                             #
 # #############################################################################
 
-# ── NYC census-calibrated distributions ───────────────────────────────────────
-# Yutong's code — census-sourced parameters replacing prior placeholders.
-# See notebooks/archive/generator.ipynb for full sourcing and methodology.
-
-# Age distribution: NY female, 21+, single-year-of-age probabilities
-# Source: Census SC-EST2024-AGESEX-CIV (civilian population by single year of age and sex)
-_AGE_VALUES = list(range(21, 86))  # 21–85; bucket 85 represents 85+
-_AGE_PROBS = [
-    0.015909975693027187, 0.015514818723877663, 0.016165837946892232,
-    0.01689024862027892,  0.01699947013835047,  0.017212975882406,
-    0.017355724578320054, 0.017534542152345977, 0.01772477427008793,
-    0.01796727563118836,  0.017869788708665356, 0.017924952319437078,
-    0.017984389970164453, 0.01800159302518125,  0.01741507874311268,
-    0.01717177811225559,  0.016891975474882467, 0.016597230133555383,
-    0.016439746732069248, 0.01589917571961944,  0.016007676438554838,
-    0.015882613683578266, 0.01561910688061082,  0.015642815541554155,
-    0.015150988805421506, 0.014800490746677025, 0.014795095607926827,
-    0.01443569931312958,  0.01465963231536682,  0.014318527774542467,
-    0.014495151642568842, 0.015190006179027459, 0.01629945044323262,
-    0.016382292266177494, 0.015931279440770407, 0.015814107901489253,
-    0.016029360010582517, 0.0164331408655305,   0.017043768053761793,
-    0.017272201799168498, 0.017123462119641668, 0.01694025841256843,
-    0.0168197626872114,   0.01658451968484241,  0.01618842115724186,
-    0.015949102506540596, 0.015597560630433698, 0.014934859031132527,
-    0.014587727036858528, 0.013939431938424342, 0.013283166298213077,
-    0.012806339839006291, 0.012359378318188544, 0.011916549151198764,
-    0.01150825888909235,  0.011151929991680755, 0.011483318856435978,
-    0.008466537112776232, 0.008097424134650845, 0.007750418703502376,
-    0.007755189543798091, 0.006740173239321621, 0.005973056389805381,
-    0.005479500935361273, 0.03647309388037247,
-]
-# Normalise (source already sums to ~1, but guard against float drift)
-_age_total = sum(_AGE_PROBS)
-_AGE_PROBS = [p / _age_total for p in _AGE_PROBS]
-
-# Race / ethnicity — two-stage draw matching Census methodology
-# Source: Census SC-EST2024-SR11H (NY female by sex, race, Hispanic origin)
-_P_HISPANIC     = 2030943 / 10161956
-_P_NON_HISPANIC = 8131013 / 10161956
-
-_RACE_PROBS_NON_HISP = {
-    "White":        5361976 / 8131013,
-    "Black":        1504583 / 8131013,
-    "AIAN":           30664 / 8131013,
-    "Asian":        1023010 / 8131013,
-    "NHPI":            5269 / 8131013,
-    "Two or More":   205511 / 8131013,
-}
-
-_RACE_PROBS_HISP = {
-    "White":        1460416 / 2030943,
-    "Black":         360471 / 2030943,
-    "AIAN":           83440 / 2030943,
-    "Asian":          23744 / 2030943,
-    "NHPI":            9962 / 2030943,
-    "Two or More":    92910 / 2030943,
-}
-
-# Insurance status by age band — female-only, age 21+
-# Source: ACS B27001 (https://data.census.gov/table/ACSDT1Y2022.B27001)
-_INSURANCE_BY_AGE = {
-    (21, 25): {"Insured": 13190608, "Uninsured": 1872271},
-    (26, 34): {"Insured": 18118047, "Uninsured": 2411358},
-    (35, 44): {"Insured": 20435569, "Uninsured": 2248259},
-    (45, 54): {"Insured": 18622090, "Uninsured": 1805871},
-    (55, 64): {"Insured": 19717410, "Uninsured": 1476065},
-    (65, 74): {"Insured": 18473038, "Uninsured":  179909},
-    (75, 99): {"Insured": 13985406, "Uninsured":   75089},
-}
-
-_INSURANCE_PROBS = {}
-for _band, _vals in _INSURANCE_BY_AGE.items():
-    _total = _vals["Insured"] + _vals["Uninsured"]
-    _INSURANCE_PROBS[_band] = _vals["Insured"] / _total
-
-# Smoking rate — NYS BRFSS 2023
-_SMOKER_RATE       = 0.109
-
-_HPV_POSITIVE_RATE = 0.25    # among unvaccinated women with cervix, PLACEHOLDER
-
-_HPV_VAX_RATE = {            # vaccination coverage by age cohort, PLACEHOLDER
-    (21, 29): 0.60,
-    (30, 39): 0.40,
-    (40, 49): 0.20,
-    (50, 99): 0.05,
-}
-
-# Hysterectomy prevalence by age band AND race/ethnicity group
-# Source: CDC/BRFSS 2018 (https://stacks.cdc.gov/view/cdc/113157/cdc_113157_DS1.pdf)
-_HYSTERECTOMY_BY_GROUP = {
-    "Hispanic": {
-        (21, 29): 0.004, (30, 39): 0.029, (40, 49): 0.109,
-        (50, 59): 0.211, (60, 69): 0.295, (70, 99): 0.430,
-    },
-    "White": {
-        (21, 29): 0.005, (30, 39): 0.054, (40, 49): 0.166,
-        (50, 59): 0.268, (60, 69): 0.341, (70, 99): 0.456,
-    },
-    "Black": {
-        (21, 29): 0.003, (30, 39): 0.038, (40, 49): 0.185,
-        (50, 59): 0.337, (60, 69): 0.441, (70, 99): 0.521,
-    },
-    "Asian": {
-        (21, 29): 0.004, (30, 39): 0.006, (40, 49): 0.078,
-        (50, 59): 0.112, (60, 69): 0.149, (70, 99): 0.276,
-    },
-    "Other": {
-        (21, 29): 0.004, (30, 39): 0.038, (40, 49): 0.143,
-        (50, 59): 0.239, (60, 69): 0.310, (70, 99): 0.418,
-    },
-}
-
-# BMI mixture model — calibrated to NYC 27.6% obesity rate
-# Source: NYC Health obesity indicator (https://a816-dohbesp.nyc.gov/IndicatorPublic/data-explorer/overweight/)
-_BMI_OBESITY_RATE    = 0.276
-_BMI_NONOBES_MU      = 24.7
-_BMI_NONOBES_SIGMA   = 3.2
-_BMI_OBESE_MU        = 34.8
-_BMI_OBESE_SIGMA     = 4.5
+# All population-attribute distributions now live in parameters.py under
+# "POPULATION ATTRIBUTE DISTRIBUTIONS". They are read here as cfg.AGE_VALUES,
+# cfg.SMOKER_RATE, cfg.HYSTERECTOMY_BY_GROUP, etc.
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -175,7 +59,7 @@ def _sample_age(age_range: tuple = None) -> int:
     range by rejection sampling (re-drawing until the age falls within bounds).
     """
     for _ in range(100):  # rejection sampling with safety limit
-        age = random.choices(_AGE_VALUES, weights=_AGE_PROBS, k=1)[0]
+        age = random.choices(cfg.AGE_VALUES, weights=cfg.AGE_PROBS, k=1)[0]
         if age == 85:
             age = int(round(random.gauss(89.0, 4.0)))
             age = max(85, min(100, age))
@@ -194,12 +78,12 @@ def _sample_race_ethnicity() -> tuple:
     Returns (race, ethnicity) where ethnicity is "Hispanic" or "Non-Hispanic"
     and race is one of the Census 6 race groups.
     """
-    if random.random() < _P_HISPANIC:
+    if random.random() < cfg.P_HISPANIC:
         ethnicity = "Hispanic"
-        race = _weighted_choice(_RACE_PROBS_HISP)
+        race = _weighted_choice(cfg.RACE_PROBS_HISP)
     else:
         ethnicity = "Non-Hispanic"
-        race = _weighted_choice(_RACE_PROBS_NON_HISP)
+        race = _weighted_choice(cfg.RACE_PROBS_NON_HISP)
     return race, ethnicity
 
 
@@ -229,7 +113,7 @@ def _rate_for_age(table: dict, age: int, default: float = 0.05) -> float:
 def _sample_insurance(age: int) -> str:
     """Draw Insured/Uninsured from the ACS age-band distribution."""
     p_insured = 0.95  # fallback
-    for (lo, hi), prob in _INSURANCE_PROBS.items():
+    for (lo, hi), prob in cfg.INSURANCE_PROBS.items():
         if lo <= age <= hi:
             p_insured = prob
             break
@@ -238,11 +122,11 @@ def _sample_insurance(age: int) -> str:
 
 def _sample_bmi() -> float:
     """Draw BMI from the NYC-calibrated mixture model (27.6% obesity rate)."""
-    if random.random() < _BMI_OBESITY_RATE:
-        bmi = random.gauss(_BMI_OBESE_MU, _BMI_OBESE_SIGMA)
+    if random.random() < cfg.BMI_OBESITY_RATE:
+        bmi = random.gauss(cfg.BMI_OBESE_MU, cfg.BMI_OBESE_SIGMA)
         bmi = max(30.0, min(60.0, bmi))
     else:
-        bmi = random.gauss(_BMI_NONOBES_MU, _BMI_NONOBES_SIGMA)
+        bmi = random.gauss(cfg.BMI_NONOBES_MU, cfg.BMI_NONOBES_SIGMA)
         bmi = max(16.0, min(29.9, bmi))
     return round(bmi, 1)
 
@@ -275,7 +159,7 @@ def sample_patient(
     race, ethnicity  = _sample_race_ethnicity()
     insurance        = _sample_insurance(age)
 
-    smoker     = random.random() < _SMOKER_RATE
+    smoker     = random.random() < cfg.SMOKER_RATE
     # ~30% of ever-smokers are former smokers; sample years since quitting (0–30 yrs)
     is_former  = (not smoker) and (random.random() < 0.30)
     pack_years = round(random.uniform(5, 40), 1) if (smoker or is_former) else 0.0
@@ -283,12 +167,12 @@ def sample_patient(
 
     bmi = _sample_bmi()
 
-    hpv_vaccinated    = random.random() < _rate_for_age(_HPV_VAX_RATE, age)
-    hpv_positive      = (not hpv_vaccinated) and (random.random() < _HPV_POSITIVE_RATE)
+    hpv_vaccinated    = random.random() < _rate_for_age(cfg.HPV_VAX_RATE, age)
+    hpv_positive      = (not hpv_vaccinated) and (random.random() < cfg.HPV_POSITIVE_RATE)
 
     # Hysterectomy — age x race/ethnicity stratified (Yutong's code, BRFSS 2018)
     hyst_group        = _hysterectomy_group(race, ethnicity)
-    hyst_table        = _HYSTERECTOMY_BY_GROUP[hyst_group]
+    hyst_table        = cfg.HYSTERECTOMY_BY_GROUP[hyst_group]
     hysterectomy_prob = _rate_for_age(hyst_table, age, default=0.35)
     has_cervix        = random.random() > hysterectomy_prob
 

@@ -518,3 +518,141 @@ PROCEDURE_REVENUE = {
     "lung_biopsy":   2100,    # CPT 32405 (CT-guided needle biopsy)
     "lung_treatment": 18500,  # surgery / radiation / med onc — rough composite
 }
+
+
+# =============================================================================
+# POPULATION ATTRIBUTE DISTRIBUTIONS
+# =============================================================================
+# Every attribute a new patient carries (age, race, insurance, smoking, HPV,
+# cervix status, BMI) is drawn from one of these distributions when
+# sample_patient() is called. Originally these lived inside model.py as
+# private module-level constants; they're parameters, not model logic, so
+# they belong here where a scenario-runner can tune them.
+# =============================================================================
+
+# ── Age distribution ────────────────────────────────────────────────────────
+# NY female, age 21+, single-year-of-age probabilities.
+# Age-85 bucket represents 85+ in the Census source; sample_patient expands
+# it to 85–100 via a clipped Normal(89, 4) draw.
+# Source: Census SC-EST2024-AGESEX-CIV (civilian population by single year of age and sex)
+AGE_VALUES = list(range(21, 86))  # 21–85; 85 represents 85+
+AGE_PROBS = [
+    0.015909975693027187, 0.015514818723877663, 0.016165837946892232,
+    0.01689024862027892,  0.01699947013835047,  0.017212975882406,
+    0.017355724578320054, 0.017534542152345977, 0.01772477427008793,
+    0.01796727563118836,  0.017869788708665356, 0.017924952319437078,
+    0.017984389970164453, 0.01800159302518125,  0.01741507874311268,
+    0.01717177811225559,  0.016891975474882467, 0.016597230133555383,
+    0.016439746732069248, 0.01589917571961944,  0.016007676438554838,
+    0.015882613683578266, 0.01561910688061082,  0.015642815541554155,
+    0.015150988805421506, 0.014800490746677025, 0.014795095607926827,
+    0.01443569931312958,  0.01465963231536682,  0.014318527774542467,
+    0.014495151642568842, 0.015190006179027459, 0.01629945044323262,
+    0.016382292266177494, 0.015931279440770407, 0.015814107901489253,
+    0.016029360010582517, 0.0164331408655305,   0.017043768053761793,
+    0.017272201799168498, 0.017123462119641668, 0.01694025841256843,
+    0.0168197626872114,   0.01658451968484241,  0.01618842115724186,
+    0.015949102506540596, 0.015597560630433698, 0.014934859031132527,
+    0.014587727036858528, 0.013939431938424342, 0.013283166298213077,
+    0.012806339839006291, 0.012359378318188544, 0.011916549151198764,
+    0.01150825888909235,  0.011151929991680755, 0.011483318856435978,
+    0.008466537112776232, 0.008097424134650845, 0.007750418703502376,
+    0.007755189543798091, 0.006740173239321621, 0.005973056389805381,
+    0.005479500935361273, 0.03647309388037247,
+]
+# Normalise (source sums to ~1 but guard against float drift)
+_age_total = sum(AGE_PROBS)
+AGE_PROBS  = [p / _age_total for p in AGE_PROBS]
+del _age_total
+
+# ── Race / ethnicity (two-stage draw) ───────────────────────────────────────
+# Source: Census SC-EST2024-SR11H (NY female by sex, race, Hispanic origin)
+P_HISPANIC     = 2030943 / 10161956
+P_NON_HISPANIC = 8131013 / 10161956
+
+RACE_PROBS_NON_HISP = {
+    "White":        5361976 / 8131013,
+    "Black":        1504583 / 8131013,
+    "AIAN":           30664 / 8131013,
+    "Asian":        1023010 / 8131013,
+    "NHPI":            5269 / 8131013,
+    "Two or More":   205511 / 8131013,
+}
+
+RACE_PROBS_HISP = {
+    "White":        1460416 / 2030943,
+    "Black":         360471 / 2030943,
+    "AIAN":           83440 / 2030943,
+    "Asian":          23744 / 2030943,
+    "NHPI":            9962 / 2030943,
+    "Two or More":    92910 / 2030943,
+}
+
+# ── Insurance status by age band (female-only, age 21+) ──────────────────────
+# Source: ACS B27001 (https://data.census.gov/table/ACSDT1Y2022.B27001)
+INSURANCE_BY_AGE = {
+    (21, 25): {"Insured": 13190608, "Uninsured": 1872271},
+    (26, 34): {"Insured": 18118047, "Uninsured": 2411358},
+    (35, 44): {"Insured": 20435569, "Uninsured": 2248259},
+    (45, 54): {"Insured": 18622090, "Uninsured": 1805871},
+    (55, 64): {"Insured": 19717410, "Uninsured": 1476065},
+    (65, 74): {"Insured": 18473038, "Uninsured":  179909},
+    (75, 99): {"Insured": 13985406, "Uninsured":   75089},
+}
+# Derived: P(insured) by age band
+INSURANCE_PROBS = {
+    _band: _vals["Insured"] / (_vals["Insured"] + _vals["Uninsured"])
+    for _band, _vals in INSURANCE_BY_AGE.items()
+}
+
+# ── Smoking rate ─────────────────────────────────────────────────────────────
+# Source: NYS BRFSS 2023
+SMOKER_RATE = 0.109
+
+# ── HPV status ───────────────────────────────────────────────────────────────
+HPV_POSITIVE_RATE = 0.25    # among unvaccinated women with cervix — PLACEHOLDER
+
+# Vaccination coverage by age cohort — PLACEHOLDER
+HPV_VAX_RATE = {
+    (21, 29): 0.60,
+    (30, 39): 0.40,
+    (40, 49): 0.20,
+    (50, 99): 0.05,
+}
+
+# ── Hysterectomy prevalence (drives has_cervix) ──────────────────────────────
+# Stratified by age band AND race/ethnicity group.
+# Source: CDC/BRFSS 2018 (https://stacks.cdc.gov/view/cdc/113157/cdc_113157_DS1.pdf)
+HYSTERECTOMY_BY_GROUP = {
+    "Hispanic": {
+        (21, 29): 0.004, (30, 39): 0.029, (40, 49): 0.109,
+        (50, 59): 0.211, (60, 69): 0.295, (70, 99): 0.430,
+    },
+    "White": {
+        (21, 29): 0.005, (30, 39): 0.054, (40, 49): 0.166,
+        (50, 59): 0.268, (60, 69): 0.341, (70, 99): 0.456,
+    },
+    "Black": {
+        (21, 29): 0.003, (30, 39): 0.038, (40, 49): 0.185,
+        (50, 59): 0.337, (60, 69): 0.441, (70, 99): 0.521,
+    },
+    "Asian": {
+        (21, 29): 0.004, (30, 39): 0.006, (40, 49): 0.078,
+        (50, 59): 0.112, (60, 69): 0.149, (70, 99): 0.276,
+    },
+    "Other": {
+        (21, 29): 0.004, (30, 39): 0.038, (40, 49): 0.143,
+        (50, 59): 0.239, (60, 69): 0.310, (70, 99): 0.418,
+    },
+}
+
+# ── BMI mixture model ────────────────────────────────────────────────────────
+# Two-component Gaussian mixture: non-obese (BMI<30) and obese (BMI≥30).
+# Overall obesity rate calibrated to NYC.
+# Source: NYC Health obesity indicator
+# (https://a816-dohbesp.nyc.gov/IndicatorPublic/data-explorer/overweight/)
+BMI_OBESITY_RATE  = 0.276
+BMI_NONOBES_MU    = 24.7
+BMI_NONOBES_SIGMA = 3.2
+BMI_OBESE_MU      = 34.8
+BMI_OBESE_SIGMA   = 4.5
