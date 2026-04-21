@@ -53,29 +53,28 @@ A discrete-event simulation (DES) of a multi-cancer women's health screening pro
 
 ```
 NYP/
+├── ModelParameters/
+│   ├── parameters.py      # All simulation inputs (probabilities, capacities, revenue, population distributions)
+│   └── validation.py      # Cross-validation targets + literature benchmarks (NOT simulation inputs)
+│
 ├── src/
-│   ├── config.py          # All parameters, probabilities, capacities, revenue rates
 │   ├── patient.py         # Patient dataclass — shared data contract between all modules
-│   ├── population.py      # NYC population sampler + Gompertz mortality + life event draws
-│   ├── screening.py       # Eligibility, test assignment, result draws, pre-LDCT funnel
-│   ├── followup.py        # Post-screening clinical pathways (cervical + lung)
-│   ├── metrics.py         # Counters, rates, revenue analysis, summary reporting
+│   ├── model.py           # Population sampler + screening + follow-up + metrics (merged)
 │   ├── db.py              # SQLite persistence — patient + event log storage
-│   ├── runner.py          # SimulationRunner — day-by-day orchestration + queue engine
-│   └── scenarios.py       # Co-scheduling scenario definitions
+│   └── runner.py          # SimulationRunner — day-by-day orchestration + queue engine
 │
 ├── notebooks/
 │   ├── simulation.ipynb          # Main notebook: 80-year run + all visualizations
-│   ├── metrics_outputs.ipynb     # Analysis, funnels, revenue, LTFU plots
-│   └── scenario_analysis.ipynb   # Co-scheduling comparison
+│   └── Base Visualizations/      # 30+ saved PNGs from latest run
 │
 ├── archive/                      # Reference notebooks (not required to run)
 └── docs/
-    └── README.md                 # Project overview
-    └── SIMULATION_ARCHITECTURE.md # This file
+    ├── README.md                 # Project overview
+    ├── SIMULATION_ARCHITECTURE.md # This file
+    └── GLOSSARY.md               # Medical terms + CPT codes
 ```
 
-**Design principle:** all logic lives in `.py` modules — importable, testable, version-controlled. Notebooks are thin wrappers that call those modules, run scenarios, and display output. No probability, capacity, or interval value is hard-coded anywhere except `config.py`.
+**Design principle:** all logic lives in `.py` modules — importable, testable, version-controlled. Notebooks are thin wrappers that call those modules, run scenarios, and display output. No probability, capacity, or interval value is hard-coded anywhere except `parameters.py`.
 
 ---
 
@@ -290,19 +289,11 @@ Outpatient arrivals are routed to a provider by weighted draw from `DESTINATION_
 | PCP | 0.852 | `DESTINATION_PROBS_OUTPATIENT["pcp"]` |
 | Gynecologist | 0.148 | `DESTINATION_PROBS_OUTPATIENT["gynecologist"]` |
 
-Provider daily capacities (`PROVIDER_CAPACITY`): PCP 70, GYN 52, Specialist 35, ER 43 — but these are **not enforced as hard constraints**. Provider routing is proportional; the real bottleneck is at procedure slots.
+Provider throughput is enforced as a single daily cap (`DAILY_PATIENTS`), not per-provider. Each workday, up to `DAILY_PATIENTS` patients from the intake queue are seated across all providers; overflow remains in the FIFO queue for the next workday. Provider *routing* (PCP vs GYN) is proportional and does not itself cap capacity — the real bottleneck is at the procedure slots (Section 9).
 
 ### Scheduling Lead Time
 
-Drawn uniformly from `OUTPATIENT_LEAD_DAYS`:
-
-| Provider | Lead Time (days) | Config Key |
-|---|---|---|
-| PCP | Uniform(1, 7) | `OUTPATIENT_LEAD_DAYS["pcp"]` |
-| Gynecologist | Uniform(7, 21) | `OUTPATIENT_LEAD_DAYS["gynecologist"]` |
-| Specialist | Uniform(14, 28) | `OUTPATIENT_LEAD_DAYS["specialist"]` |
-
-ER patients are added directly as drop-ins (`_queues.add_dropin(p, "er")`).
+Outpatients enter the intake FIFO on their arrival day. They get seen by a provider on the next available workday within the `DAILY_PATIENTS` cap — no explicit per-provider lead-time draw. ER patients skip the outpatient intake and enter `intake_er` as drop-ins, served after established and outpatient priority.
 
 ### New-to-Established Conversion
 
@@ -359,25 +350,17 @@ First screen ever (`last_day = -1`): always due. Falls back to cytology (shorter
 
 ---
 
-## 7. Test Completion & Calibration
+## 7. Calibration Targets
 
-Once a patient is eligible and due, the simulation initiates screening deterministically. No separate per-visit "decision to order" probability applies.
+Once a patient is eligible and due, the simulation initiates screening deterministically. No per-visit "decision to order" probability applies; we do not model test-completion-given-ordered either.
 
-### Test Completion Rates
-
-| Test | P(completed \| ordered) | Config Key | Source |
-|---|---|---|---|
-| Cervical (in-office) | 0.97108 | `CERVICAL_TEST_COMPLETION_PROB` | AiP Parameters PDF |
-| LDCT (after ordering) | 0.612 | `LUNG_TEST_COMPLETION_PROB` | ASCO abstracts/197367 |
-| LDCT absolute completion | 0.719 | `LUNG_TEST_COMPLETION_ABSOLUTE` | Same source |
-
-### Calibration Targets
+External benchmarks in `validation.py` — the simulation OUTPUT should fall in these ranges when calibrated against NYP data:
 
 | Metric | Target | Source |
 |---|---|---|
 | Cervical up-to-date (3-yr interval) | 73–83% | NHIS/BRFSS |
 | Lung annual rate (academic center) | 15–25% | Fedewa et al. 2022 |
-| Visits before cervical initiation | ~1.5 (range 1–3) | AiP Parameters PDF |
+| Visits before cervical initiation | ~1.5 (range 1–3) | Kepka et al. 2014 |
 | Visits before lung initiation | ~4 (range 2–6) | Triplette et al. 2022 |
 
 ---
@@ -464,14 +447,6 @@ No patient-level risk adjustments for lung results.
 | RADS_4A | 0.08 | `LUNG_RADS_MALIGNANCY_RATE["RADS_4A"]` | ACR Lung-RADS v1.1 |
 | RADS_4B_4X | 0.35 | `LUNG_RADS_MALIGNANCY_RATE["RADS_4B_4X"]` | Pinsky et al. 2015 |
 
-### Lung-RADS Follow-Up Adherence
-
-| Category | Adherence | Config Key | Source |
-|---|---|---|---|
-| RADS_3 | 67.1% | `LUNG_RADS_ADHERENCE["RADS_3"]` | ASCO JCO 2021 |
-| RADS_4A | 66.4% | `LUNG_RADS_ADHERENCE["RADS_4A"]` | ASCO JCO 2021 |
-| RADS_4B_4X | 78.2% | `LUNG_RADS_ADHERENCE["RADS_4B_4X"]` | ASCO JCO 2021 |
-
 ---
 
 ## 9. Procedure Slot Capacity & Queue Overflow
@@ -543,9 +518,9 @@ When HPV+ is triaged to 1-year repeat:
 | HSIL | 0.10 | 0.10 | 0.30 | 0.50 |
 | HPV_POSITIVE | 0.50 | 0.30 | 0.15 | 0.05 |
 
-**Default fallback** (`COLPOSCOPY_RESULT_PROBS_DEFAULT`): NORMAL 0.35, CIN1 0.28, CIN2 0.15, CIN3 0.15, INSUFFICIENT 0.07. INSUFFICIENT triggers a repeat colposcopy.
+Every colposcopy trigger (ASCUS / LSIL / ASC-H / HSIL / HPV_POSITIVE) has a specific `from_X` distribution — no fallback is needed.
 
-After colposcopy, a pathology result delay of `TURNAROUND_DAYS["colposcopy_result"] = 10` days elapses before treatment routing.
+After colposcopy, a pathology result delay of `TURNAROUND_DAYS["colposcopy_result"] = 10` days elapses before treatment routing. If the biopsy returns CIN2 or CIN3, the patient's `prior_cin` attribute is updated so subsequent cytology draws correctly apply `RISK_MULT_PRIOR_CIN_HIGHGRADE`.
 
 ### Treatment Assignment
 
@@ -558,8 +533,6 @@ From `TREATMENT_ASSIGNMENT`:
 | CIN2 | LEEP | Schedule LEEP procedure |
 | CIN3 | LEEP | Schedule LEEP procedure |
 
-CIN2/3 treatment rate: `CIN23_TREATMENT_RATE = 0.50` — 50% treated, 50% exit.
-
 LEEP scheduling delay: `FOLLOWUP_DELAY_DAYS["leep"] = 14` days.
 Cone biopsy scheduling delay: `FOLLOWUP_DELAY_DAYS["cone_biopsy"] = 21` days.
 
@@ -569,59 +542,38 @@ After LEEP/cone biopsy: post-treatment surveillance is scheduled per ASCCP guide
 
 ## 11. Lung Follow-Up Pathway
 
-### Pre-LDCT Funnel (3 Sequential LTFU Nodes)
+### Pre-LDCT Milestones
 
-`run_lung_pre_ldct(p, day, metrics)` — each step is a Bernoulli draw; failure = LTFU:
-
-| Step | Success Probability | Config Key | Failure = LTFU |
-|---|---|---|---|
-| 1. Referral placed | 0.72 | `LUNG_PATHWAY_PROBS["referral_placed"]` | 28% drop |
-| 2. LDCT scheduled | 0.80 | `LUNG_PATHWAY_PROBS["scheduled_after_referral"]` | 20% drop |
-| 3. LDCT completed | 0.612 | `LUNG_TEST_COMPLETION_PROB` | 38.8% drop |
-
-Cumulative completion: 0.72 × 0.80 × 0.612 ≈ 35.3% of eligible patients actually complete an LDCT.
+`run_lung_pre_ldct(p, day, metrics)` records three administrative milestones (referral placed → scan scheduled → scan completed). **No Bernoulli LTFU fires at these nodes** — LTFU is handled exclusively by the queue-based geometric waiting-time hazard (consistent with the cervical pathway). Dropouts happen only if the patient abandons the LDCT retry queue after repeated capacity overflow.
 
 ### Post-LDCT Result Routing
 
-`run_lung_followup(p, day, metrics)` and `_lung_result_routing(p, day)`:
-
-**Step 1 — Result Communication:**
-| Step | Success Probability | Config Key |
-|---|---|---|
-| Result communicated | 0.90 | `LUNG_PATHWAY_PROBS["result_communicated"]` |
-
-**Step 2 — Follow-up adherence** (Bernoulli per category):
-
-| RADS Category | Adherence | Config Key | If non-adherent |
-|---|---|---|---|
-| RADS_3 | 67.1% | `LUNG_RADS_ADHERENCE["RADS_3"]` | LTFU |
-| RADS_4A | 66.4% | `LUNG_RADS_ADHERENCE["RADS_4A"]` | LTFU |
-| RADS_4B_4X | 78.2% | `LUNG_RADS_ADHERENCE["RADS_4B_4X"]` | LTFU |
-
-**Step 3 — Disposition:**
+`run_lung_followup(p, day, metrics)` — RADS category drives disposition:
 
 | RADS Category | Action | Repeat Interval | Config Key |
 |---|---|---|---|
 | RADS_0 | Repeat LDCT | 60 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_0"]` |
-| RADS_1, RADS_2 | Repeat LDCT | 365 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_1"]` |
+| RADS_1, RADS_2 | Repeat LDCT (routine annual) | 365 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_1"]` / `["RADS_2"]` |
 | RADS_3 | Repeat LDCT | 180 days | `LUNG_RADS_REPEAT_INTERVALS["RADS_3"]` |
 | RADS_4A | Biopsy pathway | — | — |
 | RADS_4B_4X | Biopsy pathway | — | — |
 
 ### Biopsy Pathway (RADS 4A/4B/4X)
 
-Sequential LTFU nodes — each step is a Bernoulli draw:
+Biopsy referral → scheduling → completion → pathology result. Administrative steps are recorded but do not fire Bernoulli LTFU (again, queue hazard only).
 
-| Step | Success Probability | Config Key |
+The pathology result is the one clinical probability in this pathway — it determines whether the biopsy returns malignant or benign. Rates are stratified by Lung-RADS tier:
+
+| RADS Category | P(malignant \| biopsy completed) | Config Key |
 |---|---|---|
-| Biopsy referral made | 0.80 | `LUNG_PATHWAY_PROBS["biopsy_referral_made"]` |
-| Biopsy scheduled | 0.78 | `LUNG_PATHWAY_PROBS["biopsy_scheduled"]` |
-| Biopsy completed | 0.88 | `LUNG_PATHWAY_PROBS["biopsy_completed"]` |
-| Malignancy confirmed | 0.25 | `LUNG_PATHWAY_PROBS["malignancy_confirmed"]` |
-| Treatment given | 0.92 | `LUNG_PATHWAY_PROBS["treatment_given"]` |
+| RADS_3 | 0.03 | `LUNG_RADS_MALIGNANCY_RATE["RADS_3"]` (not reached — RADS 3 goes to repeat LDCT) |
+| RADS_4A | 0.08 | `LUNG_RADS_MALIGNANCY_RATE["RADS_4A"]` |
+| RADS_4B_4X | 0.35 | `LUNG_RADS_MALIGNANCY_RATE["RADS_4B_4X"]` |
 
-If malignancy not confirmed (75%): `p.lung_biopsy_result = "benign"`, return to annual surveillance.
-If malignancy confirmed but treatment not given (8%): `p.exit_system(day, "lost_to_followup")`.
+Sources: Pinsky et al. 2015 (NLST/Lung-RADS); McKee et al. 2015; ACR Lung-RADS v1.1; Hammer et al. 2020.
+
+If benign: `p.lung_biopsy_result = "benign"`, return to annual surveillance.
+If malignant: `p.lung_biopsy_result = "malignant"`, proceed to treatment slot competition.
 
 Scheduling delays: `FOLLOWUP_DELAY_DAYS["lung_biopsy"] = 21` days, `FOLLOWUP_DELAY_DAYS["lung_treatment"] = 21` days.
 
@@ -930,24 +882,7 @@ These are **configured scheduling windows**, not simulation outputs. Queue wait 
 | ASCUS / LSIL | Within 3 months (90 days) | `ABNORMAL_FOLLOWUP_DAYS["ASCUS_LSIL"]` |
 | HSIL / ASC-H | Within 1 month (30 days) | `ABNORMAL_FOLLOWUP_DAYS["HSIL_ASCH"]` |
 
-Source: 2019 ASCCP Risk-Based Management Consensus Guidelines (Perkins et al., J Low Genit Tract Dis 2020).
-
-### Unscreened Re-entry Delay
-
-| Provider | Delay (days) | Config Key |
-|---|---|---|
-| PCP | 28 | `RESCHEDULE_DELAY_DAYS["pcp"]` |
-| Gynecologist | 38 | `RESCHEDULE_DELAY_DAYS["gynecologist"]` |
-| Specialist | 30 | `RESCHEDULE_DELAY_DAYS["specialist"]` |
-| ER | 7 | `RESCHEDULE_DELAY_DAYS["er"]` |
-| Default | 30 | `RESCHEDULE_DELAY_DAYS["default"]` |
-
-### Post-Treatment Re-entry Delay
-
-| Cancer | Delay (days) | Config Key |
-|---|---|---|
-| Cervical | 180 | `POST_TREATMENT_DELAY_DAYS["cervical"]` |
-| Lung | 365 | `POST_TREATMENT_DELAY_DAYS["lung"]` |
+Source: 2019 ASCCP Risk-Based Management Consensus Guidelines (Perkins et al., J Low Genit Tract Dis 2020). `ABNORMAL_FOLLOWUP_DAYS` lives in `validation.py` as a literature benchmark; it is not currently consumed by the scheduler, which uses the simpler `FOLLOWUP_DELAY_DAYS["colposcopy"] = 50` / `FOLLOWUP_DELAY_DAYS["colposcopy_hsil"] = 32` instead.
 
 ---
 
@@ -964,26 +899,4 @@ All volume outputs should be multiplied by `POPULATION_SCALE_FACTOR = 100` when 
 
 ---
 
-## Disease-Specific Mortality (Placeholder)
-
-`DISEASE_MORTALITY` in config defines additional mortality risk given a confirmed diagnosis. **Currently set to `None` for all categories** — no disease-specific death days are drawn. When populated with NYP/SEER data, the runner should draw a disease-specific death day at diagnosis time and add it to the life-event queue.
-
-| Condition | Config Key | Current Value |
-|---|---|---|
-| CIN1 | `DISEASE_MORTALITY["CIN1"]` | None |
-| CIN2 | `DISEASE_MORTALITY["CIN2"]` | None |
-| CIN3 | `DISEASE_MORTALITY["CIN3"]` | None |
-| Lung malignant | `DISEASE_MORTALITY["lung_malignant"]` | None |
-| Any cancer | `DISEASE_MORTALITY["any_cancer"]` | None |
-
----
-
-## Workflow Mode
-
-`WORKFLOW_MODE` controls the care delivery model:
-- `"fragmented"` (current default) — separate appointments per specialty
-- `"coordinated"` — bundled multi-screening program (future state)
-
----
-
-*All clinical probabilities and revenue rates are PLACEHOLDERS unless otherwise sourced — replace with NYP EHR/finance data before operational use. Parameters marked PLACEHOLDER in `config.py` are clearly annotated.*
+*All clinical probabilities and revenue rates are PLACEHOLDERS unless otherwise sourced — replace with NYP EHR/finance data before operational use. Parameters marked PLACEHOLDER in `parameters.py` are clearly annotated.*

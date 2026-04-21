@@ -85,19 +85,18 @@ Established patients who hit pathway LTFU are **re-activated** and continue annu
 
 ```
 NYP/
+├── ModelParameters/
+│   ├── parameters.py   # Single source of truth for all simulation inputs
+│   └── validation.py   # Cross-validation targets + literature benchmarks
+│
 ├── src/
-│   ├── config.py       # Single source of truth for all parameters
 │   ├── patient.py      # Patient dataclass
-│   ├── population.py   # NYC demographic sampler + life event draws
-│   ├── screening.py    # Eligibility, test assignment, result draws
-│   ├── followup.py     # Cervical + lung follow-up pathways
-│   ├── metrics.py      # Counters, rates, revenue analysis
+│   ├── model.py        # Population sampling + screening + follow-up + metrics
 │   ├── db.py           # SQLite persistence (patients + events tables)
 │   └── runner.py       # SimulationRunner — day loop + queue engine
 │
 ├── notebooks/
 │   ├── simulation.ipynb           # Main: 80-year run, metrics, 30+ visualizations
-│   ├── scenario_analysis.ipynb    # Coordinated vs. fragmented workflow scenarios
 │   └── Base Visualizations/       # 30 saved PNGs from latest simulation run
 │
 ├── docs/
@@ -108,7 +107,7 @@ NYP/
 └── archive/            # Reference notebooks
 ```
 
-All logic in `.py` modules; notebooks are thin wrappers. Change any parameter in `config.py` and re-run.
+All logic in `.py` modules; notebooks are thin wrappers. Change any parameter in `parameters.py` and re-run.
 
 ---
 
@@ -124,14 +123,14 @@ All logic in `.py` modules; notebooks are thin wrappers. Change any parameter in
 
 ## Placeholder Parameters
 
-All clinical probabilities and revenue rates in `config.py` are marked `# PLACEHOLDER` — replace with NYP EHR/finance data before operational use.
+All clinical probabilities and revenue rates in `parameters.py` are marked `# PLACEHOLDER` — replace with NYP EHR/finance data before operational use.
 
 | Priority | What to Replace |
 |---|---|
 | High | `PROCEDURE_REVENUE` — NYP contract rates |
 | High | `CERVICAL_RESULT_PROBS` — NYP lab abnormal rates |
 | High | `LTFU_PROBS` — NYP EHR attrition data |
-| Medium | `LUNG_PATHWAY_PROBS` — NYP LDCT referral/completion data |
+| Medium | `LUNG_RADS_MALIGNANCY_RATE` — NYP lung pathology biopsy yield data |
 | Medium | `CAPACITIES` — NYP procedure slot throughput |
 | Medium | `COLPOSCOPY_RESULT_PROBS` — ASCCP risk tables |
 

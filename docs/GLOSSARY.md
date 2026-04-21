@@ -9,7 +9,7 @@ This file defines every medical term, acronym, procedure name, clinical result c
 | Acronym / Term | Full Name | Role in the simulation |
 |---|---|---|
 | **USPSTF** | United States Preventive Services Task Force | The federal body that issues evidence-based screening recommendations. The simulation follows USPSTF 2018 (cervical) and USPSTF 2021 (lung) guidelines to determine who is eligible for screening and at what intervals. |
-| **ASCCP** | American Society for Colposcopy and Cervical Pathology | Issues risk-based management guidelines for abnormal cervical screening results. The colposcopy result probabilities in `config.py` are intended to be calibrated from ASCCP risk tables. |
+| **ASCCP** | American Society for Colposcopy and Cervical Pathology | Issues risk-based management guidelines for abnormal cervical screening results. The colposcopy result probabilities in `parameters.py` are intended to be calibrated from ASCCP risk tables. |
 | **ACR** | American College of Radiology | Maintains the Lung-RADS reporting system (see below). Also issues guidelines on timely workup for suspicious lung findings. |
 | **NCCN** | National Comprehensive Cancer Network | Issues guidelines on lung cancer workup and treatment; referenced in comments for lung biopsy follow-up timing. |
 | **CPT** | Current Procedural Terminology | A standardised code set (maintained by the AMA) used to bill for medical procedures. Each procedure in `config.PROCEDURE_REVENUE` is tagged with its CPT code as a calibration reference. |
