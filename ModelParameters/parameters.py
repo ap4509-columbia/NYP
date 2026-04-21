@@ -94,44 +94,6 @@ ELIGIBILITY = {
 }
 
 
-# Screening initiation rates — hybrid per-visit probability model
-# Formula: P(screen at visit k) = min(P_base + (k-1) * P_increment, P_cap)
-# Source: AiP Parameters PDF, Section 2
-
-# Base per-visit screening initiation probability by setting
-# Cervical PCP: Kepka et al. Prev Med 2014; Stange et al. Ann Fam Med 2003; NYP Epic BPA adds ~10-15pp (Huy et al. 2013)
-# Cervical GYN: Sawaya et al. Ann Intern Med 2019 — well-woman visit, cervical screening is integral
-# Lung PCP: Fedewa et al. JAMA Intern Med 2022; Mazzone et al. Chest 2021 — SDM bottleneck
-SCREENING_INITIATION_BASE = {
-    "cervical_pcp": 0.55,   # Source: Kepka et al. Prev Med 2014; Stange et al. Ann Fam Med 2003; Huy et al. 2013; AiP Parameters PDF
-    "cervical_gyn": 0.85,   # Source: Sawaya et al. Ann Intern Med 2019; AiP Parameters PDF
-    "lung_pcp":     0.12,   # Source: Fedewa et al. JAMA Intern Med 2022; Mazzone et al. Chest 2021; AiP Parameters PDF
-}
-# Sensitivity ranges from AiP Parameters PDF:
-#   cervical_pcp: 40–65%; cervical_gyn: 75–92%; lung_pcp: 8–18%
-
-# Escalation per additional eligible visit where screening was not performed
-# ASSUMPTION — no published per-visit escalation rate; chosen to reach ~calibration target over 1.5 visits (cervical)
-SCREENING_INITIATION_INCREMENT = {
-    "cervical": 0.05,   # ASSUMPTION
-    "lung":     0.03,   # ASSUMPTION
-}
-
-# Maximum per-visit initiation probability (cap)
-# ASSUMPTION — prevents unrealistic 100% eventual uptake
-SCREENING_INITIATION_CAP = {
-    "cervical": 0.95,   # ASSUMPTION
-    "lung":     0.50,   # ASSUMPTION — SDM completes in only 30–50% of encounters (Mazzone et al. Chest 2021)
-}
-
-# "Never screener" fraction — patients who will never screen regardless of visit count
-# Source: AiP Parameters PDF — "~10–15% for cervical, ~60–70% for lung"
-NEVER_SCREENER_FRAC = {
-    "cervical": 0.125,   # Source: AiP Parameters PDF (midpoint of 10–15%)
-    "lung":     0.65,    # Source: AiP Parameters PDF (midpoint of 60–70%)
-}
-
-
 # Cervical test type selection for ages 30–65
 # Co-test dominant at academic centers; primary HPV emerging post-2024 USPSTF draft
 # Source: AiP Parameters PDF

@@ -26,8 +26,7 @@ LUNG_ELIGIBLE_BASE_PROB = 0.055
 
 # ── Expected Visits Before Screening Initiation ────────────────────────────
 # Average number of provider visits before a screening is first ordered.
-# This should EMERGE from the behavioral model (SCREENING_INITIATION_BASE,
-# SCREENING_INITIATION_INCREMENT, SCREENING_INITIATION_CAP in parameters.py).
+# External benchmark for cross-validation — not currently consumed by the model.
 # Source: AiP Parameters PDF; Kepka et al. 2014; Triplette et al. 2022
 SCREENING_VISITS_BEFORE_INITIATION = {
     "cervical": 1.5,   # Source: AiP Parameters PDF; Kepka et al. 2014

@@ -359,44 +359,9 @@ First screen ever (`last_day = -1`): always due. Falls back to cytology (shorter
 
 ---
 
-## 7. Screening Initiation Model
+## 7. Test Completion & Calibration
 
-The simulation uses a **hybrid per-visit probability model** for whether screening is actually initiated during an eligible visit. This is distinct from eligibility — a patient may be eligible but the provider may not initiate screening.
-
-### Per-Visit Initiation Probability
-
-```
-P(screen at visit k) = min(P_base + (k-1) × P_increment, P_cap)
-```
-
-| Setting | Base Probability | Config Key | Source |
-|---|---|---|---|
-| Cervical at PCP | 0.55 | `SCREENING_INITIATION_BASE["cervical_pcp"]` | Kepka et al. 2014; Stange et al. 2003 |
-| Cervical at GYN | 0.85 | `SCREENING_INITIATION_BASE["cervical_gyn"]` | Sawaya et al. 2019 |
-| Lung at PCP | 0.12 | `SCREENING_INITIATION_BASE["lung_pcp"]` | Fedewa et al. 2022; Mazzone et al. 2021 |
-
-### Escalation per Visit
-
-| Cancer | Increment per visit | Config Key |
-|---|---|---|
-| Cervical | +0.05 | `SCREENING_INITIATION_INCREMENT["cervical"]` |
-| Lung | +0.03 | `SCREENING_INITIATION_INCREMENT["lung"]` |
-
-### Caps
-
-| Cancer | Maximum | Config Key |
-|---|---|---|
-| Cervical | 0.95 | `SCREENING_INITIATION_CAP["cervical"]` |
-| Lung | 0.50 | `SCREENING_INITIATION_CAP["lung"]` |
-
-### Never-Screener Fraction
-
-A fixed fraction will never screen regardless of visit count:
-
-| Cancer | Fraction | Config Key | Source |
-|---|---|---|---|
-| Cervical | 12.5% | `NEVER_SCREENER_FRAC["cervical"]` | AiP Parameters PDF |
-| Lung | 65% | `NEVER_SCREENER_FRAC["lung"]` | AiP Parameters PDF |
+Once a patient is eligible and due, the simulation initiates screening deterministically. No separate per-visit "decision to order" probability applies.
 
 ### Test Completion Rates
 
