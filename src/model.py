@@ -846,12 +846,11 @@ def draw_colposcopy_result(p: Patient) -> str:
     """
     Draw a CIN grade from colposcopy, conditional on the result that triggered it.
     The key format matches COLPOSCOPY_RESULT_PROBS in config (e.g. 'from_HSIL').
-    Falls back to a default distribution if the trigger is not found in config.
+    Every colposcopy trigger (ASCUS/LSIL/ASC-H/HSIL/HPV_POSITIVE) has a
+    specific distribution, so no fallback is required.
     """
-    key   = f"from_{p.cervical_result}"   # e.g. "from_HSIL", "from_HPV_POSITIVE"
-    probs = cfg.COLPOSCOPY_RESULT_PROBS.get(
-        key, cfg.COLPOSCOPY_RESULT_PROBS_DEFAULT
-    )
+    key = f"from_{p.cervical_result}"   # e.g. "from_HSIL", "from_HPV_POSITIVE"
+    probs = cfg.COLPOSCOPY_RESULT_PROBS[key]
     return random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
 
 
@@ -871,11 +870,15 @@ def run_colposcopy(
     """
     p.current_stage     = "followup"
     cin                 = draw_colposcopy_result(p)
-    # If colposcopy sample is insufficient, patient loops back for repeat colposcopy
-    # Source: AiP Parameters PDF — "Patients with insufficient information to diagnose loop back"
-    # INSUFFICIENT is included in COLPOSCOPY_RESULT_PROBS_DEFAULT with prob 0.07
     p.colposcopy_result = cin
     p.log(current_day, f"COLPOSCOPY → {cin}")
+
+    # Elevate future-screening risk for confirmed high-grade dysplasia.
+    # Patients with prior CIN2/CIN3 carry persistent higher risk for
+    # ASC-H/HSIL on subsequent Pap tests, modelled via
+    # RISK_MULT_PRIOR_CIN_HIGHGRADE in draw_cervical_result().
+    if cin in ("CIN2", "CIN3"):
+        p.prior_cin = cin
 
     if metrics is not None and current_day >= _WARMUP_DAY:
         metrics["n_colposcopy"] += 1
@@ -1059,7 +1062,9 @@ def run_lung_followup(
         p.log(current_day, "LUNG biopsy: completed")
 
         # Malignancy confirmed by pathology? (clinical result, not LTFU)
-        if random.random() > cfg.LUNG_PATHWAY_PROBS["malignancy_confirmed"]:
+        # Per-RADS-tier rate — RADS 4A ≈ 8%, RADS 4B/4X ≈ 35% (Pinsky 2015, ACR)
+        malignancy_prob = cfg.LUNG_RADS_MALIGNANCY_RATE.get(rads, 0.25)
+        if random.random() > malignancy_prob:
             # Biopsy came back benign — return to annual surveillance
             p.lung_biopsy_result = "benign"
             p.log(current_day, "LUNG biopsy: benign — return to surveillance")

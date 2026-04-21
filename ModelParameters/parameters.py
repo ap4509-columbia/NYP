@@ -36,8 +36,16 @@ RANDOM_SEED = None   # None = non-deterministic (different result each run).
                      # Set to an integer (e.g. 42) to reproduce a specific run.
 
 # ── Simulation Horizon ────────────────────────────────────────────────────────
+# NOTE on two "warmup" concepts — they're different things, don't confuse them:
+#   WARMUP_YEARS (below)      — ANALYSIS warmup. Metrics/vizzes exclude the
+#                               first N years so we only measure steady state.
+#   WARMUP_DAYS (later, under Visit Scheduling)
+#                             — SCHEDULING warmup. The window over which the
+#                               initial cohort's first visits are spread so
+#                               providers don't sit idle on day 0.
+# The scheduling warmup fits inside the analysis warmup.
 SIM_YEARS      = 80                      # full 80-year longitudinal horizon
-WARMUP_YEARS   = 10                      # years 0–9 are warmup; analysis starts at year 10
+WARMUP_YEARS   = 10                      # ANALYSIS warmup — years 0–9 excluded from metrics
 DAYS_PER_YEAR  = 365
 SIM_DAYS       = SIM_YEARS * DAYS_PER_YEAR   # = 29,200 days
 NUM_REPS       = 10       # number of replications for variance analysis
@@ -170,12 +178,17 @@ LUNG_RADS_PROBS = {
     "RADS_4B_4X": 0.022,  # very suspicious; Source: PMC10331628 + Pinsky et al. 2015 (0.17 * 0.13)
 }
 
-# ── Lung Pathway Clinical Probabilities ─────────────────────────────────────
-# LTFU is handled exclusively by queue-based geometric waiting-time hazard
-# (consistent with the cervical pathway). Only clinical outcome probabilities
-# remain here — not per-node dropout rates.
-LUNG_PATHWAY_PROBS = {
-    "malignancy_confirmed":     0.25,    # P(malignant | biopsy completed); Source: Pinsky et al. 2015
+# ── Lung-RADS Malignancy Rate (per-tier) ─────────────────────────────────────
+# P(malignant | biopsy completed) stratified by Lung-RADS category.
+# Used in run_lung_followup() at the biopsy-pathology bifurcation for RADS 4
+# patients. RADS_3 is included for completeness even though RADS 3 patients
+# in the current flow go to 6-month repeat LDCT instead of biopsy.
+# Source: Pinsky et al. 2015 (NLST/Lung-RADS); McKee et al. 2015;
+# ACR Lung-RADS v1.1; Hammer et al. 2020
+LUNG_RADS_MALIGNANCY_RATE = {
+    "RADS_3":     0.03,   # Pinsky et al. 2015; McKee et al. 2015
+    "RADS_4A":    0.08,   # ACR Lung-RADS v1.1; Hammer et al. 2020
+    "RADS_4B_4X": 0.35,   # Pinsky et al. 2015; ACR Lung-RADS v1.1
 }
 
 # ── Lung-RADS Repeat Intervals (days) ────────────────────────────────────────
@@ -210,10 +223,33 @@ LTFU_PROBS = {
 
 # ── HPV-Positive Triage Split (ASCCP) ────────────────────────────────────────
 # When a cervical screening returns HPV_POSITIVE, the ASCCP risk table drives
-# whether the patient is managed with a 1-year repeat cytology (lower-risk) or
-# referred immediately to colposcopy (higher-risk).
+# whether the patient is managed with a 1-year repeat cytology (lower-risk)
+# or referred immediately to colposcopy (higher-risk).
+#
+# HOW TO CALIBRATE THIS:
+# ────────────────────────────────────────────────────────────────────────────
+# This single scalar is the AGGREGATE probability that an HPV-positive
+# patient is sent to colposcopy. It collapses the following ASCCP 2019
+# sub-populations into one weighted sum:
+#
+#     HPV_POSITIVE_COLPOSCOPY_PROB
+#       ≈  P(HPV 16 or 18 | HPV+)                  [→ colposcopy]
+#       +  P(other high-risk HPV+ with abnormal    [→ colposcopy]
+#            reflex cytology | HPV+)
+#       +  P(persistent HPV+ ≥12 months | HPV+)    [→ colposcopy]
+#
+# The remainder (1 − prob) — non-16/18 HPV+ with normal reflex cytology —
+# goes to 1-year repeat cytology (watch-and-wait). We do NOT model
+# HPV genotyping or reflex cytology as separate steps; this one number
+# absorbs all three sub-paths.
+#
+# To replace the placeholder, pull NYP cervical EHR data filtered on
+# HPV+ results and compute: N(colposcopy within 90 days) / N(total HPV+).
+# ASCCP 2019 risk tables (Perkins et al., J Low Genit Tract Dis 2020)
+# give literature anchors in the ~0.55–0.65 range for mixed HPV+ pools.
+#
 # PLACEHOLDER — replace with NYP risk-stratified HPV management data.
-HPV_POSITIVE_COLPOSCOPY_PROB = 0.60   # probability HPV+ → immediate colposcopy
+HPV_POSITIVE_COLPOSCOPY_PROB = 0.60   # aggregate P(HPV+ → immediate colposcopy)
                                        # (1 - this) → 1-year repeat cytology
 
 # ── Risk Multipliers for Cervical Result Draws ────────────────────────────────
@@ -224,22 +260,11 @@ RISK_MULT_HPV_POSITIVE_CYTOLOGY = 1.5   # inflate all abnormal cytology if HPV+
 RISK_MULT_HPV_POSITIVE_HPV_TEST = 2.0   # inflate HPV_POSITIVE result if prior HPV+
 RISK_MULT_PRIOR_CIN_HIGHGRADE   = 1.8   # inflate ASC-H / HSIL if prior CIN2/CIN3
 
-# ── Colposcopy Result Fallback Distribution ───────────────────────────────────
-# Used when the triggering cytology result does not match any key in
-# COLPOSCOPY_RESULT_PROBS (e.g. unexpected result category).
-# Colposcopy finding distribution (aggregate, all triggers combined)
-# Source: AiP Parameters PDF
-# Note: CIN2 and CIN3 split from combined high_grade (0.30) is ASSUMPTION — use 50/50
-COLPOSCOPY_RESULT_PROBS_DEFAULT = {
-    "NORMAL":       0.35,   # resolved_normal; Source: AiP Parameters PDF
-    "CIN1":         0.28,   # low_grade; Source: AiP Parameters PDF
-    "CIN2":         0.15,   # high_grade split (50% of 0.30); Source: AiP Parameters PDF; split ASSUMPTION
-    "CIN3":         0.15,   # high_grade split (50% of 0.30); Source: AiP Parameters PDF; split ASSUMPTION
-    "INSUFFICIENT": 0.07,   # insufficient sample; Source: AiP Parameters PDF
-}
-
-# ── Colposcopy Result Probabilities ───────────────────────────────────────────
-# PLACEHOLDER — to be powered by ASCCP risk tables
+# ── Colposcopy Result Probabilities (per triggering cytology result) ────────
+# Given the abnormal Pap that triggered the colposcopy referral, what CIN
+# grade does the biopsy return? Higher-severity triggers map to higher CIN
+# grades (e.g. HSIL → mostly CIN2/3; ASCUS → mostly NORMAL/CIN1).
+# PLACEHOLDER — replace with NYP pathology data or ASCCP risk tables.
 COLPOSCOPY_RESULT_PROBS = {
     "from_ASCUS":        {"NORMAL": 0.60, "CIN1": 0.25, "CIN2": 0.10, "CIN3": 0.05},
     "from_LSIL":         {"NORMAL": 0.40, "CIN1": 0.35, "CIN2": 0.15, "CIN3": 0.10},
@@ -402,13 +427,18 @@ ANNUAL_VISIT_INTERVAL  = 365           # days between established patient visits
 # After each visit, the far end of the window is extended by one year, so the
 # patient always has approximately ADVANCE_SCHEDULE_YEARS future appointments booked.
 ADVANCE_SCHEDULE_YEARS = 5
-# Warmup period: spread initial cohort across multiple years so the screening
-# intervals (3-year cytology, 5-year HPV) are staggered and Year 1 isn't a
-# spike. Patients are evenly distributed across the warmup window; each gets
-# ADVANCE_SCHEDULE_YEARS of pre-booked annual visits from their start date.
-# A 3-year warmup (1095 days) ensures the first cytology cycle has completed
-# and the system reaches near-steady-state by Year 4.
-WARMUP_DAYS            = 1825          # 5-year warmup
+# SCHEDULING warmup (distinct from the 10-year ANALYSIS warmup WARMUP_YEARS).
+# Window over which the initial cohort of INITIAL_POOL_SIZE established
+# patients has their FIRST visits spread, so providers don't sit idle on
+# day 0 and don't get a visit spike at year 1.
+#
+# Why 5 years specifically:
+#   Cervical screening intervals are 3 years (cytology) and 5 years (HPV-alone).
+#   Spreading first visits over 5 years desynchronizes both screening cycles
+#   at their natural frequency — no Year-4 or Year-6 re-screening spike.
+#   After 5 years every patient has had at least one cycle, so the system is
+#   in steady state by the time analysis begins at year 10.
+WARMUP_DAYS            = 1825          # 5-year scheduling warmup
 
 # ── Gompertz mortality parameters ─────────────────────────────────────────────
 # Mortality is modeled as a Gompertz hazard: h(t) = a * exp(b * t), where t is

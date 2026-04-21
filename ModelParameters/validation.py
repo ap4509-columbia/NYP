@@ -84,11 +84,3 @@ ABNORMAL_FOLLOWUP_DAYS = {
     "HSIL_ASCH":  30,    # expedited, within 1 month
 }
 
-# Malignancy rate by Lung-RADS category (among patients in that category).
-# Source: Pinsky et al. 2015 (NLST/Lung-RADS); McKee et al. 2015;
-# ACR Lung-RADS v1.1; Hammer et al. 2020
-LUNG_RADS_MALIGNANCY_RATE = {
-    "RADS_3":     0.03,   # Pinsky 2015; McKee 2015
-    "RADS_4A":    0.08,   # ACR Lung-RADS v1.1; Hammer 2020
-    "RADS_4B_4X": 0.35,   # Pinsky 2015; ACR Lung-RADS v1.1
-}

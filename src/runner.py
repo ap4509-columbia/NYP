@@ -448,8 +448,21 @@ class SimulationRunner:
         self.metrics["procedure_used"]     = dict(self._queues.procedure_used)
         self.metrics["procedure_overflow"] = dict(self._queues.procedure_overflow)
 
-        # Final flush of any remaining exited patients
+        # Final flush: persist every patient who ever existed to the DB.
+        # (1) Any still-exiting patients already in _flush_buffer get written.
+        # (2) Still-alive patients in _established_pool are marked
+        #     "alive_at_sim_end" and pushed to the buffer so their
+        #     demographics + event log land in SQLite too. Without this,
+        #     only patients who exited clinically would be queryable
+        #     post-run; survivors would be lost when the in-memory pool
+        #     is garbage-collected.
         if self.use_stable_population and self._db:
+            sim_end_day = self.n_days
+            for p in self._established_pool:
+                if p.active:
+                    p.exit_system(sim_end_day, "alive_at_sim_end")
+                    self._flush_buffer.append(p)
+
             self._flush_exited_patients(force=True)
             # Do NOT close the DB here — keep it open for post-run queries
             # via db_summary() and plot_pool_stability().
