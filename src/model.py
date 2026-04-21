@@ -1598,13 +1598,20 @@ def compute_revenue(metrics: dict) -> dict:
     All rates are PLACEHOLDERS — replace with NYP finance / contract data.
     Set individual values in config.PROCEDURE_REVENUE.
 
+    UNIT: all dollar fields are scaled to REAL NYP DOLLARS by multiplying
+    through POPULATION_SCALE_FACTOR (one simulated patient represents
+    POPULATION_SCALE_FACTOR real women). Headcount and ratio fields
+    (`*_count_sim`, `*_count_real`, `demand_capture_rate`, etc.) are
+    not dollar-denominated and follow their own semantics.
+
     Returns
     -------
     dict with keys:
-        realized_total        : float
-        foregone_total        : float
-        realized_by_procedure : dict[str, float]
-        foregone_by_node      : dict[str, float]
+        realized_total        : float  (real USD)
+        foregone_total        : float  (real USD)
+        unserved_total        : float  (real USD)
+        realized_by_procedure : dict[str, float]   (real USD per procedure)
+        foregone_by_node      : dict[str, float]   (real USD per LTFU node)
     """
     rev = cfg.PROCEDURE_REVENUE
 
@@ -1693,6 +1700,19 @@ def compute_revenue(metrics: dict) -> dict:
 
     # Capture rate: fraction of intake demand that was actually served
     demand_capture_rate = intake_served / max(intake_total, 1)
+
+    # Scale all dollar outputs from simulated-cohort dollars to real NYP
+    # dollars. 1 sim patient represents POPULATION_SCALE_FACTOR real women,
+    # so every dollar amount (computed as sim_count × USD_rate) must be
+    # multiplied by POPULATION_SCALE_FACTOR to reflect the true population.
+    # Headcounts (*_count_*) and ratios (demand_capture_rate) are not
+    # dollar-denominated and keep their own semantics.
+    scale          = cfg.POPULATION_SCALE_FACTOR
+    realized       = {k: v * scale for k, v in realized.items()}
+    foregone       = {k: v * scale for k, v in foregone.items()}
+    realized_total = realized_total * scale
+    foregone_total = foregone_total * scale
+    unserved_total = unserved_total * scale
 
     return {
         "realized_total":        realized_total,
