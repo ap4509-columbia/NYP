@@ -506,150 +506,216 @@ def render_top_pairs_table(top_df: pd.DataFrame, output_dir: str) -> str:
     return str(path)
 
 
-def render_parameter_sweep_plot(
+# =============================================================================
+# Sensitive-pair plots — one chart per (input parameter, output metric) pair
+# =============================================================================
+#
+# Design per professor's sketch: one line per chart, X = input parameter value
+# (raw units), Y = output metric value (raw units). No normalization, no
+# multi-curve overlays. Replaces the older % change-from-baseline sweeps.
+
+# Parameters the user specifically asked to plot, in their original listing
+# order. Any other parameter in SENSITIVITY_PARAMS is still valid — pass a
+# custom list to render_sensitive_pair_plots() to override.
+IMPORTANT_PARAMETERS_FOR_PAIR_PLOTS: List[str] = [
+    "DAILY_PATIENTS",
+    "CAPACITIES.cytology",
+    "CAPACITIES.colposcopy",
+    "CAPACITIES.ldct",
+    "CAPACITIES.lung_biopsy",
+    "CAPACITIES.leep",
+    "LTFU_PROBS.queue_primary_daily",
+    "LTFU_PROBS.queue_secondary_daily",
+    "HPV_POSITIVE_RATE",
+    "SMOKER_RATE",
+    "FOLLOWUP_DELAY_DAYS.colposcopy",
+]
+
+
+def _output_unit_hint(output_name: str) -> str:
+    """Return a short unit hint for an output name (for axis labels)."""
+    if output_name.endswith("_usd"):
+        return "USD (real NYP dollars)"
+    if output_name.endswith("_pct"):
+        return "percent"
+    if "wait" in output_name:
+        return "days"
+    if "overflow" in output_name or "total" in output_name or "count" in output_name:
+        return "count"
+    return "value"
+
+
+def render_sensitive_pair_plot(
     param: str,
+    output: str,
     sweep_df: pd.DataFrame,
-    baseline_map: Dict[str, float],
-    elas_row: pd.Series,
+    eps: float,
     output_dir: str,
-    n_outputs: int = 4,
+    rank: int = 0,
 ) -> Optional[str]:
     """
-    One 1D sweep plot for a single parameter.
+    Render ONE plot showing how a single output varies with a single input parameter.
 
-    X-axis : the parameter's grid values (5 points from SENSITIVITY_PARAMS)
-    Y-axis : % change from baseline for each output (shared scale → curves comparable)
-    Curves : the top-N outputs most affected by this parameter (picked from elas_row)
+    X-axis : the parameter's 5 grid values (raw units, native scale).
+    Y-axis : the output's value at each grid point (raw units, native scale).
+    One line, five markers. No normalization.
 
-    Pure rendering — no simulations. All data comes from the existing sweep CSV.
+    A dashed vertical line marks the parameter's baseline value (grid_index 2).
+    ε is shown as a small annotation in the lower-right corner.
+
+    Pure rendering — no simulations run. All data from the sweep CSV.
     """
-    # Pick top-N outputs by |ε| (finite only), preserve rank order for legend
-    top_outs = elas_row.abs().dropna().nlargest(n_outputs).index.tolist()
-    if not top_outs:
-        return None
-
-    rows = sweep_df[sweep_df["param"] == param].copy()
+    rows = sweep_df[
+        (sweep_df["param"] == param) & (sweep_df["output_name"] == output)
+    ].sort_values("grid_index")
     if rows.empty:
         return None
 
-    # Unique grid values in grid-index order
-    grid_pairs = (
-        rows[["grid_index", "grid_value"]]
-        .drop_duplicates()
-        .sort_values("grid_index")
-        .reset_index(drop=True)
-    )
-    grid_values = grid_pairs["grid_value"].astype(float).values
+    x = rows["grid_value"].astype(float).values
+    y = pd.to_numeric(rows["output_value"], errors="coerce").astype(float).values
+    if not np.all(np.isfinite(y)):
+        # Keep only finite pairs; if all NaN, skip this pair
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 2:
+            return None
+        x, y = x[mask], y[mask]
 
-    # Parameter's baseline = grid_index 2 (middle) by convention
+    # Parameter baseline = grid_index 2 by convention in SENSITIVITY_PARAMS
+    baseline_x: Optional[float] = None
     try:
-        baseline_param_value = float(
-            grid_pairs[grid_pairs["grid_index"] == 2]["grid_value"].iloc[0]
-        )
+        bx = rows[rows["grid_index"] == 2]["grid_value"]
+        if not bx.empty:
+            baseline_x = float(bx.iloc[0])
     except (IndexError, ValueError):
-        baseline_param_value = None
+        baseline_x = None
 
-    fig_w = 9.5
-    fig_h = 7.5
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig, ax = plt.subplots(figsize=(9.0, 6.5))
     fig.patch.set_facecolor("white")
 
-    colors = plt.cm.tab10(np.linspace(0, 1, max(n_outputs, 10)))
-    for i, out_name in enumerate(top_outs):
-        y_base = baseline_map.get(out_name)
-        if y_base is None or not np.isfinite(y_base) or y_base == 0:
-            continue
-        sub = rows[rows["output_name"] == out_name].sort_values("grid_index")
-        y_raw = pd.to_numeric(sub["output_value"], errors="coerce").astype(float).values
-        x = sub["grid_value"].astype(float).values
-        y_pct = (y_raw / y_base - 1.0) * 100.0
-        short_label = out_name.split(".", 1)[1] if "." in out_name else out_name
-        eps = elas_row.get(out_name)
-        legend_label = (
-            f"{short_label}  (ε = {eps:+.2f})" if eps is not None and np.isfinite(eps)
-            else short_label
-        )
-        ax.plot(x, y_pct, marker="o", markersize=6, linewidth=2,
-                color=colors[i % len(colors)], label=legend_label)
+    short_output = output.split(".", 1)[1] if "." in output else output
+    unit_hint = _output_unit_hint(output)
 
-    # Baseline anchor — vertical dashed line + y=0 horizontal
-    ax.axhline(0, color="#888", linewidth=0.8, linestyle=":", zorder=0)
-    if baseline_param_value is not None:
-        ax.axvline(
-            baseline_param_value, color="#888",
-            linewidth=1.0, linestyle="--", alpha=0.8, zorder=0,
-        )
-        ax.text(
-            baseline_param_value, ax.get_ylim()[1] * 0.97,
-            f"  baseline = {baseline_param_value:g}",
-            fontsize=8, color="#555", va="top",
-        )
+    # Single line, single accessible color (ColorBrewer blue — colorblind-safe)
+    line_color = "#2C7BB6"
+    ax.plot(x, y, marker="o", markersize=9, linewidth=2.4, color=line_color,
+            markeredgecolor="white", markeredgewidth=1.5)
 
-    ax.set_xlabel(f"{param}  (parameter value)", fontsize=10, labelpad=8)
-    ax.set_ylabel("% change in output relative to baseline", fontsize=10, labelpad=8)
+    # Baseline marker
+    if baseline_x is not None:
+        ax.axvline(baseline_x, color="#888", linewidth=1.0, linestyle="--",
+                   alpha=0.7, zorder=0)
+        y_top = ax.get_ylim()[1]
+        ax.text(baseline_x, y_top, f"  baseline = {baseline_x:g}",
+                fontsize=8, color="#555", va="top")
+
+    # Axis labels — bold parameter + output names, unit hints as suffix
+    ax.set_xlabel(f"{param}", fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_ylabel(f"{short_output}  ({unit_hint})", fontsize=11, fontweight="bold", labelpad=10)
+
     ax.set_title(
-        f"Parameter sweep — {param}\n"
-        f"How the top-{len(top_outs)} most-affected outputs respond as this input is varied",
-        fontsize=12, fontweight="bold", pad=14,
+        f"{param}  →  {short_output}",
+        fontsize=13, fontweight="bold", pad=14,
     )
+
+    # Elasticity annotation in lower-right corner
+    eps_box = f"ε = {eps:+.2f}"
+    ax.text(
+        0.98, 0.04, eps_box,
+        transform=ax.transAxes,
+        fontsize=13, fontweight="bold",
+        ha="right", va="bottom",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FEF4D9", edgecolor="#DDB257"),
+    )
+
     ax.grid(True, alpha=0.25, linestyle="-", linewidth=0.5)
-    ax.legend(fontsize=8, loc="best", framealpha=0.9)
     ax.spines[["top", "right"]].set_visible(False)
 
-    # Explanation block — matches the heatmap style so readers can skim one guide across all charts
+    # Thousands-separator y-axis labels when values are large counts/dollars
+    try:
+        if np.nanmax(np.abs(y)) >= 1000:
+            ax.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda v, _: f"{v:,.0f}")
+            )
+    except ValueError:
+        pass
+
+    # Plain-English "how to read" footer, tailored to this specific pair
+    direction = ("rises" if eps > 0
+                 else "falls" if eps < 0
+                 else "stays roughly constant")
     guide = (
         "HOW TO READ THIS CHART\n"
-        f"We re-ran the simulation with {param} set to each of the 5 values on the X-axis, "
-        "one run per point, all other parameters frozen at baseline. Each curve is one output metric.\n\n"
-        "The Y-axis is % CHANGE FROM BASELINE — a curve that rises above 0 means the output "
-        "increased vs baseline; below 0 means it decreased. Curves share one scale so you can compare\n"
-        "their slopes directly. The dashed vertical line marks the parameter's baseline value (where\n"
-        "every curve passes through 0). ε in the legend is the elasticity (% output change per % input\n"
-        "change) — a summary number for each curve's average slope."
+        f"We ran the full 80-year simulation 5 times — once with {param} set to each of the X-axis values.\n"
+        "Every other parameter was frozen at baseline. The Y-axis shows the raw value the simulation produced\n"
+        f"for '{short_output}' in its native units ({unit_hint}). One line, five points, one input, one output.\n"
+        "The dashed vertical line marks the baseline parameter value.\n\n"
+        "WHAT ε MEANS\n"
+        "ε = elasticity = percentage change in the output per percentage change in the input.\n"
+        f"For this pair, ε = {eps:+.2f}. In plain English: a 10 % increase in {param} {direction} "
+        f"'{short_output}' by roughly {abs(eps) * 10:.1f} %."
     )
     fig.text(
         0.5, 0.01, guide,
-        ha="center", va="bottom", fontsize=8, family="monospace",
+        ha="center", va="bottom",
+        fontsize=8, family="monospace",
         bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
     )
+
     plt.tight_layout(rect=(0, 0.20, 1, 1))
 
-    safe_name = param.replace("/", "_")
-    path = Path(output_dir) / f"sweep_{safe_name}.png"
+    safe_param = param.replace("/", "_")
+    safe_output = output.replace("/", "_")
+    filename = f"pair_{rank:02d}_{safe_param}_to_{safe_output}.png"
+    path = Path(output_dir) / filename
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return str(path)
 
 
-def render_parameter_sweep_plots(
+def render_sensitive_pair_plots(
     csv_path: str,
     elas: pd.DataFrame,
     output_dir: str,
-    n_outputs: int = 4,
+    params: Optional[List[str]] = None,
+    n_outputs_per_param: int = 3,
 ) -> list:
     """
-    Render one 1D sweep plot per parameter in the elasticity matrix.
+    For each parameter in `params` (default: IMPORTANT_PARAMETERS_FOR_PAIR_PLOTS),
+    pick its top-N most-sensitive outputs (by |ε|) and render one plot per pair.
 
-    Data is pulled from the existing sweep CSV — no simulations are run.
+    File naming: pair_<rank>_<param>_to_<output>.png, ranked by |ε| across all pairs.
     """
-    df = pd.read_csv(csv_path)
-    baseline = df[df["param"] == "__baseline__"]
-    if baseline.empty:
-        raise ValueError("sweep CSV is missing the __baseline__ row")
-    baseline_map = baseline.set_index("output_name")["output_value"].to_dict()
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    if params is None:
+        params = IMPORTANT_PARAMETERS_FOR_PAIR_PLOTS
+
+    df = pd.read_csv(csv_path)
     sweep = df[df["param"] != "__baseline__"].copy()
     sweep["output_value"] = pd.to_numeric(sweep["output_value"], errors="coerce")
 
-    saved: list = []
-    for param in elas.index:
-        path = render_parameter_sweep_plot(
+    # Build (param, output, ε) triples and rank globally by |ε|
+    triples = []
+    for param in params:
+        if param not in elas.index:
+            continue
+        top_outs = elas.loc[param].abs().dropna().nlargest(n_outputs_per_param).index.tolist()
+        for out_name in top_outs:
+            eps = elas.loc[param, out_name]
+            if np.isfinite(eps):
+                triples.append((param, out_name, float(eps)))
+
+    triples.sort(key=lambda t: -abs(t[2]))
+
+    saved = []
+    for rank, (param, output, eps) in enumerate(triples, start=1):
+        path = render_sensitive_pair_plot(
             param=param,
+            output=output,
             sweep_df=sweep,
-            baseline_map=baseline_map,
-            elas_row=elas.loc[param],
+            eps=eps,
             output_dir=output_dir,
-            n_outputs=n_outputs,
+            rank=rank,
         )
         if path:
             saved.append(path)
@@ -660,14 +726,13 @@ def render_all(
     elas: pd.DataFrame,
     output_dir: str,
     top_n: int = 15,
-    csv_path: Optional[str] = None,
-    n_outputs_per_param: int = 4,
 ) -> list:
     """
-    Render every SA visualization:
-      1. Per-section heatmaps
-      2. Top-pairs ranked table
-      3. Per-parameter 1D sweep line plots (if csv_path is provided)
+    Render the heatmap bundle: per-section heatmaps + top-pairs ranked table.
+
+    For the one-per-pair line plots (X = input, Y = output raw value), call
+    `render_sensitive_pair_plots(csv_path, elas, output_dir)` separately
+    — typically into a dedicated folder so they don't mix with the heatmaps.
 
     Returns the list of saved file paths.
     """
@@ -678,8 +743,4 @@ def render_all(
         if p:
             saved.append(p)
     saved.append(render_top_pairs_table(top_sensitive_pairs(elas, top_n), output_dir))
-    if csv_path is not None:
-        saved.extend(render_parameter_sweep_plots(
-            csv_path, elas, output_dir, n_outputs=n_outputs_per_param,
-        ))
     return saved
