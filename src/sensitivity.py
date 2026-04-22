@@ -255,6 +255,94 @@ def run_sweep(
 
 
 # =============================================================================
+# Monte Carlo sweep — the same OAT design, replicated across many seeds
+# =============================================================================
+#
+# run_sweep() above fixes the random seed across all runs so any observed
+# change is purely due to the perturbed parameter. run_mc_sweep() runs the
+# same sweep MANY times with different seeds, so each (param, grid_value)
+# point has n_seeds independent samples — letting us visualize the
+# stochastic spread of every output as the parameter is varied.
+
+
+def run_mc_sweep(
+    n_seeds: int,
+    seed_start: int = 42,
+    n_workers: Optional[int] = None,
+    out_csv: Optional[str] = None,
+    progress: bool = True,
+) -> str:
+    """
+    Run the OAT sweep across `n_seeds` independent random seeds.
+
+    Total runs = n_seeds × (1 baseline + 15 params × 5 grid points) = 76 × n_seeds.
+    Each run is a full 80-year simulation. All runs are independent and
+    parallelized across available cores.
+
+    Output is a long-format CSV with one row per
+    (seed, param, grid_index, grid_value, output_name). Downstream rendering
+    groups by (param, output_name) and plots one line per seed.
+
+    Nothing about `n_seeds` is hardcoded — change this argument to scale up
+    when you want more samples. 5 seeds is reasonable for an initial look;
+    30+ for a proper Monte Carlo characterization.
+    """
+    if n_seeds < 1:
+        raise ValueError(f"n_seeds must be ≥ 1, got {n_seeds}")
+
+    seeds = list(range(seed_start, seed_start + n_seeds))
+    jobs: List[Dict[str, Any]] = []
+    for seed in seeds:
+        jobs.append({
+            "param_label": "__baseline__", "param_name": None, "value": None,
+            "grid_index": -1, "seed": seed,
+        })
+        for p in SENSITIVITY_PARAMS:
+            for idx, v in enumerate(p.grid):
+                jobs.append({
+                    "param_label": p.name, "param_name": p.name, "value": v,
+                    "grid_index": idx, "seed": seed,
+                })
+
+    n_workers = n_workers or max(1, (os.cpu_count() or 1) - 1)
+    if out_csv is None:
+        here = Path(__file__).resolve().parent.parent
+        results_dir = here / "notebooks" / "Sensitivity Monte Carlo"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = str(results_dir / f"mc_sweep_n{n_seeds}_start{seed_start}.csv")
+
+    if progress:
+        print(f"[mc_sweep] {len(jobs)} runs = {n_seeds} seeds × 76 per-seed sweep")
+        print(f"[mc_sweep] {n_workers} parallel workers → {out_csv}")
+
+    results: List[Dict[str, Any]] = []
+    t_start = time.time()
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_worker, j): j for j in jobs}
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            results.append(r)
+            if progress and (i % max(1, len(jobs) // 20) == 0 or i == len(jobs)):
+                elapsed = time.time() - t_start
+                eta = (elapsed / i) * (len(jobs) - i) / 60
+                print(f"  [{i:>4}/{len(jobs)}]  elapsed {elapsed/60:.1f}min  ETA {eta:.1f}min")
+
+    output_names = sorted(results[0]["outputs"].keys()) if results else []
+    with open(out_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["param", "grid_index", "grid_value", "output_name", "output_value", "seed"])
+        for r in results:
+            for name in output_names:
+                w.writerow([r["param"], r["grid_index"], r["grid_value"], name,
+                            r["outputs"].get(name), r["seed"]])
+
+    if progress:
+        print(f"[mc_sweep] done in {(time.time() - t_start)/60:.1f} min  "
+              f"({len(results) * len(output_names):,} rows written)")
+    return out_csv
+
+
+# =============================================================================
 # Elasticity computation
 # =============================================================================
 
@@ -713,6 +801,242 @@ def render_sensitive_pair_plots(
             param=param,
             output=output,
             sweep_df=sweep,
+            eps=eps,
+            output_dir=output_dir,
+            rank=rank,
+        )
+        if path:
+            saved.append(path)
+    return saved
+
+
+# =============================================================================
+# Monte Carlo pair plots — same (X, Y) structure as render_sensitive_pair_plot,
+# but with multiple seeds visualized as a spaghetti + mean + ±1 SD band.
+# =============================================================================
+
+def render_mc_pair_plot(
+    param: str,
+    output: str,
+    mc_df: pd.DataFrame,
+    eps: float,
+    output_dir: str,
+    rank: int = 0,
+) -> Optional[str]:
+    """
+    Render ONE Monte Carlo style plot for a single (input, output) pair.
+
+    Visual structure (same axes as render_sensitive_pair_plot):
+      • X-axis : the parameter's grid values (raw units)
+      • Y-axis : the output's value (raw units, native scale)
+      • Thin semi-transparent line per seed — each line is one full 80-year run
+      • Bold mean line (across seeds) overlaid
+      • Shaded ±1 SD envelope
+      • Dashed vertical line at the baseline parameter value (grid_index=2)
+      • ε annotation in the lower-right corner; n_seeds stated in the title
+
+    n_seeds is inferred from the data, not hardcoded. The chart scales
+    naturally as more seeds are added to the input CSV.
+    """
+    rows = mc_df[
+        (mc_df["param"] == param) & (mc_df["output_name"] == output)
+    ].copy()
+    if rows.empty:
+        return None
+
+    rows["output_value"] = pd.to_numeric(rows["output_value"], errors="coerce")
+    rows["grid_value"] = rows["grid_value"].astype(float)
+
+    seeds = sorted(rows["seed"].unique())
+    n_seeds = len(seeds)
+    if n_seeds < 1:
+        return None
+
+    # Grid values in index order (take mean across seeds; all seeds share grid)
+    grid_pairs = (
+        rows[["grid_index", "grid_value"]]
+        .drop_duplicates()
+        .sort_values("grid_index")
+        .reset_index(drop=True)
+    )
+    x_grid = grid_pairs["grid_value"].values
+
+    # Pivot: rows = grid_index, columns = seed, values = output_value
+    pivot = rows.pivot_table(
+        index="grid_index", columns="seed",
+        values="output_value", aggfunc="first",
+    ).sort_index()
+
+    y_mean = pivot.mean(axis=1).values
+    y_std = pivot.std(axis=1, ddof=1).values if n_seeds > 1 else np.zeros_like(y_mean)
+
+    # Baseline parameter value — grid index 2 by convention
+    baseline_x: Optional[float] = None
+    try:
+        bx = grid_pairs[grid_pairs["grid_index"] == 2]["grid_value"]
+        if not bx.empty:
+            baseline_x = float(bx.iloc[0])
+    except (IndexError, ValueError):
+        baseline_x = None
+
+    fig, ax = plt.subplots(figsize=(9.0, 6.5))
+    fig.patch.set_facecolor("white")
+
+    short_output = output.split(".", 1)[1] if "." in output else output
+    unit_hint = _output_unit_hint(output)
+
+    # ── One thin translucent line per seed (spaghetti) ──────────────────────
+    spaghetti_color = "#2C7BB6"
+    for seed in seeds:
+        col = pivot.get(seed)
+        if col is None:
+            continue
+        y_seed = col.values
+        ax.plot(
+            x_grid, y_seed,
+            color=spaghetti_color, alpha=min(0.7, max(0.15, 1.5 / n_seeds)),
+            linewidth=1.0, zorder=2,
+        )
+
+    # ── ±1 SD shaded band ───────────────────────────────────────────────────
+    if n_seeds > 1:
+        ax.fill_between(
+            x_grid, y_mean - y_std, y_mean + y_std,
+            color=spaghetti_color, alpha=0.15, zorder=1,
+            label="±1 SD across seeds",
+        )
+
+    # ── Bold mean line with dots on top ─────────────────────────────────────
+    mean_color = "#1F4E79"
+    ax.plot(
+        x_grid, y_mean,
+        color=mean_color, linewidth=2.8,
+        marker="o", markersize=9,
+        markeredgecolor="white", markeredgewidth=1.5,
+        zorder=3, label=f"mean of {n_seeds} seeds",
+    )
+
+    # Baseline marker
+    if baseline_x is not None:
+        ax.axvline(
+            baseline_x, color="#888", linewidth=1.0, linestyle="--",
+            alpha=0.7, zorder=0,
+        )
+        y_top = ax.get_ylim()[1]
+        ax.text(baseline_x, y_top, f"  baseline = {baseline_x:g}",
+                fontsize=8, color="#555", va="top")
+
+    ax.set_xlabel(f"{param}", fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_ylabel(f"{short_output}  ({unit_hint})", fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_title(
+        f"{param}  →  {short_output}\n"
+        f"Monte Carlo across {n_seeds} random seeds",
+        fontsize=13, fontweight="bold", pad=14,
+    )
+
+    ax.text(
+        0.98, 0.04, f"ε = {eps:+.2f}",
+        transform=ax.transAxes,
+        fontsize=13, fontweight="bold",
+        ha="right", va="bottom",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FEF4D9", edgecolor="#DDB257"),
+    )
+
+    if n_seeds > 1:
+        ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.25, linestyle="-", linewidth=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    # Thousands separators on large-magnitude Y
+    try:
+        if np.nanmax(np.abs(y_mean)) >= 1000:
+            ax.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda v, _: f"{v:,.0f}")
+            )
+    except ValueError:
+        pass
+
+    # Plain-English footer, auto-adapts to n_seeds
+    direction = ("rises" if eps > 0
+                 else "falls" if eps < 0
+                 else "stays roughly constant")
+    guide = (
+        f"HOW TO READ THIS CHART\n"
+        f"Each thin blue line = one full 80-year simulation run with a different random seed "
+        f"(total {n_seeds} runs).\n"
+        f"The bold dark line is the MEAN across seeds. The shaded band is ±1 standard deviation, "
+        f"showing how much\n'{short_output}' naturally jitters due to stochastic noise. The dashed "
+        f"vertical line marks the baseline parameter value.\n\n"
+        f"WHAT ε MEANS\n"
+        f"ε = elasticity = % change in the output per % change in the input (computed from the MEAN "
+        f"line). For this pair,\n"
+        f"ε = {eps:+.2f}. Plain English: a 10 % increase in {param} {direction} "
+        f"'{short_output}' by roughly {abs(eps) * 10:.1f} % on average."
+    )
+    fig.text(
+        0.5, 0.01, guide,
+        ha="center", va="bottom",
+        fontsize=8, family="monospace",
+        bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
+    )
+
+    plt.tight_layout(rect=(0, 0.20, 1, 1))
+
+    safe_param = param.replace("/", "_")
+    safe_output = output.replace("/", "_")
+    filename = f"pair_{rank:02d}_{safe_param}_to_{safe_output}.png"
+    path = Path(output_dir) / filename
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return str(path)
+
+
+def render_mc_pair_plots(
+    mc_csv_path: str,
+    elas: pd.DataFrame,
+    output_dir: str,
+    params: Optional[List[str]] = None,
+    n_outputs_per_param: int = 3,
+) -> list:
+    """
+    Monte Carlo pair plots for the same (param, output) pairs used by
+    render_sensitive_pair_plots. Reads `mc_csv_path` (produced by
+    run_mc_sweep) and renders one plot per pair with multi-seed spread.
+
+    The elasticity matrix `elas` is used ONLY for pair selection and for
+    the ε annotation on each chart. It should be computed from the
+    fixed-seed sweep CSV, not the MC CSV (the MC noise makes elasticity
+    fits less stable — they're summary numbers here, not the primary
+    signal).
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    if params is None:
+        params = IMPORTANT_PARAMETERS_FOR_PAIR_PLOTS
+
+    df = pd.read_csv(mc_csv_path)
+    mc = df[df["param"] != "__baseline__"].copy()
+    mc["output_value"] = pd.to_numeric(mc["output_value"], errors="coerce")
+
+    # Same ranking logic as the fixed-seed renderer
+    triples = []
+    for param in params:
+        if param not in elas.index:
+            continue
+        top_outs = elas.loc[param].abs().dropna().nlargest(n_outputs_per_param).index.tolist()
+        for out_name in top_outs:
+            eps = elas.loc[param, out_name]
+            if np.isfinite(eps):
+                triples.append((param, out_name, float(eps)))
+
+    triples.sort(key=lambda t: -abs(t[2]))
+
+    saved = []
+    for rank, (param, output, eps) in enumerate(triples, start=1):
+        path = render_mc_pair_plot(
+            param=param,
+            output=output,
+            mc_df=mc,
             eps=eps,
             output_dir=output_dir,
             rank=rank,

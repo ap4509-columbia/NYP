@@ -236,8 +236,10 @@ def draw_death_day(p: "Patient", entry_day: int) -> int:
     We invert S(t|x) = U  (U ~ Uniform(0,1)) to get t, then convert to
     a simulation day.
 
-    Smoking adjustment scales `a` upward, shifting the hazard curve left
-    (earlier expected death).
+    Risk multipliers scale `a` upward (earlier expected death) and stack
+    multiplicatively — standard proportional-hazards composition:
+      - Smoking status (current / former / never)
+      - Obesity (BMI ≥ cfg.BMI_OBESE_THRESHOLD)
     """
     a = cfg.GOMPERTZ_A
     b = cfg.GOMPERTZ_B
@@ -247,6 +249,10 @@ def draw_death_day(p: "Patient", entry_day: int) -> int:
         a *= cfg.SMOKER_MORTALITY_MULTIPLIER
     elif getattr(p, "pack_years", 0) > 0:
         a *= cfg.FORMER_SMOKER_MORTALITY_MULTIPLIER
+
+    # Obesity-adjusted baseline (stacks with smoking)
+    if getattr(p, "bmi", 0.0) >= cfg.BMI_OBESE_THRESHOLD:
+        a *= cfg.OBESE_MORTALITY_MULTIPLIER
 
     age = p.age
     # Hard cap

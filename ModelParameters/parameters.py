@@ -460,6 +460,15 @@ GOMPERTZ_B = 0.0819          # exponential aging coefficient
 SMOKER_MORTALITY_MULTIPLIER        = 2.5    # current smokers
 FORMER_SMOKER_MORTALITY_MULTIPLIER = 1.4    # quit but pack_years > 0
 
+# Mortality multiplier for obese patients (BMI ≥ BMI_OBESE_THRESHOLD).
+# Applied multiplicatively to the Gompertz baseline `a` at draw time,
+# stacking with any smoker multiplier (standard proportional-hazards composition).
+# PLACEHOLDER — value is a plausibility estimate, not from a verified source.
+# Replace with a verified literature rate (e.g. from a vetted meta-analysis of
+# BMI and all-cause mortality) or NYP / NYC-specific rates before use.
+OBESE_MORTALITY_MULTIPLIER = 1.30   # current obese (BMI ≥ 30)  — PLACEHOLDER
+BMI_OBESE_THRESHOLD        = 30.0   # CDC / WHO Class I obesity cutoff
+
 # Hard cap — no patient survives past this age regardless of draw
 MORTALITY_AGE_CAP = 100
 
