@@ -506,8 +506,171 @@ def render_top_pairs_table(top_df: pd.DataFrame, output_dir: str) -> str:
     return str(path)
 
 
-def render_all(elas: pd.DataFrame, output_dir: str, top_n: int = 15) -> list:
-    """Per-section heatmaps + top-pairs table. Returns list of saved paths."""
+def render_parameter_sweep_plot(
+    param: str,
+    sweep_df: pd.DataFrame,
+    baseline_map: Dict[str, float],
+    elas_row: pd.Series,
+    output_dir: str,
+    n_outputs: int = 4,
+) -> Optional[str]:
+    """
+    One 1D sweep plot for a single parameter.
+
+    X-axis : the parameter's grid values (5 points from SENSITIVITY_PARAMS)
+    Y-axis : % change from baseline for each output (shared scale → curves comparable)
+    Curves : the top-N outputs most affected by this parameter (picked from elas_row)
+
+    Pure rendering — no simulations. All data comes from the existing sweep CSV.
+    """
+    # Pick top-N outputs by |ε| (finite only), preserve rank order for legend
+    top_outs = elas_row.abs().dropna().nlargest(n_outputs).index.tolist()
+    if not top_outs:
+        return None
+
+    rows = sweep_df[sweep_df["param"] == param].copy()
+    if rows.empty:
+        return None
+
+    # Unique grid values in grid-index order
+    grid_pairs = (
+        rows[["grid_index", "grid_value"]]
+        .drop_duplicates()
+        .sort_values("grid_index")
+        .reset_index(drop=True)
+    )
+    grid_values = grid_pairs["grid_value"].astype(float).values
+
+    # Parameter's baseline = grid_index 2 (middle) by convention
+    try:
+        baseline_param_value = float(
+            grid_pairs[grid_pairs["grid_index"] == 2]["grid_value"].iloc[0]
+        )
+    except (IndexError, ValueError):
+        baseline_param_value = None
+
+    fig_w = 9.5
+    fig_h = 7.5
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig.patch.set_facecolor("white")
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_outputs, 10)))
+    for i, out_name in enumerate(top_outs):
+        y_base = baseline_map.get(out_name)
+        if y_base is None or not np.isfinite(y_base) or y_base == 0:
+            continue
+        sub = rows[rows["output_name"] == out_name].sort_values("grid_index")
+        y_raw = pd.to_numeric(sub["output_value"], errors="coerce").astype(float).values
+        x = sub["grid_value"].astype(float).values
+        y_pct = (y_raw / y_base - 1.0) * 100.0
+        short_label = out_name.split(".", 1)[1] if "." in out_name else out_name
+        eps = elas_row.get(out_name)
+        legend_label = (
+            f"{short_label}  (ε = {eps:+.2f})" if eps is not None and np.isfinite(eps)
+            else short_label
+        )
+        ax.plot(x, y_pct, marker="o", markersize=6, linewidth=2,
+                color=colors[i % len(colors)], label=legend_label)
+
+    # Baseline anchor — vertical dashed line + y=0 horizontal
+    ax.axhline(0, color="#888", linewidth=0.8, linestyle=":", zorder=0)
+    if baseline_param_value is not None:
+        ax.axvline(
+            baseline_param_value, color="#888",
+            linewidth=1.0, linestyle="--", alpha=0.8, zorder=0,
+        )
+        ax.text(
+            baseline_param_value, ax.get_ylim()[1] * 0.97,
+            f"  baseline = {baseline_param_value:g}",
+            fontsize=8, color="#555", va="top",
+        )
+
+    ax.set_xlabel(f"{param}  (parameter value)", fontsize=10, labelpad=8)
+    ax.set_ylabel("% change in output relative to baseline", fontsize=10, labelpad=8)
+    ax.set_title(
+        f"Parameter sweep — {param}\n"
+        f"How the top-{len(top_outs)} most-affected outputs respond as this input is varied",
+        fontsize=12, fontweight="bold", pad=14,
+    )
+    ax.grid(True, alpha=0.25, linestyle="-", linewidth=0.5)
+    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    # Explanation block — matches the heatmap style so readers can skim one guide across all charts
+    guide = (
+        "HOW TO READ THIS CHART\n"
+        f"We re-ran the simulation with {param} set to each of the 5 values on the X-axis, "
+        "one run per point, all other parameters frozen at baseline. Each curve is one output metric.\n\n"
+        "The Y-axis is % CHANGE FROM BASELINE — a curve that rises above 0 means the output "
+        "increased vs baseline; below 0 means it decreased. Curves share one scale so you can compare\n"
+        "their slopes directly. The dashed vertical line marks the parameter's baseline value (where\n"
+        "every curve passes through 0). ε in the legend is the elasticity (% output change per % input\n"
+        "change) — a summary number for each curve's average slope."
+    )
+    fig.text(
+        0.5, 0.01, guide,
+        ha="center", va="bottom", fontsize=8, family="monospace",
+        bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
+    )
+    plt.tight_layout(rect=(0, 0.20, 1, 1))
+
+    safe_name = param.replace("/", "_")
+    path = Path(output_dir) / f"sweep_{safe_name}.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return str(path)
+
+
+def render_parameter_sweep_plots(
+    csv_path: str,
+    elas: pd.DataFrame,
+    output_dir: str,
+    n_outputs: int = 4,
+) -> list:
+    """
+    Render one 1D sweep plot per parameter in the elasticity matrix.
+
+    Data is pulled from the existing sweep CSV — no simulations are run.
+    """
+    df = pd.read_csv(csv_path)
+    baseline = df[df["param"] == "__baseline__"]
+    if baseline.empty:
+        raise ValueError("sweep CSV is missing the __baseline__ row")
+    baseline_map = baseline.set_index("output_name")["output_value"].to_dict()
+
+    sweep = df[df["param"] != "__baseline__"].copy()
+    sweep["output_value"] = pd.to_numeric(sweep["output_value"], errors="coerce")
+
+    saved: list = []
+    for param in elas.index:
+        path = render_parameter_sweep_plot(
+            param=param,
+            sweep_df=sweep,
+            baseline_map=baseline_map,
+            elas_row=elas.loc[param],
+            output_dir=output_dir,
+            n_outputs=n_outputs,
+        )
+        if path:
+            saved.append(path)
+    return saved
+
+
+def render_all(
+    elas: pd.DataFrame,
+    output_dir: str,
+    top_n: int = 15,
+    csv_path: Optional[str] = None,
+    n_outputs_per_param: int = 4,
+) -> list:
+    """
+    Render every SA visualization:
+      1. Per-section heatmaps
+      2. Top-pairs ranked table
+      3. Per-parameter 1D sweep line plots (if csv_path is provided)
+
+    Returns the list of saved file paths.
+    """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     saved = []
     for section in sorted(set(_section(o) for o in elas.columns)):
@@ -515,4 +678,8 @@ def render_all(elas: pd.DataFrame, output_dir: str, top_n: int = 15) -> list:
         if p:
             saved.append(p)
     saved.append(render_top_pairs_table(top_sensitive_pairs(elas, top_n), output_dir))
+    if csv_path is not None:
+        saved.extend(render_parameter_sweep_plots(
+            csv_path, elas, output_dir, n_outputs=n_outputs_per_param,
+        ))
     return saved
