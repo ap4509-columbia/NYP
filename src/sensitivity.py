@@ -429,6 +429,208 @@ _SECTION_DESCRIPTIONS = {
 }
 
 
+_SECTION_TITLE = {
+    "cervical":     "Primary Cervical Screening",
+    "colposcopy":   "Cervical Follow-Up Procedures",
+    "finance":      "Financial Outcomes",
+    "ltfu":         "Loss-to-Follow-Up",
+    "lung":         "Primary Lung Screening",
+    "lung_bx":      "Lung Follow-Up Procedures",
+    "mortality":    "Mortality Outcomes",
+    "pop":          "Population Dynamics",
+    "queue":        "Queues & Capacity Utilization",
+    "treatment":    "Treatment Procedures",
+    "scale_sanity": "Population Scale Sanity Check",
+}
+
+
+_PARAM_INFO: Dict[str, Dict[str, str]] = {
+    "DAILY_PATIENTS": {
+        "name": "Daily screening-slot bandwidth",
+        "explain": "how many patient slots per day are available across the primary-screening schedule",
+    },
+    "CAPACITIES.cytology": {
+        "name": "Cytology scheduling capacity",
+        "explain": "the number of cytology (Pap test) appointment slots NYP offers each day",
+    },
+    "CAPACITIES.colposcopy": {
+        "name": "Colposcopy scheduling capacity",
+        "explain": "the number of colposcopy appointment slots NYP offers each day (colposcopy is the cervical follow-up procedure after an abnormal primary screen)",
+    },
+    "CAPACITIES.ldct": {
+        "name": "LDCT scheduling capacity",
+        "explain": "the number of LDCT (low-dose CT) scan slots NYP offers each day for lung screening",
+    },
+    "CAPACITIES.lung_biopsy": {
+        "name": "Lung biopsy scheduling capacity",
+        "explain": "the number of lung biopsy appointment slots NYP offers each day (biopsy is the lung follow-up procedure after a suspicious LDCT)",
+    },
+    "CAPACITIES.leep": {
+        "name": "LEEP scheduling capacity",
+        "explain": "the number of LEEP (loop electrosurgical excision) treatment slots NYP offers each day (LEEP treats CIN2 / CIN3 lesions)",
+    },
+    "FOLLOWUP_DELAY_DAYS.colposcopy": {
+        "name": "Delay to colposcopy follow-up",
+        "explain": "the number of days between an abnormal cervical primary result and the scheduled colposcopy appointment",
+    },
+    "TURNAROUND_DAYS.ldct_notification": {
+        "name": "LDCT result turnaround time",
+        "explain": "the number of days between an LDCT scan and the patient receiving their Lung-RADS result",
+    },
+    "LTFU_PROBS.queue_primary_daily": {
+        "name": "Primary-queue daily drop-off probability",
+        "explain": "the daily probability a patient waiting in the primary-screening queue drops out before their appointment (loss to follow-up)",
+    },
+    "LTFU_PROBS.queue_secondary_daily": {
+        "name": "Secondary-queue daily drop-off probability",
+        "explain": "the daily probability a patient waiting in the secondary-procedure queue (colposcopy or lung biopsy) drops out before their appointment",
+    },
+    "HPV_POSITIVE_COLPOSCOPY_PROB": {
+        "name": "HPV-positive to colposcopy referral rate",
+        "explain": "the share of HPV-positive primary screens that get referred on to colposcopy",
+    },
+    "SMOKER_RATE": {
+        "name": "Smoker prevalence in the population",
+        "explain": "the share of the eligible population who are current or recent smokers (this drives USPSTF lung-screening eligibility)",
+    },
+    "HPV_POSITIVE_RATE": {
+        "name": "HPV positivity rate",
+        "explain": "the share of cervical primary screens whose HPV component returns positive",
+    },
+    "TOTAL_DAILY_ARRIVALS": {
+        "name": "Total daily patient arrivals",
+        "explain": "the total number of new patients arriving per day into the NYP screening pool",
+    },
+    "POPULATION_SCALE_FACTOR": {
+        "name": "Population scale factor",
+        "explain": "the multiplier used to scale simulation-pool outputs up to the full NYP addressable population — included as a linearity sanity check (dollar outputs should move 1-for-1 with this factor)",
+    },
+}
+
+
+def _param_display(param: str) -> str:
+    """Human-readable label for a parameter name."""
+    info = _PARAM_INFO.get(param)
+    return info["name"] if info else param.replace("_", " ").title()
+
+
+def _param_explanation(param: str) -> str:
+    """Intuitive NYP-sim-specific description of the parameter."""
+    info = _PARAM_INFO.get(param)
+    return info["explain"] if info else (
+        f"the simulation parameter '{param}' varied across its configured sweep grid"
+    )
+
+
+def _output_display(output: str) -> str:
+    """Human-readable label for an output metric name.
+
+    Strips the leading section prefix ("queue.overflow.ldct_total" -> "overflow
+    ldct total") and replaces separators with spaces for title readability.
+    """
+    short = output.split(".", 1)[1] if "." in output else output
+    return short.replace(".", " ").replace("_", " ")
+
+
+# -----------------------------------------------------------------------------
+# Layout helpers — shared across all sensitivity renderers to keep text off
+# the plot area and guarantee consistent title / subtitle / description bands.
+# -----------------------------------------------------------------------------
+
+import textwrap
+
+
+def _seed_range(seeds) -> str:
+    """Return 'seeds X–Y' for use in subtitles and footers."""
+    try:
+        sl = sorted({int(s) for s in seeds if s is not None})
+    except (TypeError, ValueError):
+        sl = []
+    return f"seeds {sl[0]}–{sl[-1]}" if sl else ""
+
+
+def _finalize_sensitivity_figure(
+    fig,
+    *,
+    title: str,
+    subtitle: str = "",
+    description: str = "",
+    footer: str = "",
+    top: float = 0.91,
+    bottom: float = 0.20,
+    left: float = 0.08,
+    right: float = 0.95,
+    wrap_width: int = 140,
+) -> None:
+    """
+    Attach a professional title, italic subtitle, description paragraph, and
+    footer to the figure, reserving space so nothing overlaps the plot area.
+    Positions are anchored in absolute inches so behavior is stable across
+    figure heights.
+    """
+    fig_h = fig.get_size_inches()[1]
+
+    title_y = 1.0 - max(0.015, 0.30 / fig_h)
+    subtitle_y = 1.0 - max(0.055, 0.62 / fig_h)
+    fig.suptitle(title, fontsize=14, fontweight="bold", y=title_y)
+    if subtitle:
+        fig.text(0.5, subtitle_y, subtitle, ha="center",
+                 fontsize=11, color="#444", style="italic")
+
+    foot_y = max(0.010, 0.15 / fig_h)
+    desc_y = max(0.035, 0.50 / fig_h)
+
+    n_lines = 0
+    if description:
+        wrapped = "\n".join(
+            textwrap.fill(p.strip(), width=wrap_width)
+            for p in description.strip().split("\n") if p.strip()
+        )
+        n_lines = wrapped.count("\n") + 1
+        fig.text(0.5, desc_y, wrapped, ha="center", va="bottom",
+                 fontsize=9.5, color="#333", parse_math=False)
+
+    if footer:
+        fig.text(0.5, foot_y, footer, ha="center",
+                 fontsize=8, color="#888", style="italic")
+
+    needed_bottom_inches = 1.25 + 0.18 * n_lines
+    needed_bottom_frac = needed_bottom_inches / fig_h
+    bottom_eff = max(bottom, needed_bottom_frac)
+
+    needed_top_inches = 1.00 if subtitle else 0.65
+    top_eff = min(top, 1.0 - needed_top_inches / fig_h)
+
+    plt.subplots_adjust(top=top_eff, bottom=bottom_eff, left=left, right=right)
+
+
+def _external_legend(ax, loc: str = "upper right") -> None:
+    """Place a legend OUTSIDE the axes so it never overlaps plot content."""
+    handles, labels = ax.get_legend_handles_labels()
+    if not handles:
+        return
+    if loc == "upper right":
+        anchor, loc_key = (1.005, 1.0), "upper left"
+    elif loc == "lower right":
+        anchor, loc_key = (1.005, 0.0), "lower left"
+    elif loc == "right":
+        anchor, loc_key = (1.005, 0.5), "center left"
+    else:
+        anchor, loc_key = (1.005, 1.0), "upper left"
+    ax.legend(handles, labels, loc=loc_key, bbox_to_anchor=anchor,
+              frameon=True, framealpha=0.95, edgecolor="#CCC", fontsize=9)
+
+
+_OAT_EXPLAINER = (
+    "This is a One-at-a-Time (OAT) sensitivity analysis: we pick one input parameter, sweep it across a small grid "
+    "of plausible values, and hold every other parameter fixed at its baseline. The full 80-year simulation is "
+    "then re-run at each grid point, so every chart here captures the isolated effect of changing that single "
+    "parameter. Elasticity (ε) is the percent change in the output per percent change in the input, measured from "
+    "a log-log fit across the grid; ε is positive when the output rises with the parameter, negative when it falls, "
+    "and |ε| > 1 means the output amplifies the input change."
+)
+
+
 def _pick_worked_example(sub: pd.DataFrame) -> Optional[str]:
     """
     Find the cell with the largest |ε| in this section's elasticity matrix and
@@ -456,27 +658,36 @@ def _pick_worked_example(sub: pd.DataFrame) -> Optional[str]:
 
 
 def render_section_heatmap(elas: pd.DataFrame, section: str, output_dir: str, vmax: float = 1.5) -> Optional[str]:
-    """Heatmap for all outputs whose names begin with `section.`, with a per-chart explanation."""
+    """Heatmap of every output in one section vs every parameter. ε per cell.
+
+    Rows are parameters rendered with their human-readable labels; columns are
+    the outputs in this section. Colorbar sits OUTSIDE the axes; description
+    paragraph explains OAT methodology and how to read the colors.
+    """
     cols = [o for o in elas.columns if _section(o) == section]
     if not cols:
         return None
     sub = elas[cols]
-    labels = [o.replace(section + ".", "", 1) for o in cols]
-    desc = _SECTION_DESCRIPTIONS.get(section, "")
+    labels = [o.replace(section + ".", "", 1).replace("_", " ") for o in cols]
+    param_labels = [_param_display(p) for p in sub.index]
+
+    section_name = _SECTION_TITLE.get(section, section.replace("_", " ").title())
+    section_blurb = _SECTION_DESCRIPTIONS.get(section, "")
     example = _pick_worked_example(sub)
 
-    # Bottom reserved for the reader's guide (3 blocks)
-    fig_w = max(9, 0.55 * len(cols) + 5)
-    fig_h = max(6.5, 0.35 * len(sub.index) + 4.2)
+    fig_w = max(12, 0.60 * len(cols) + 6.5)
+    fig_h = max(7.5, 0.42 * len(sub.index) + 4.8)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     fig.patch.set_facecolor("white")
 
     data = sub.values.astype(float)
     im = ax.imshow(data, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(range(len(sub.index))); ax.set_yticklabels(sub.index, fontsize=8)
-    ax.set_xlabel("Output metric (what we measure)", fontsize=9, labelpad=8)
-    ax.set_ylabel("Input parameter (what we varied)", fontsize=9, labelpad=8)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(sub.index)))
+    ax.set_yticklabels(param_labels, fontsize=9)
+    ax.set_xlabel("Output metric", fontsize=10, labelpad=8)
+    ax.set_ylabel("Input parameter varied", fontsize=10, labelpad=8)
 
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):
@@ -487,110 +698,104 @@ def render_section_heatmap(elas: pd.DataFrame, section: str, output_dir: str, vm
             else:
                 ax.text(j, i, "·", ha="center", va="center", fontsize=10, color="#888")
 
-    ax.set_title(
-        f"Sensitivity Analysis — {section.replace('_', ' ').title()}\n"
-        f"{desc}",
-        fontsize=12, fontweight="bold", pad=14,
-    )
-    cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
-    cbar.set_label("elasticity (ε)", fontsize=9)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.015)
+    cbar.set_label("Elasticity (ε)", fontsize=10)
+    cbar.ax.tick_params(labelsize=8)
 
-    # Three-block explanation at the bottom:
-    #   1. What elasticity is
-    #   2. A worked example from this chart's actual data
-    #   3. Interpretation key
-    definition = (
-        "WHAT IS ELASTICITY (ε)?\n"
-        "ε = percentage change in the OUTPUT  ÷  percentage change in the INPUT parameter.\n"
-        "It measures how strongly an output responds when we vary one input, holding everything else constant."
-    )
-    interpretation = (
-        "INTERPRETATION\n"
-        "  ε ≈  0     output is INSENSITIVE to this parameter (gray/white cell).\n"
-        "  ε ≈ +1     1-to-1 positive — a 1 % rise in the input raises the output by 1 %.\n"
-        "  ε ≈ −1     1-to-1 inverse — a 1 % rise in the input lowers the output by 1 %.\n"
-        "  |ε| > 1    AMPLIFIED — the output responds faster than the input (a leverage knob).\n"
-        "Colors: RED = output rises with input, BLUE = output falls with input, WHITE ≈ no effect.\n"
-        "A dot ( · ) means elasticity could not be computed (e.g. baseline output was zero)."
-    )
-    blocks = [definition]
+    description_parts = [
+        f"This heatmap shows how the {section_blurb.lower() if section_blurb else section} outputs respond when "
+        f"each input parameter is varied, one parameter at a time.",
+        _OAT_EXPLAINER,
+        (
+            "How to read the colors: red cells mean the output rises when the parameter rises; blue cells mean the "
+            "output falls when the parameter rises; near-white cells mean the parameter has little or no effect on "
+            "that output. Each cell shows the ε value. A dot (·) means ε could not be computed (often because the "
+            "baseline output was zero, so a percent change is undefined)."
+        ),
+    ]
     if example:
-        blocks.append(example)
-    blocks.append(interpretation)
-    guide = "\n\n".join(blocks)
+        description_parts.append(example.replace("EXAMPLE FROM THIS CHART\n", "Worked example from this chart: ")
+                                          .replace("\n", " "))
+    description = "\n".join(description_parts)
 
-    fig.text(
-        0.5, 0.01, guide,
-        ha="center", va="bottom", fontsize=8, family="monospace",
-        bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
+    _finalize_sensitivity_figure(
+        fig,
+        title=f"Parameter Sensitivity — {section_name}",
+        subtitle=section_blurb,
+        description=description,
+        footer="One-at-a-time (OAT) sweep of 15 parameters × 5 grid values, one full 80-year simulation per grid point.",
+        top=0.91, bottom=0.20, left=0.22, right=0.94,
     )
-
-    plt.tight_layout(rect=(0, 0.25, 1, 1))  # reserve bottom 25% for the guide
     path = Path(output_dir) / f"sensitivity_{section}.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     return str(path)
 
 
 def render_top_pairs_table(top_df: pd.DataFrame, output_dir: str) -> str:
-    """Top-N (parameter, output, ε) table with plain-English explanation + worked example."""
-    fig, ax = plt.subplots(figsize=(12, max(6, 0.38 * len(top_df) + 4)))
+    """Top-N highest-leverage (parameter, output, ε) pairs as a ranked table.
+
+    Parameters use human-readable labels; outputs retain their engineering names
+    (full dotted path) so the reader can cross-reference against the section
+    heatmaps and the pair plots.
+    """
+    n = len(top_df)
+    fig, ax = plt.subplots(figsize=(14, max(6.5, 0.40 * n + 5.5)))
     fig.patch.set_facecolor("white")
     ax.axis("off")
 
-    cell_data = [[i + 1, r["param"], r["output"], f"{r['elasticity']:+.3f}"]
-                 for i, (_, r) in enumerate(top_df.iterrows())]
+    cell_data = [
+        [i + 1, _param_display(r["param"]), r["output"], f"{r['elasticity']:+.3f}"]
+        for i, (_, r) in enumerate(top_df.iterrows())
+    ]
     t = ax.table(
         cellText=cell_data,
-        colLabels=["Rank", "Parameter (input varied)", "Output (metric affected)", "Elasticity ε"],
+        colLabels=["Rank", "Input parameter", "Output metric", "Elasticity ε"],
         loc="center", cellLoc="left",
-        colWidths=[0.06, 0.36, 0.46, 0.12],
+        colWidths=[0.06, 0.34, 0.48, 0.12],
     )
-    t.auto_set_font_size(False); t.set_fontsize(9); t.scale(1, 1.4)
+    t.auto_set_font_size(False)
+    t.set_fontsize(9.5)
+    t.scale(1, 1.45)
     for j in range(4):
-        c = t[0, j]; c.set_facecolor("#2C3E50"); c.set_text_props(color="white", fontweight="bold")
+        c = t[0, j]
+        c.set_facecolor("#2C3E50")
+        c.set_text_props(color="white", fontweight="bold")
+    # Zebra-stripe body rows for readability
+    for r_idx in range(1, n + 1):
+        bg = "#FFFFFF" if r_idx % 2 else "#F5F7FA"
+        for j in range(4):
+            t[r_idx, j].set_facecolor(bg)
 
-    ax.set_title(
-        f"Top {len(top_df)} Most-Sensitive Input → Output Pairs\n"
-        f"Ranked by the absolute size of elasticity |ε| (bigger = higher leverage)",
-        fontsize=13, fontweight="bold", pad=18,
-    )
-
-    # Worked example from the #1 pair in the ranking
-    example_block = ""
+    description_parts = [
+        f"These are the {n} highest-leverage input-to-output relationships in the NYP cancer screening simulation, "
+        f"ranked by the absolute value of elasticity. The higher a pair sits on this list, the more sensitive that "
+        f"output is to changes in that parameter — meaning small changes to the parameter produce outsized changes "
+        f"in the output.",
+        _OAT_EXPLAINER,
+    ]
     if not top_df.empty:
         top = top_df.iloc[0]
         eps = float(top["elasticity"])
         direction = "rises" if eps > 0 else "falls"
-        example_block = (
-            f"\n\nEXAMPLE FROM ROW 1\n"
-            f"{top['param']}  →  {top['output']}  has ε = {eps:+.2f}.\n"
-            f"Meaning: a 10 % increase in {top['param']} {direction} "
-            f"{top['output']} by roughly {abs(eps) * 10:.1f} %."
+        description_parts.append(
+            f"Worked example from row 1: {_param_display(top['param'])} has ε = {eps:+.2f} for '{top['output']}'. "
+            f"A 10% increase in {_param_display(top['param']).lower()} {direction} that output by roughly "
+            f"{abs(eps) * 10:.1f}% on average."
         )
+    description = "\n".join(description_parts)
 
-    definition = (
-        "WHAT IS ELASTICITY (ε)?\n"
-        "ε = percentage change in the OUTPUT  ÷  percentage change in the INPUT parameter.\n"
-        "It measures how strongly an output responds when one input is varied, all else equal."
+    _finalize_sensitivity_figure(
+        fig,
+        title=f"Top {n} Most Sensitive Parameter–Output Pairs",
+        subtitle="Ranked by elasticity magnitude (|ε|); largest leverage first",
+        description=description,
+        footer="One-at-a-time (OAT) sweep of 15 parameters × 5 grid values, one full 80-year simulation per grid point.",
+        top=0.91, bottom=0.24, left=0.04, right=0.96,
     )
-    interpretation = (
-        "INTERPRETATION\n"
-        "  ε ≈  0     output is INSENSITIVE to this parameter.\n"
-        "  ε ≈ +1     1-to-1 positive — a 1 % rise in the input raises the output by 1 %.\n"
-        "  ε ≈ −1     1-to-1 inverse — a 1 % rise in the input lowers the output by 1 %.\n"
-        "  |ε| > 1    AMPLIFIED leverage — the output moves faster than the input.\n"
-        "These 15 rows are the model's highest-leverage input→output relationships."
-    )
-    guide = definition + example_block + "\n\n" + interpretation
-    fig.text(
-        0.5, 0.01, guide,
-        ha="center", va="bottom", fontsize=8.5, family="monospace",
-        bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
-    )
-
-    plt.tight_layout(rect=(0, 0.30, 1, 1))
     path = Path(output_dir) / "sensitivity_top_pairs.png"
-    plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     return str(path)
 
 
@@ -677,48 +882,28 @@ def render_sensitive_pair_plot(
     except (IndexError, ValueError):
         baseline_x = None
 
-    fig, ax = plt.subplots(figsize=(9.0, 6.5))
+    fig, ax = plt.subplots(figsize=(12, 7))
     fig.patch.set_facecolor("white")
 
-    short_output = output.split(".", 1)[1] if "." in output else output
+    short_output = _output_display(output)
     unit_hint = _output_unit_hint(output)
+    param_name = _param_display(param)
 
-    # Single line, single accessible color (ColorBrewer blue — colorblind-safe)
-    line_color = "#2C7BB6"
-    ax.plot(x, y, marker="o", markersize=9, linewidth=2.4, color=line_color,
-            markeredgecolor="white", markeredgewidth=1.5)
+    ax.plot(x, y, marker="o", markersize=9, linewidth=2.4, color="#2C7BB6",
+            markeredgecolor="white", markeredgewidth=1.5,
+            label="Simulation result at each grid value")
 
-    # Baseline marker
     if baseline_x is not None:
         ax.axvline(baseline_x, color="#888", linewidth=1.0, linestyle="--",
-                   alpha=0.7, zorder=0)
-        y_top = ax.get_ylim()[1]
-        ax.text(baseline_x, y_top, f"  baseline = {baseline_x:g}",
-                fontsize=8, color="#555", va="top")
+                   alpha=0.7, zorder=0,
+                   label=f"Baseline parameter value ({baseline_x:g})")
 
-    # Axis labels — bold parameter + output names, unit hints as suffix
-    ax.set_xlabel(f"{param}", fontsize=11, fontweight="bold", labelpad=10)
-    ax.set_ylabel(f"{short_output}  ({unit_hint})", fontsize=11, fontweight="bold", labelpad=10)
-
-    ax.set_title(
-        f"{param}  →  {short_output}",
-        fontsize=13, fontweight="bold", pad=14,
-    )
-
-    # Elasticity annotation in lower-right corner
-    eps_box = f"ε = {eps:+.2f}"
-    ax.text(
-        0.98, 0.04, eps_box,
-        transform=ax.transAxes,
-        fontsize=13, fontweight="bold",
-        ha="right", va="bottom",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FEF4D9", edgecolor="#DDB257"),
-    )
-
+    ax.set_xlabel(param_name, fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_ylabel(f"{short_output.capitalize()}  ({unit_hint})",
+                  fontsize=11, fontweight="bold", labelpad=10)
     ax.grid(True, alpha=0.25, linestyle="-", linewidth=0.5)
     ax.spines[["top", "right"]].set_visible(False)
 
-    # Thousands-separator y-axis labels when values are large counts/dollars
     try:
         if np.nanmax(np.abs(y)) >= 1000:
             ax.yaxis.set_major_formatter(
@@ -727,29 +912,33 @@ def render_sensitive_pair_plot(
     except ValueError:
         pass
 
-    # Plain-English "how to read" footer, tailored to this specific pair
+    _external_legend(ax, loc="upper right")
+
     direction = ("rises" if eps > 0
                  else "falls" if eps < 0
                  else "stays roughly constant")
-    guide = (
-        "HOW TO READ THIS CHART\n"
-        f"We ran the full 80-year simulation 5 times — once with {param} set to each of the X-axis values.\n"
-        "Every other parameter was frozen at baseline. The Y-axis shows the raw value the simulation produced\n"
-        f"for '{short_output}' in its native units ({unit_hint}). One line, five points, one input, one output.\n"
-        "The dashed vertical line marks the baseline parameter value.\n\n"
-        "WHAT ε MEANS\n"
-        "ε = elasticity = percentage change in the output per percentage change in the input.\n"
-        f"For this pair, ε = {eps:+.2f}. In plain English: a 10 % increase in {param} {direction} "
-        f"'{short_output}' by roughly {abs(eps) * 10:.1f} %."
+    eps_clause = (
+        f"Elasticity ε = {eps:+.2f} — a 10% increase in {param_name.lower()} {direction} this output by "
+        f"roughly {abs(eps) * 10:.1f}%."
     )
-    fig.text(
-        0.5, 0.01, guide,
-        ha="center", va="bottom",
-        fontsize=8, family="monospace",
-        bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
+    description = (
+        f"This chart asks: how does the output change when we vary only {param_name.lower()}? "
+        f"In this simulation, {param_name.lower()} is {_param_explanation(param)}. "
+        f"{_OAT_EXPLAINER} "
+        f"The X-axis shows the {len(x)} grid values we tested for this parameter. The Y-axis shows the resulting "
+        f"output in its native units ({unit_hint}). Each point is one full 80-year simulation run at that "
+        f"parameter value (single fixed seed). The dashed vertical line marks the baseline parameter value. "
+        f"{eps_clause}"
     )
 
-    plt.tight_layout(rect=(0, 0.20, 1, 1))
+    _finalize_sensitivity_figure(
+        fig,
+        title=f"{short_output.capitalize()}",
+        subtitle=f"Sensitivity to {param_name.lower()}",
+        description=description,
+        footer=f"One-at-a-time (OAT) sweep · 1 seed × {len(x)} grid points.",
+        top=0.91, bottom=0.28, left=0.08, right=0.78,
+    )
 
     safe_param = param.replace("/", "_")
     safe_output = output.replace("/", "_")
@@ -879,14 +1068,16 @@ def render_mc_pair_plot(
     except (IndexError, ValueError):
         baseline_x = None
 
-    fig, ax = plt.subplots(figsize=(9.0, 6.5))
+    fig, ax = plt.subplots(figsize=(12, 7))
     fig.patch.set_facecolor("white")
 
-    short_output = output.split(".", 1)[1] if "." in output else output
+    short_output = _output_display(output)
     unit_hint = _output_unit_hint(output)
+    param_name = _param_display(param)
 
-    # ── One thin translucent line per seed (spaghetti) ──────────────────────
     spaghetti_color = "#2C7BB6"
+    alpha_seed = min(0.7, max(0.15, 1.5 / n_seeds))
+    first = True
     for seed in seeds:
         col = pivot.get(seed)
         if col is None:
@@ -894,60 +1085,40 @@ def render_mc_pair_plot(
         y_seed = col.values
         ax.plot(
             x_grid, y_seed,
-            color=spaghetti_color, alpha=min(0.7, max(0.15, 1.5 / n_seeds)),
+            color=spaghetti_color, alpha=alpha_seed,
             linewidth=1.0, zorder=2,
+            label="Individual simulation runs" if first else None,
         )
+        first = False
 
-    # ── ±1 SD shaded band ───────────────────────────────────────────────────
     if n_seeds > 1:
         ax.fill_between(
             x_grid, y_mean - y_std, y_mean + y_std,
             color=spaghetti_color, alpha=0.15, zorder=1,
-            label="±1 SD across seeds",
+            label="±1 standard deviation across runs",
         )
 
-    # ── Bold mean line with dots on top ─────────────────────────────────────
     mean_color = "#1F4E79"
     ax.plot(
         x_grid, y_mean,
         color=mean_color, linewidth=2.8,
         marker="o", markersize=9,
         markeredgecolor="white", markeredgewidth=1.5,
-        zorder=3, label=f"mean of {n_seeds} seeds",
+        zorder=3, label=f"Average across {n_seeds} runs",
     )
 
-    # Baseline marker
     if baseline_x is not None:
         ax.axvline(
             baseline_x, color="#888", linewidth=1.0, linestyle="--",
-            alpha=0.7, zorder=0,
+            alpha=0.7, zorder=0, label=f"Baseline parameter value ({baseline_x:g})",
         )
-        y_top = ax.get_ylim()[1]
-        ax.text(baseline_x, y_top, f"  baseline = {baseline_x:g}",
-                fontsize=8, color="#555", va="top")
 
-    ax.set_xlabel(f"{param}", fontsize=11, fontweight="bold", labelpad=10)
-    ax.set_ylabel(f"{short_output}  ({unit_hint})", fontsize=11, fontweight="bold", labelpad=10)
-    ax.set_title(
-        f"{param}  →  {short_output}\n"
-        f"Monte Carlo across {n_seeds} random seeds",
-        fontsize=13, fontweight="bold", pad=14,
-    )
-
-    ax.text(
-        0.98, 0.04, f"ε = {eps:+.2f}",
-        transform=ax.transAxes,
-        fontsize=13, fontweight="bold",
-        ha="right", va="bottom",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FEF4D9", edgecolor="#DDB257"),
-    )
-
-    if n_seeds > 1:
-        ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+    ax.set_xlabel(param_name, fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_ylabel(f"{short_output.capitalize()}  ({unit_hint})",
+                  fontsize=11, fontweight="bold", labelpad=10)
     ax.grid(True, alpha=0.25, linestyle="-", linewidth=0.5)
     ax.spines[["top", "right"]].set_visible(False)
 
-    # Thousands separators on large-magnitude Y
     try:
         if np.nanmax(np.abs(y_mean)) >= 1000:
             ax.yaxis.set_major_formatter(
@@ -956,31 +1127,36 @@ def render_mc_pair_plot(
     except ValueError:
         pass
 
-    # Plain-English footer, auto-adapts to n_seeds
+    _external_legend(ax, loc="upper right")
+
     direction = ("rises" if eps > 0
                  else "falls" if eps < 0
                  else "stays roughly constant")
-    guide = (
-        f"HOW TO READ THIS CHART\n"
-        f"Each thin blue line = one full 80-year simulation run with a different random seed "
-        f"(total {n_seeds} runs).\n"
-        f"The bold dark line is the MEAN across seeds. The shaded band is ±1 standard deviation, "
-        f"showing how much\n'{short_output}' naturally jitters due to stochastic noise. The dashed "
-        f"vertical line marks the baseline parameter value.\n\n"
-        f"WHAT ε MEANS\n"
-        f"ε = elasticity = % change in the output per % change in the input (computed from the MEAN "
-        f"line). For this pair,\n"
-        f"ε = {eps:+.2f}. Plain English: a 10 % increase in {param} {direction} "
-        f"'{short_output}' by roughly {abs(eps) * 10:.1f} % on average."
+    eps_clause = (
+        f"Elasticity ε = {eps:+.2f} — a 10% increase in {param_name.lower()} {direction} this output by "
+        f"roughly {abs(eps) * 10:.1f}% on average."
     )
-    fig.text(
-        0.5, 0.01, guide,
-        ha="center", va="bottom",
-        fontsize=8, family="monospace",
-        bbox=dict(boxstyle="round,pad=0.6", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
+    description = (
+        f"This chart asks: how does the output change when we vary only {param_name.lower()}? "
+        f"In this simulation, {param_name.lower()} is {_param_explanation(param)}. "
+        f"{_OAT_EXPLAINER} "
+        f"The X-axis shows the {len(x_grid)} grid values we tested for this parameter; the Y-axis shows the "
+        f"resulting output in its native units ({unit_hint}). "
+        f"For each grid value we ran {n_seeds} independent 80-year simulations, each using a different random seed. "
+        f"Each thin blue line is one of those {n_seeds} runs; the bold line is the average across runs; the shaded "
+        f"band is ±1 standard deviation (how much the output naturally jitters due to stochastic noise). "
+        f"The dashed vertical line marks the baseline parameter value. "
+        f"{eps_clause}"
     )
 
-    plt.tight_layout(rect=(0, 0.20, 1, 1))
+    _finalize_sensitivity_figure(
+        fig,
+        title=f"{short_output.capitalize()}",
+        subtitle=f"Sensitivity to {param_name.lower()}",
+        description=description,
+        footer=f"One-at-a-time (OAT) sweep · {n_seeds} seeds × {len(x_grid)} grid points · {_seed_range(seeds)}.",
+        top=0.91, bottom=0.28, left=0.08, right=0.78,
+    )
 
     safe_param = param.replace("/", "_")
     safe_output = output.replace("/", "_")

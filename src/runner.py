@@ -442,6 +442,21 @@ class SimulationRunner:
                 "cum_provider_demand":   self.metrics["provider_demand"],
                 "cum_provider_served":   self.metrics["provider_served"],
                 "cum_provider_overflow": self.metrics["provider_overflow"],
+                # ── Cumulative categorical snapshots (so downstream MC viz
+                #     can subtract year=WARMUP_YEARS from year=SIM_END to get
+                #     POST-WARMUP-ONLY totals per category). Everything here
+                #     is a per-year cumulative value; take a year-over-year
+                #     delta to get that year's events of the given type.
+                "cum_cervical_results":   dict(self.metrics.get("cervical_results", {})),
+                "cum_colposcopy_results": dict(self.metrics.get("colposcopy_results", {})),
+                "cum_n_treatment":        dict(self.metrics.get("n_treatment", {})),
+                "cum_lung_rads_distribution": dict(self.metrics.get("lung_rads_distribution", {})),
+                "cum_n_screened":         dict(self.metrics.get("n_screened", {})),
+                "cum_lung_ldct_scheduled":      self.metrics.get("lung_ldct_scheduled", 0),
+                "cum_lung_ldct_completed":      self.metrics.get("lung_ldct_completed", 0),
+                "cum_lung_biopsy_completed":    self.metrics.get("lung_biopsy_completed", 0),
+                "cum_lung_malignancy_confirmed": self.metrics.get("lung_malignancy_confirmed", 0),
+                "cum_lung_treatment_given":     self.metrics.get("lung_treatment_given", 0),
             })
 
         # Expose queue/procedure utilization in metrics for stats table
@@ -673,6 +688,20 @@ class SimulationRunner:
                 "procedure_queue_depth": self._queues.procedure_queue_depth(day),
                 "screening_queue_depth": self._queues.screening_queue_depth(day),
                 "procedure_overflow":    dict(self._queues.procedure_overflow),
+                # ── Cumulative categorical snapshots (needed so MC viz can
+                #     isolate the POST-WARMUP portion of each aggregate by
+                #     subtracting the year=WARMUP_YEARS cumulative value from
+                #     the year=SIM_END cumulative value).
+                "cum_cervical_results":         dict(self.metrics.get("cervical_results", {})),
+                "cum_colposcopy_results":       dict(self.metrics.get("colposcopy_results", {})),
+                "cum_n_treatment":              dict(self.metrics.get("n_treatment", {})),
+                "cum_lung_rads_distribution":   dict(self.metrics.get("lung_rads_distribution", {})),
+                "cum_n_screened":               dict(self.metrics.get("n_screened", {})),
+                "cum_lung_ldct_scheduled":      self.metrics.get("lung_ldct_scheduled", 0),
+                "cum_lung_ldct_completed":      self.metrics.get("lung_ldct_completed", 0),
+                "cum_lung_biopsy_completed":    self.metrics.get("lung_biopsy_completed", 0),
+                "cum_lung_malignancy_confirmed": self.metrics.get("lung_malignancy_confirmed", 0),
+                "cum_lung_treatment_given":     self.metrics.get("lung_treatment_given", 0),
             })
 
         # Clinical steps — skipped on weekends (no hospital screenings/appointments)

@@ -66,6 +66,12 @@ def _run_one_baseline(seed: int) -> Dict[str, Any]:
         )
         metrics = sim.run()
         sim.close_db()
+
+        # Final-sim aggregate dicts we may want for cascade/funnel plots
+        def _as_flat_dict(d):
+            return {k: (int(v) if isinstance(v, (int, float)) else 0)
+                    for k, v in (d or {}).items()}
+
         return {
             "seed": seed,
             "year_checkpoints": list(metrics.get("year_checkpoints", [])),
@@ -73,6 +79,23 @@ def _run_one_baseline(seed: int) -> Dict[str, Any]:
             "procedure_revenue": dict(cfg.PROCEDURE_REVENUE),
             "population_scale_factor": cfg.POPULATION_SCALE_FACTOR,
             "warmup_years": cfg.WARMUP_YEARS,
+            # Final aggregates for cascades + exit breakdowns
+            "final_n_patients":           int(metrics.get("n_patients", 0)),
+            "final_n_screened":           _as_flat_dict(metrics.get("n_screened", {})),
+            "final_cervical_results":     _as_flat_dict(metrics.get("cervical_results", {})),
+            "final_colposcopy_results":   _as_flat_dict(metrics.get("colposcopy_results", {})),
+            "final_n_treatment":          _as_flat_dict(metrics.get("n_treatment", {})),
+            "final_n_colposcopy":         int(metrics.get("n_colposcopy", 0)),
+            "final_lung_rads_distribution": _as_flat_dict(metrics.get("lung_rads_distribution", {})),
+            "final_lung_eligible":        int(metrics.get("lung_eligible", 0)),
+            "final_lung_referral_placed": int(metrics.get("lung_referral_placed", 0)),
+            "final_lung_ldct_scheduled":  int(metrics.get("lung_ldct_scheduled", 0)),
+            "final_lung_ldct_completed":  int(metrics.get("lung_ldct_completed", 0)),
+            "final_lung_biopsy_referral": int(metrics.get("lung_biopsy_referral", 0)),
+            "final_lung_biopsy_completed": int(metrics.get("lung_biopsy_completed", 0)),
+            "final_lung_malignancy_confirmed": int(metrics.get("lung_malignancy_confirmed", 0)),
+            "final_lung_treatment_given": int(metrics.get("lung_treatment_given", 0)),
+            "final_exits_by_reason":      _as_flat_dict(metrics.get("exits_by_reason", {})),
         }
     finally:
         for ext in ("", "-shm", "-wal"):
@@ -195,6 +218,16 @@ def _extract_metrics_for_seed(seed_result: Dict[str, Any]) -> pd.DataFrame:
 
     # ── Single-number-per-seed metrics: wait times ─────────────────────────
     wt = seed_result["wait_times"]
+
+    # Per-modality mean wait (one scalar per seed per modality). Used by the
+    # per-modality wait-time box plots (10, 11).
+    for modality, waits in wt.items():
+        if waits:
+            rows.append({"seed": seed, "year": None,
+                         "metric": f"final.wait_mean.{modality}",
+                         "value": float(np.mean(waits))})
+
+    # Aggregate primary + secondary means (used by 31, 32 histograms).
     primary_waits: List[float] = []
     for k in ("cytology", "hpv_alone", "co_test", "ldct"):
         primary_waits.extend(wt.get(k, []))
@@ -209,6 +242,57 @@ def _extract_metrics_for_seed(seed_result: Dict[str, Any]) -> pd.DataFrame:
         rows.append({"seed": seed, "year": None,
                      "metric": "mean_wait_secondary_days",
                      "value": float(np.mean(secondary_waits))})
+
+    # ── Full per-year dump of every scalar year_checkpoint field ───────────
+    # Emitted as "cp.<fieldname>" so base viz renderers can average any field
+    # across seeds (pool_size, cum_* fields, etc.) without needing bespoke
+    # extraction for each viz.
+    for cp in ckpts:
+        year = cp["year"]
+        for key, val in cp.items():
+            if key in ("year", "day"):
+                continue
+            if isinstance(val, (int, float)) and val is not None:
+                rows.append({"seed": seed, "year": year,
+                             "metric": f"cp.{key}",
+                             "value": float(val)})
+            elif isinstance(val, dict):
+                for sk, sv in val.items():
+                    if isinstance(sv, (int, float)) and sv is not None:
+                        rows.append({"seed": seed, "year": year,
+                                     "metric": f"cp.{key}.{sk}",
+                                     "value": float(sv)})
+
+    # ── End-of-sim aggregates for cascade / funnel / breakdown plots ───────
+    # Emitted as "final.<field>" single-number-per-seed metrics (year=None).
+    # Flatten dict-valued aggregates as "final.<field>.<subkey>".
+    final_scalar_keys = [
+        "final_n_patients", "final_n_colposcopy", "final_lung_eligible",
+        "final_lung_referral_placed", "final_lung_ldct_scheduled",
+        "final_lung_ldct_completed", "final_lung_biopsy_referral",
+        "final_lung_biopsy_completed", "final_lung_malignancy_confirmed",
+        "final_lung_treatment_given",
+    ]
+    for key in final_scalar_keys:
+        val = seed_result.get(key)
+        if isinstance(val, (int, float)) and val is not None:
+            rows.append({"seed": seed, "year": None,
+                         "metric": key.replace("final_", "final."),
+                         "value": float(val)})
+
+    final_dict_keys = [
+        "final_n_screened", "final_cervical_results", "final_colposcopy_results",
+        "final_n_treatment", "final_lung_rads_distribution",
+        "final_exits_by_reason",
+    ]
+    for key in final_dict_keys:
+        d = seed_result.get(key) or {}
+        base = key.replace("final_", "final.")
+        for sk, sv in d.items():
+            if isinstance(sv, (int, float)) and sv is not None:
+                rows.append({"seed": seed, "year": None,
+                             "metric": f"{base}.{sk}",
+                             "value": float(sv)})
 
     return pd.DataFrame(rows)
 
@@ -244,8 +328,8 @@ def run_mc_baseline(
     n_workers = n_workers or max(1, (os.cpu_count() or 1) - 1)
 
     if out_csv is None:
-        here = Path(__file__).resolve().parent.parent
-        results_dir = here / "notebooks" / "Baseline Monte Carlo"
+        here = Path(__file__).resolve().parent
+        results_dir = here / "mc_baseline_data"
         results_dir.mkdir(parents=True, exist_ok=True)
         out_csv = str(results_dir / f"mc_baseline_n{n_seeds}_start{seed_start}.csv")
 
@@ -399,7 +483,16 @@ def render_mc_baseline_distribution(
     output_dir: str,
     filename: Optional[str] = None,
 ) -> Optional[str]:
-    """Strip plot (per-seed dots) + histogram for a single-number-per-seed metric."""
+    """
+    Fine-grained histogram for a single-number-per-seed metric.
+
+    Viz-builder principles applied:
+      • Each bar ≈ one seed (bins = max(50, n_seeds))
+      • Chart matches message: distribution → histogram with mean/SD markers
+      • Title states explicitly that each seed contributes ONE value
+      • X-axis clearly labelled with units; Y-axis is integer "# seeds"
+      • Footer tells reader exactly what each bar represents
+    """
     df = pd.read_csv(csv_path)
     sub = df[df["metric"] == metric].copy()
     sub["value"] = pd.to_numeric(sub["value"], errors="coerce")
@@ -408,64 +501,58 @@ def render_mc_baseline_distribution(
         return None
 
     values = sub["value"].values
-    n_seeds = int(sub["seed"].nunique())
+    all_seeds = sorted({int(s) for s in sub["seed"].unique() if s is not None})
+    n_seeds = len(all_seeds)
     mean = float(np.mean(values))
     sd = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    seed_range = (f" (seeds {all_seeds[0]} through {all_seeds[-1]})"
+                  if all_seeds else "")
 
-    fig, (ax_strip, ax_hist) = plt.subplots(
-        2, 1, figsize=(10.0, 6.8),
-        gridspec_kw={"height_ratios": [1, 3]},
-        sharex=True,
-    )
+    fig, ax = plt.subplots(figsize=(11, 5.5))
     fig.patch.set_facecolor("white")
 
-    spaghetti_color = "#2C7BB6"
+    hist_color = "#2C7BB6"
     mean_color = "#1F4E79"
 
-    # Strip: jittered dots, alpha scales with N
-    alpha = max(0.15, min(0.75, 15.0 / max(1, n_seeds)))
-    marker_size = max(14, min(70, 1200 / max(1, n_seeds)))
-    rng = np.random.default_rng(42)
-    y_jit = rng.uniform(-0.3, 0.3, size=len(values))
-    ax_strip.scatter(values, y_jit,
-                     alpha=alpha, color=spaghetti_color,
-                     s=marker_size, edgecolor="white", linewidth=0.9, zorder=3)
-    ax_strip.axvline(mean, color=mean_color, linewidth=2.0, zorder=2)
-    ax_strip.set_ylim(-0.6, 0.6)
-    ax_strip.set_yticks([])
-    ax_strip.set_ylabel(f"{n_seeds} seeds", fontsize=9)
-    ax_strip.grid(axis="x", alpha=0.25, linewidth=0.5)
-    ax_strip.spines[["top", "right", "left"]].set_visible(False)
+    # Very fine bins — each bar ≈ one seed
+    bins = int(max(50, n_seeds))
+    # Y-axis = probability mass: each seed contributes 1/n_seeds, so bar height
+    # is the fraction of seeds falling into that bin.
+    weights = np.ones_like(values, dtype=float) / float(len(values))
+    ax.hist(values, bins=bins, weights=weights, color=hist_color, alpha=0.85,
+            edgecolor=hist_color, linewidth=0.4)
 
-    # Histogram with mean ± SD markers
-    bins = int(max(10, min(30, np.sqrt(n_seeds) * 2)))
-    ax_hist.hist(values, bins=bins, color=spaghetti_color, alpha=0.7,
-                 edgecolor="white", linewidth=0.8)
-    ax_hist.axvline(mean, color=mean_color, linewidth=2.5,
-                    label=f"mean = {mean:,.2f}", zorder=3)
+    ax.axvline(mean, color=mean_color, linewidth=2.4,
+               label=f"mean = {mean:,.2f}", zorder=3)
     if sd > 0:
-        ax_hist.axvline(mean - sd, color="#888", linewidth=1.0, linestyle="--", zorder=2)
-        ax_hist.axvline(mean + sd, color="#888", linewidth=1.0, linestyle="--",
-                        label=f"±1 SD = {sd:,.2f}", zorder=2)
-    ax_hist.set_xlabel(x_label, fontsize=11, fontweight="bold", labelpad=10)
-    ax_hist.set_ylabel("Number of seeds", fontsize=10)
-    ax_hist.legend(loc="best", fontsize=9)
-    ax_hist.grid(axis="y", alpha=0.25, linewidth=0.5)
-    ax_hist.spines[["top", "right"]].set_visible(False)
+        ax.axvline(mean - sd, color="#888", linewidth=1.0,
+                   linestyle="--", zorder=2)
+        ax.axvline(mean + sd, color="#888", linewidth=1.0, linestyle="--",
+                   label=f"±1 SD = {sd:,.2f}", zorder=2)
 
-    ax_strip.set_title(
-        f"{title}\nDistribution across {n_seeds} baseline runs",
+    ax.set_xlabel(x_label, fontsize=11, fontweight="bold", labelpad=10)
+    ax.set_ylabel("Probability (fraction of seeds)", fontsize=10)
+    import matplotlib.ticker as mticker
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:.2f}"))
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax.grid(axis="y", alpha=0.25, linewidth=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    ax.set_title(
+        f"{title} — each seed contributes ONE value\n"
+        f"Distribution across {n_seeds} baseline runs",
         fontsize=13, fontweight="bold", pad=14,
     )
 
     guide = (
         f"HOW TO READ THIS CHART\n"
-        f"Each dot on top is ONE complete 80-year simulation run ({n_seeds} runs total). "
-        f"The histogram below shows\nthe distribution. The solid vertical line is the MEAN across "
-        f"seeds; dashed lines mark ±1 standard deviation.\n\n"
+        f"Each seed contributes ONE value — shown as its own bar. Bins are ~1 seed wide, "
+        f"so you can see every sample.\n"
+        f"Monte Carlo across {n_seeds} baseline seeds{seed_range}. "
+        f"Solid vertical line = mean across seeds; dashed = ±1 SD.\n\n"
         f"INTERPRETING THIS CHART\n"
-        f"  • A TIGHT distribution = metric is STABLE across runs; any single run is reliable.\n"
-        f"  • A WIDE distribution = metric is NOISY; we need more samples for a trusted estimate.\n"
+        f"  • A TIGHT cluster = metric is STABLE across runs; any single run is reliable.\n"
+        f"  • A WIDE spread  = metric is NOISY; more samples needed for a trusted estimate.\n"
         f"Summary: mean = {mean:,.2f}  ±  SD = {sd:,.2f}  across {n_seeds} seeds."
     )
     fig.text(0.5, 0.01, guide, ha="center", va="bottom",
@@ -473,7 +560,7 @@ def render_mc_baseline_distribution(
              bbox=dict(boxstyle="round,pad=0.6",
                        facecolor="#F5F5F5", edgecolor="#CCCCCC"))
 
-    plt.tight_layout(rect=(0, 0.17, 1, 1))
+    plt.tight_layout(rect=(0, 0.18, 1, 1))
     filename = filename or f"mc_{metric}.png"
     path = Path(output_dir) / filename
     plt.savefig(path, dpi=150, bbox_inches="tight")
