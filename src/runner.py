@@ -80,6 +80,7 @@ from model import (
     compute_revenue,
 )
 from db import SimulationDB
+import cotesting
 
 _NON_ER       = ["pcp", "gynecologist", "specialist"]
 _ALL_PROVIDERS = _NON_ER + ["er"]
@@ -199,6 +200,24 @@ class PatientQueues:
         """Return (and clear) all follow-ups due today."""
         return self.followup.pop(day, [])
 
+    def get_due_followups_grouped(self, day: int):
+        """Same as get_due_followups, but grouped per patient so cotesting can
+        spot a patient with BOTH a colposcopy and a lung biopsy on the same day.
+
+        Returns a list of (patient, [ctx, ctx, ...]) tuples in the original
+        insertion order, and clears the day's queue. The caller dispatches each
+        ctx through _run_followup as before."""
+        entries = self.followup.pop(day, [])
+        grouped: "dict[int, list]" = {}
+        order: "list" = []
+        for p, ctx in entries:
+            key = id(p)
+            if key not in grouped:
+                grouped[key] = [p, []]
+                order.append(key)
+            grouped[key][1].append(ctx)
+        return [(grouped[k][0], grouped[k][1]) for k in order]
+
     # ── Life event scheduling ────────────────────────────────────────────────
 
     def schedule_life_event(self, p: "Patient", event_type: str, day: int) -> None:
@@ -256,6 +275,13 @@ class PatientQueues:
         if day >= self._warmup_day:
             self.procedure_overflow[procedure] = self.procedure_overflow.get(procedure, 0) + 1
         return False
+
+    def peek_slot(self, procedure: str, day: int) -> bool:
+        """Return True iff consume_slot(procedure, day) would succeed, without
+        consuming or recording overflow. Used by cotesting for atomic checks."""
+        if procedure not in self.daily_slots[day]:
+            self.daily_slots[day][procedure] = cfg.CAPACITIES.get(procedure, 0)
+        return self.daily_slots[day][procedure] > 0
 
 
 # =============================================================================
@@ -457,6 +483,8 @@ class SimulationRunner:
                 "cum_lung_biopsy_completed":    self.metrics.get("lung_biopsy_completed", 0),
                 "cum_lung_malignancy_confirmed": self.metrics.get("lung_malignancy_confirmed", 0),
                 "cum_lung_treatment_given":     self.metrics.get("lung_treatment_given", 0),
+                "cum_n_cotest_primary":         self.metrics.get("n_cotest_primary", 0),
+                "cum_n_cotest_secondary":       self.metrics.get("n_cotest_secondary", 0),
             })
 
         # Expose queue/procedure utilization in metrics for stats table
@@ -702,13 +730,28 @@ class SimulationRunner:
                 "cum_lung_biopsy_completed":    self.metrics.get("lung_biopsy_completed", 0),
                 "cum_lung_malignancy_confirmed": self.metrics.get("lung_malignancy_confirmed", 0),
                 "cum_lung_treatment_given":     self.metrics.get("lung_treatment_given", 0),
+                "cum_n_cotest_primary":         self.metrics.get("n_cotest_primary", 0),
+                "cum_n_cotest_secondary":       self.metrics.get("n_cotest_secondary", 0),
             })
 
         # Clinical steps — skipped on weekends (no hospital screenings/appointments)
         if not is_weekend:
-            # 1. Follow-ups due today
-            for p, context in self._queues.get_due_followups(day):
-                self._run_followup(p, context, day)
+            # 1. Follow-ups due today.
+            #    When cotesting is enabled, switch to the per-patient grouped
+            #    view so maybe_bundle_followup can atomically reserve a
+            #    (colposcopy, lung_biopsy) pair before either consumes its slot.
+            #    When disabled, keep the original interleaved iteration order
+            #    so baseline runs are byte-for-byte reproducible.
+            if cotesting.is_enabled():
+                for p, ctxs in self._queues.get_due_followups_grouped(day):
+                    ctxs = cotesting.maybe_bundle_followup(
+                        p, ctxs, day, self._queues, self.metrics
+                    )
+                    for context in ctxs:
+                        self._run_followup(p, context, day)
+            else:
+                for p, context in self._queues.get_due_followups(day):
+                    self._run_followup(p, context, day)
 
             # 2. New arrivals
             self._generate_arrivals(day)
@@ -923,6 +966,17 @@ class SimulationRunner:
             for c in eligible:
                 self.metrics["n_eligible"][c] += 1
 
+        # Cotesting hook: if enabled and patient is due+eligible for BOTH
+        # cervical and lung today, atomically reserve a cervical modality slot
+        # + an ldct slot. On success, preconsumed_by_cancer tells the loop
+        # below which cancers already have their slot and must skip the
+        # reschedule check + consume_slot call. Returns pass-through when
+        # cotesting is disabled → baseline behavior unchanged.
+        bundle = cotesting.maybe_bundle_primary(
+            p, eligible, day, self._queues, self.metrics,
+            is_due_for_screening, assign_screening_test,
+        )
+
         for cancer in eligible:
             if not p.active:
                 break
@@ -932,37 +986,49 @@ class SimulationRunner:
             if not is_due_for_screening(p, cancer, day):
                 continue
 
-            # Assign test modality, then check procedure slot availability.
-            # If no slot today, reschedule for tomorrow rather than skipping.
-            # Primary screenings compete for slots — PCP/GYN/Specialist are
-            # processed before ER, so scheduled patients get priority.
-            test = assign_screening_test(p, cancer)
+            preconsumed_test = bundle.preconsumed_by_cancer.get(cancer)
 
-            # Reschedule check: patient may not be able to make it today
-            # (10% PLACEHOLDER). If so, re-enter queue for next day.
-            if random.random() < cfg.LTFU_PROBS.get("reschedule_primary", 0.10):
-                orig_ref = day - p.wait_days if p.wait_days > 0 else day
-                self._queues.schedule_followup(
-                    p, {"cancer": cancer, "step": "screening_retry",
-                         "referral_day": orig_ref,
-                         "first_attempt_day": orig_ref}, day + 1
-                )
-                p.log(day, f"RESCHEDULE {test} — patient unavailable, moved to day {day + 1}")
-                continue
+            if preconsumed_test is not None:
+                # Cotested primary visit: slot was atomically reserved with the
+                # sibling cancer above. Skip reschedule + consume_slot; treat
+                # the slot as already-supplied.
+                test = preconsumed_test
+                self._day_screening_demand += 1
+                self._day_screening_supply += 1
+            else:
+                # Assign test modality, then check procedure slot availability.
+                # If no slot today, reschedule for tomorrow rather than skipping.
+                # Primary screenings compete for slots — PCP/GYN/Specialist are
+                # processed before ER, so scheduled patients get priority.
+                # Reuse the test already drawn inside the bundler (if any) to
+                # avoid a second weighted draw.
+                test = bundle.assigned_tests.get(cancer) or assign_screening_test(p, cancer)
 
-            self._day_screening_demand += 1
-            if not self._queues.consume_slot(test, day):
-                self._day_screening_overflow += 1
-                orig_ref = day - p.wait_days if p.wait_days > 0 else day
-                self._queues.schedule_followup(
-                    p, {"cancer": cancer, "step": "screening_retry",
-                         "referral_day": orig_ref,
-                         "first_attempt_day": orig_ref}, day + 1
-                )
-                p.log(day, f"NO SLOT for {test} — rescheduled to day {day + 1}")
-                continue
+                # Reschedule check: patient may not be able to make it today
+                # (10% PLACEHOLDER). If so, re-enter queue for next day.
+                if random.random() < cfg.LTFU_PROBS.get("reschedule_primary", 0.10):
+                    orig_ref = day - p.wait_days if p.wait_days > 0 else day
+                    self._queues.schedule_followup(
+                        p, {"cancer": cancer, "step": "screening_retry",
+                             "referral_day": orig_ref,
+                             "first_attempt_day": orig_ref}, day + 1
+                    )
+                    p.log(day, f"RESCHEDULE {test} — patient unavailable, moved to day {day + 1}")
+                    continue
 
-            self._day_screening_supply += 1
+                self._day_screening_demand += 1
+                if not self._queues.consume_slot(test, day):
+                    self._day_screening_overflow += 1
+                    orig_ref = day - p.wait_days if p.wait_days > 0 else day
+                    self._queues.schedule_followup(
+                        p, {"cancer": cancer, "step": "screening_retry",
+                             "referral_day": orig_ref,
+                             "first_attempt_day": orig_ref}, day + 1
+                    )
+                    p.log(day, f"NO SLOT for {test} — rescheduled to day {day + 1}")
+                    continue
+
+                self._day_screening_supply += 1
             result = run_screening_step(p, cancer, day, self.metrics,
                                         test_override=test)
 
@@ -1473,31 +1539,39 @@ class SimulationRunner:
 
         elif step == "colposcopy":
             first_attempt = context.get("first_attempt_day", day)
-            # Queue LTFU check — only on retries (after slot overflow)
-            if context.get("is_retry") and self._check_queue_ltfu(
-                    p, day, first_attempt, "secondary", "colposcopy"):
-                return
-            # Reschedule check: patient may not make it today
-            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
-                self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "colposcopy",
-                         "referral_day": referral_day,
-                         "first_attempt_day": first_attempt,
-                         "is_retry": True}, day + 1
-                )
-                p.log(day, "RESCHEDULE colposcopy — patient unavailable, moved to next day")
-                return
-            self._day_secondary_demand += 1
-            if not self._queues.consume_slot("colposcopy", day):
-                self._day_secondary_overflow += 1
-                self._queues.schedule_followup(
-                    p, {"cancer": "cervical", "step": "colposcopy",
-                         "referral_day": referral_day,
-                         "first_attempt_day": first_attempt,
-                         "is_retry": True}, day + 1
-                )
-                return
-            self._day_secondary_supply += 1
+            preconsumed = context.get("cotest_preconsumed", False)
+            if preconsumed:
+                # Cotested secondary visit: slot was atomically reserved alongside
+                # a lung biopsy. Skip reschedule + consume_slot (both already
+                # handled by maybe_bundle_followup); credit the supply counter.
+                self._day_secondary_demand += 1
+                self._day_secondary_supply += 1
+            else:
+                # Queue LTFU check — only on retries (after slot overflow)
+                if context.get("is_retry") and self._check_queue_ltfu(
+                        p, day, first_attempt, "secondary", "colposcopy"):
+                    return
+                # Reschedule check: patient may not make it today
+                if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+                    self._queues.schedule_followup(
+                        p, {"cancer": "cervical", "step": "colposcopy",
+                             "referral_day": referral_day,
+                             "first_attempt_day": first_attempt,
+                             "is_retry": True}, day + 1
+                    )
+                    p.log(day, "RESCHEDULE colposcopy — patient unavailable, moved to next day")
+                    return
+                self._day_secondary_demand += 1
+                if not self._queues.consume_slot("colposcopy", day):
+                    self._day_secondary_overflow += 1
+                    self._queues.schedule_followup(
+                        p, {"cancer": "cervical", "step": "colposcopy",
+                             "referral_day": referral_day,
+                             "first_attempt_day": first_attempt,
+                             "is_retry": True}, day + 1
+                    )
+                    return
+                self._day_secondary_supply += 1
 
             queue_wait = day - first_attempt
             if queue_wait > 0 and day >= self._warmup_day:
@@ -1862,31 +1936,38 @@ class SimulationRunner:
         if context is None:
             context = {}
         first_attempt = context.get("first_attempt_day", day)
-        # Queue LTFU check — only on retries (after slot overflow)
-        if context.get("is_retry") and self._check_queue_ltfu(
-                p, day, first_attempt, "secondary", "lung_biopsy"):
-            return
-        # Reschedule check: patient may not make it today
-        if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
-            self._queues.schedule_followup(
-                p, {"cancer": "lung", "step": "biopsy",
-                     "referral_day": referral_day,
-                     "first_attempt_day": first_attempt,
-                     "is_retry": True}, day + 1
-            )
-            p.log(day, "RESCHEDULE lung biopsy — patient unavailable, moved to next day")
-            return
-        self._day_secondary_demand += 1
-        if not self._queues.consume_slot("lung_biopsy", day):
-            self._day_secondary_overflow += 1
-            self._queues.schedule_followup(
-                p, {"cancer": "lung", "step": "biopsy",
-                     "referral_day": referral_day,
-                     "first_attempt_day": first_attempt,
-                     "is_retry": True}, day + 1
-            )
-            return
-        self._day_secondary_supply += 1
+        preconsumed = context.get("cotest_preconsumed", False)
+        if preconsumed:
+            # Cotested secondary visit: slot atomically reserved with colposcopy.
+            # Skip reschedule + consume_slot; credit the supply counter.
+            self._day_secondary_demand += 1
+            self._day_secondary_supply += 1
+        else:
+            # Queue LTFU check — only on retries (after slot overflow)
+            if context.get("is_retry") and self._check_queue_ltfu(
+                    p, day, first_attempt, "secondary", "lung_biopsy"):
+                return
+            # Reschedule check: patient may not make it today
+            if random.random() < cfg.LTFU_PROBS.get("reschedule_secondary", 0.10):
+                self._queues.schedule_followup(
+                    p, {"cancer": "lung", "step": "biopsy",
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
+                )
+                p.log(day, "RESCHEDULE lung biopsy — patient unavailable, moved to next day")
+                return
+            self._day_secondary_demand += 1
+            if not self._queues.consume_slot("lung_biopsy", day):
+                self._day_secondary_overflow += 1
+                self._queues.schedule_followup(
+                    p, {"cancer": "lung", "step": "biopsy",
+                         "referral_day": referral_day,
+                         "first_attempt_day": first_attempt,
+                         "is_retry": True}, day + 1
+                )
+                return
+            self._day_secondary_supply += 1
         queue_wait = day - first_attempt
         if queue_wait > 0 and day >= self._warmup_day:
             self.metrics["wait_times"]["lung_biopsy"].append(queue_wait)

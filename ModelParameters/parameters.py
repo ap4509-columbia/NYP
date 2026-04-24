@@ -309,6 +309,25 @@ CAPACITIES = {
     "cone_biopsy": 4,     # PLACEHOLDER — replace with NYP OR scheduling data
 }
 
+# ── Scenario Analysis ────────────────────────────────────────────────────────
+# Target slot counts for the "expanded_capacity" scenario in src/scenarios.py.
+# Keeping the numbers here (not in scenarios.py) avoids hardcoding in the
+# scenario registry and keeps operational tuning in one place.
+SCENARIO_CAPACITIES_EXPANDED = {
+    "cytology":    10,
+    "hpv_alone":   10,
+    "co_test":     10,
+    "ldct":        10,
+    "colposcopy":  10,
+    "lung_biopsy": 10,
+    "leep":        10,
+    "cone_biopsy": 10,
+}
+
+# Co-testing behavior toggle. Scenarios flip this to True via apply_scenario();
+# default False preserves current (sequential, no-bundling) behavior.
+COTESTING = {"enabled": False}
+
 # ── Inter-Step Scheduling Delays (days) ───────────────────────────────────────
 # Time between referral and the next appointment at each step.
 # These drive wait-time metrics and are a key lever in scenario analysis

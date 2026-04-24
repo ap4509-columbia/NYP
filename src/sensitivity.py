@@ -446,8 +446,8 @@ _SECTION_TITLE = {
 
 _PARAM_INFO: Dict[str, Dict[str, str]] = {
     "DAILY_PATIENTS": {
-        "name": "Daily screening-slot bandwidth",
-        "explain": "how many patient slots per day are available across the primary-screening schedule",
+        "name": "Daily new-patient intake capacity",
+        "explain": "the number of new patients NYP can seat at a provider each day — i.e., how fast the intake queue drains. This is an upstream bottleneck, NOT a per-procedure screening-slot capacity (cytology, LDCT, colposcopy, etc., are tuned separately via CAPACITIES.*), and it is not the arrivals rate either (that's TOTAL_DAILY_ARRIVALS)",
     },
     "CAPACITIES.cytology": {
         "name": "Cytology scheduling capacity",
@@ -522,12 +522,128 @@ def _param_explanation(param: str) -> str:
     )
 
 
+_OUTPUT_LABELS: Dict[str, str] = {
+    # queue: procedure-level overflow counts and utilization
+    "queue.overflow.cytology_total":    "Days cytology fully booked (total)",
+    "queue.overflow.hpv_alone_total":   "Days HPV-alone fully booked (total)",
+    "queue.overflow.co_test_total":     "Days co-test fully booked (total)",
+    "queue.overflow.ldct_total":        "Days LDCT fully booked (total)",
+    "queue.overflow.colposcopy_total":  "Days colposcopy fully booked (total)",
+    "queue.overflow.lung_biopsy_total": "Days lung biopsy fully booked (total)",
+    "queue.overflow.leep_total":        "Days LEEP fully booked (total)",
+    "queue.overflow.cone_biopsy_total": "Days cone biopsy fully booked (total)",
+    "queue.util.cytology_pct":    "Cytology slot utilization (%)",
+    "queue.util.hpv_alone_pct":   "HPV-alone slot utilization (%)",
+    "queue.util.ldct_pct":        "LDCT slot utilization (%)",
+    "queue.util.colposcopy_pct":  "Colposcopy slot utilization (%)",
+    "queue.util.lung_biopsy_pct": "Lung biopsy slot utilization (%)",
+    "queue.util.leep_pct":        "LEEP slot utilization (%)",
+    "queue.util.cone_biopsy_pct": "Cone biopsy slot utilization (%)",
+    # queue: aggregate demand / overflow
+    "queue.primary.demand_mean":      "Mean daily primary-screening demand",
+    "queue.secondary.demand_mean":    "Mean daily secondary-procedure demand",
+    "queue.treatment.demand_mean":    "Mean daily treatment demand",
+    "queue.primary.overflow_mean":    "Mean daily primary-screening overflow",
+    "queue.secondary.overflow_mean":  "Mean daily secondary-procedure overflow",
+    "queue.treatment.overflow_mean":  "Mean daily treatment overflow",
+    "queue.primary.overcap_pct":      "Share of days primary screening was over capacity (%)",
+    "queue.secondary.overcap_pct":    "Share of days secondary procedures were over capacity (%)",
+    "queue.treatment.overcap_pct":    "Share of days treatment was over capacity (%)",
+    # queue: wait-time medians
+    "queue.wait_median.cytology":        "Median wait for cytology (days)",
+    "queue.wait_median.hpv_alone":       "Median wait for HPV-alone (days)",
+    "queue.wait_median.co_test":         "Median wait for co-test (days)",
+    "queue.wait_median.ldct":            "Median wait for LDCT (days)",
+    "queue.wait_median.colposcopy":      "Median wait for colposcopy (days)",
+    "queue.wait_median.lung_biopsy":     "Median wait for lung biopsy (days)",
+    "queue.wait_median.leep":            "Median wait for LEEP (days)",
+    "queue.wait_median.cone_biopsy":     "Median wait for cone biopsy (days)",
+    "queue.wait_median.one_year_repeat": "Median wait for 1-year repeat cytology (days)",
+    "queue.wait_abandoned_median.cytology":    "Median abandoned wait — cytology (days)",
+    "queue.wait_abandoned_median.hpv_alone":   "Median abandoned wait — HPV-alone (days)",
+    "queue.wait_abandoned_median.co_test":     "Median abandoned wait — co-test (days)",
+    "queue.wait_abandoned_median.ldct":        "Median abandoned wait — LDCT (days)",
+    "queue.wait_abandoned_median.colposcopy":  "Median abandoned wait — colposcopy (days)",
+    "queue.wait_abandoned_median.lung_biopsy": "Median abandoned wait — lung biopsy (days)",
+    "queue.wait_abandoned_median.leep":        "Median abandoned wait — LEEP (days)",
+    "queue.wait_abandoned_median.cone_biopsy": "Median abandoned wait — cone biopsy (days)",
+    # LTFU
+    "ltfu.total":                       "Total patients lost to follow-up",
+    "ltfu.unscreened":                  "Patients lost before any screening",
+    "ltfu.queue_primary":               "Patients lost from primary screening queue",
+    "ltfu.queue_secondary":             "Patients lost from secondary procedure queue",
+    "ltfu.queue_treatment":             "Patients lost from treatment queue",
+    "ltfu.post_abnormal":               "Patients lost after abnormal result",
+    "ltfu.post_colposcopy":             "Patients lost after colposcopy",
+    "ltfu.rate_of_throughput_mean_pct": "Mean LTFU rate (% of annual throughput)",
+    # population
+    "pop.pool_size_mean":           "Mean active screening-pool size",
+    "pop.annual_mortality_mean":    "Mean annual mortality (patients)",
+    "pop.annual_throughput_mean":   "Mean annual patient throughput",
+    "pop.arrivals.aging_in_share_pct":  "Arrivals from aging-in (%)",
+    "pop.arrivals.new_mover_share_pct": "Arrivals from new movers (%)",
+    "pop.arrivals.referral_share_pct":  "Arrivals from referrals (%)",
+    "pop.arrivals.total":           "Total arrivals",
+    "pop.exits.total":              "Total exits from pool",
+    # cervical
+    "cervical.annual_total_mean":         "Mean annual cervical screenings",
+    "cervical.annual_cytology_mean":      "Mean annual cytology screenings",
+    "cervical.annual_hpv_alone_mean":     "Mean annual HPV-alone screenings",
+    "cervical.uptake_mean_pct":           "Cervical screening uptake (% of pool/year)",
+    "cervical.cytology.abnormal_rate_pct":  "Cytology abnormal rate (%)",
+    "cervical.hpv_alone.positive_rate_pct": "HPV-alone positive rate (%)",
+    # lung
+    "lung.annual_ldct_mean":                 "Mean annual LDCT screenings",
+    "lung.uptake_mean_pct":                  "Lung screening uptake (% of eligible/year)",
+    "lung.funnel.eligible":                  "Patients eligible for lung screening",
+    "lung.funnel.referral_rate_pct":         "Lung referral rate (% of eligible)",
+    "lung.funnel.scheduled_rate_pct":        "Lung scheduling rate (% of referred)",
+    "lung.funnel.completed_rate_pct":        "Lung completion rate (% of scheduled)",
+    "lung.rads.abnormal_rate_pct":           "Lung-RADS abnormal rate (%)",
+    # colposcopy
+    "colposcopy.annual_mean":              "Mean annual colposcopies",
+    "colposcopy.abnormal_primary_total":   "Total abnormal primary cervical results",
+    "colposcopy.performed_total":          "Total colposcopies performed",
+    "colposcopy.completion_rate_pct":      "Colposcopy completion rate (%)",
+    # lung biopsy
+    "lung_bx.annual_mean":                 "Mean annual lung biopsies",
+    "lung_bx.funnel.abnormal_total":       "Total abnormal Lung-RADS results",
+    "lung_bx.funnel.referral_rate_pct":    "Lung biopsy referral rate (%)",
+    "lung_bx.funnel.scheduled_rate_pct":   "Lung biopsy scheduling rate (%)",
+    "lung_bx.funnel.completed_rate_pct":   "Lung biopsy completion rate (%)",
+    "lung_bx.malignancy_rate_pct":         "Lung biopsy malignancy rate (%)",
+    # treatment
+    "treatment.leep_total":                  "Total LEEPs performed",
+    "treatment.cone_biopsy_total":           "Total cone biopsies performed",
+    "treatment.surveillance_total":          "Total surveillance visits",
+    "treatment.leep_annual_mean":            "Mean annual LEEPs",
+    "treatment.cin23_diagnosed":             "CIN2/CIN3 lesions diagnosed",
+    "treatment.cervical_excisional_total":   "Total cervical excisional treatments",
+    "treatment.cervical_completion_rate_pct":"Cervical treatment completion rate (%)",
+    "treatment.lung_total":                  "Total lung treatments",
+    "treatment.lung_annual_mean":            "Mean annual lung treatments",
+    "treatment.lung_completion_rate_pct":    "Lung treatment completion rate (%)",
+    # mortality
+    "mortality.total_sim":            "Total mortality (sim scale)",
+    "mortality.total_scaled":         "Total mortality (NYP-scale)",
+    "mortality.annual_rate_mean_pct": "Mean annual mortality rate (%)",
+    # finance
+    "finance.realized_total_usd":  "Total realized revenue (USD)",
+    "finance.foregone_total_usd":  "Total foregone revenue (USD)",
+    "finance.unserved_total_usd":  "Total unserved demand (USD)",
+    "finance.capture_rate_pct":    "Demand capture rate (%)",
+}
+
+
 def _output_display(output: str) -> str:
     """Human-readable label for an output metric name.
 
-    Strips the leading section prefix ("queue.overflow.ldct_total" -> "overflow
-    ldct total") and replaces separators with spaces for title readability.
+    Looks up an explicit mapping in _OUTPUT_LABELS first, then falls back to a
+    generic tokenizer that strips the section prefix and replaces separators
+    with spaces.
     """
+    if output in _OUTPUT_LABELS:
+        return _OUTPUT_LABELS[output]
     short = output.split(".", 1)[1] if "." in output else output
     return short.replace(".", " ").replace("_", " ")
 

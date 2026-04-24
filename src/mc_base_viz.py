@@ -34,6 +34,11 @@ MEAN_COLOR      = "#1F4E79"
 ENTRY_COLOR     = "#27AE60"
 EXIT_COLOR      = "#C0392B"
 
+# Optional scenario identifier rendered in every footer when set (via
+# render_all_base_mc). Baseline pipeline leaves this None → byte-identical
+# footer to today.
+_scenario_tag: Optional[str] = None
+
 
 def _adaptive_alpha(n: int, ink: float = 4.0) -> float:
     return float(max(0.04, min(0.5, ink / max(1, n))))
@@ -184,9 +189,12 @@ def _finalize_figure(
     needed_top_inches = 1.00 if subtitle else 0.65
     top_eff = min(top, 1.0 - needed_top_inches / fig_h)
 
+    footer_text = f"Monte Carlo across {n} baseline seeds ({rng})."
+    if _scenario_tag:
+        footer_text = f"{_scenario_tag}  •  {footer_text}"
     fig.text(
         0.5, foot_y,
-        f"Monte Carlo across {n} baseline seeds ({rng}).",
+        footer_text,
         ha="center", fontsize=8, color="#888", style="italic",
     )
 
@@ -2205,16 +2213,29 @@ _RENDERERS: List[Callable[[pd.DataFrame, str], str]] = [
 ]
 
 
-def render_all_base_mc(csv_path: str, output_dir: str) -> List[str]:
-    """Render the MC-averaged base visualizations (inference table + 16 charts)
-    into output_dir."""
+def render_all_base_mc(
+    csv_path: str,
+    output_dir: str,
+    scenario_tag: Optional[str] = None,
+) -> List[str]:
+    """Render the MC-averaged base visualizations (inference table + 23 charts)
+    into output_dir.
+
+    scenario_tag, when provided, is stamped onto every chart's footer to make
+    scenario runs visually distinguishable from baseline. The baseline pipeline
+    omits this argument and produces byte-identical output to prior runs."""
+    global _scenario_tag
     df = pd.read_csv(csv_path)
     saved: List[str] = []
-    for fn in _RENDERERS:
-        try:
-            p = fn(df, output_dir)
-            if p:
-                saved.append(p)
-        except Exception as e:
-            print(f"  [skip] {fn.__name__}: {e}")
+    _scenario_tag = scenario_tag
+    try:
+        for fn in _RENDERERS:
+            try:
+                p = fn(df, output_dir)
+                if p:
+                    saved.append(p)
+            except Exception as e:
+                print(f"  [skip] {fn.__name__}: {e}")
+    finally:
+        _scenario_tag = None
     return saved
