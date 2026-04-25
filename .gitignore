@@ -15,3 +15,7 @@ reference/.ipynb_checkpoints/
 notebooks/*.pkl
 notebooks/*.png
 .DS_Store
+
+# Monte Carlo simulation output data (large CSVs, regenerable)
+src/mc_baseline_data/
+src/mc_scenario_data/
