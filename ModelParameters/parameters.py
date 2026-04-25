@@ -1,6 +1,6 @@
 # =============================================================================
 # parameters.py
-# NYP Women's Health Screening Simulation — Simulation Input Parameter s
+# NYP Women's Health Screening Simulation — Simulation Input Parameters
 # =============================================================================
 #
 # DESIGN PHILOSOPHY
