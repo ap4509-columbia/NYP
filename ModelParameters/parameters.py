@@ -15,7 +15,7 @@
 #
 # SECTIONS
 # ─────────────────────────────────────────────────────────────────────────────
-#   1. Simulation horizon & replication settings
+#   1. Simulation horizon & replication setting s
 #   2. Arrivals (mirrors Sophia's parameters)
 #   3. Provider capacities and scheduling lead times
 #   4. Eligibility criteria (USPSTF guidelines)
