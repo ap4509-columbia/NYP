@@ -47,17 +47,26 @@ def _weighted_choice(dist: dict):
     return random.choices(keys, weights=weights, k=1)[0]
 
 
-def _sample_age(age_range: tuple = None) -> int:
+def _sample_age(age_range: tuple = None, age_weights: dict = None) -> int:
     """
-    Sample a patient age from the Census single-year-of-age distribution.
+    Sample a patient age.
 
-    Draws from the empirical categorical distribution (ages 21–85).
-    The age-85 bucket represents 85+ in the Census source; patients who
-    draw 85 are expanded to 85–100 using a clipped Normal(89, 4).
+    If age_weights is provided — a {(lo, hi): weight} dict — draw a bucket
+    by weight and then draw a uniform integer age within that bucket. This
+    is how new arrivals are sampled (skew toward middle age).
 
-    If age_range is provided as (lo, hi), the draw is constrained to that
-    range by rejection sampling (re-drawing until the age falls within bounds).
+    Otherwise, draw from the Census single-year-of-age empirical distribution
+    (ages 21–85; the 85 bucket represents 85+ and is expanded to 85–100 via
+    a clipped Normal(89, 4)). If age_range is provided as (lo, hi), the
+    Census draw is constrained by rejection sampling. This path is used for
+    the established pool, which should mirror the general NYC population.
     """
+    if age_weights is not None:
+        buckets = list(age_weights.keys())
+        weights = list(age_weights.values())
+        lo, hi = random.choices(buckets, weights=weights, k=1)[0]
+        return random.randint(lo, hi)
+
     for _ in range(100):  # rejection sampling with safety limit
         age = random.choices(cfg.AGE_VALUES, weights=cfg.AGE_PROBS, k=1)[0]
         if age == 85:
@@ -139,6 +148,7 @@ def sample_patient(
     destination:  str,
     patient_type: str,
     age_range:    tuple = None,
+    age_weights:  dict = None,
 ) -> Patient:
     """
     Draw one patient from the NYC eligible women population.
@@ -149,13 +159,15 @@ def sample_patient(
     day_created  : simulation day the patient enters the system
     destination  : first provider — "pcp"|"gynecologist"|"specialist"|"er"
     patient_type : "outpatient" | "drop_in"
-    age_range    : optional (lo, hi) to constrain the age draw
+    age_range    : optional (lo, hi) to constrain the Census age draw
+    age_weights  : optional {(lo, hi): weight} for bucketed age sampling
+                   (used for new arrivals; takes precedence over age_range)
 
     Returns
     -------
     Patient object with demographics and clinical flags set.
     """
-    age              = _sample_age(age_range)
+    age              = _sample_age(age_range=age_range, age_weights=age_weights)
     race, ethnicity  = _sample_race_ethnicity()
     insurance        = _sample_insurance(age)
 
@@ -168,7 +180,8 @@ def sample_patient(
     bmi = _sample_bmi()
 
     hpv_vaccinated    = random.random() < _rate_for_age(cfg.HPV_VAX_RATE, age)
-    hpv_positive      = (not hpv_vaccinated) and (random.random() < cfg.HPV_POSITIVE_RATE)
+    hpv_rate          = _rate_for_age(cfg.HPV_POSITIVE_RATE, age, default=0.10)
+    hpv_positive      = (not hpv_vaccinated) and (random.random() < hpv_rate)
 
     # Hysterectomy — age x race/ethnicity stratified (Yutong's code, BRFSS 2018)
     hyst_group        = _hysterectomy_group(race, ethnicity)
@@ -226,7 +239,7 @@ def _build_patient(patient_id, day_created, patient_type, destination,
 # =============================================================================
 
 
-def draw_death_day(p: "Patient", entry_day: int) -> int:
+def draw_death_day(p: "Patient", entry_day: int, extra_multiplier: float = 1.0) -> int:
     """
     Draw a death day from the Gompertz hazard conditional on current age.
 
@@ -240,8 +253,10 @@ def draw_death_day(p: "Patient", entry_day: int) -> int:
     multiplicatively — standard proportional-hazards composition:
       - Smoking status (current / former / never)
       - Obesity (BMI ≥ cfg.BMI_OBESE_THRESHOLD)
+      - Optional `extra_multiplier` for disease-specific competing-risk
+        draws (e.g. post-CIN2/3 LEEP).
     """
-    a = cfg.GOMPERTZ_A
+    a = cfg.GOMPERTZ_A * extra_multiplier
     b = cfg.GOMPERTZ_B
 
     # Smoking-adjusted baseline
@@ -312,12 +327,15 @@ def draw_cessation_day(entry_day: int) -> int:
     return entry_day + int(years * 365)
 
 
-def draw_hpv_clearance_day(entry_day: int) -> int:
+def draw_hpv_clearance_day(p: "Patient", entry_day: int) -> int:
     """
-    Draw the day an HPV-positive patient clears the infection,
-    from Exponential(ANNUAL_HPV_CLEARANCE_PROB).
+    Draw the day an HPV-positive patient clears the infection.
+
+    Rate is age-stratified (ages 21–29 clear faster; 30+ persist longer)
+    and picked once at entry using p.age. Exponential waiting-time draw.
     """
-    rate = cfg.ANNUAL_HPV_CLEARANCE_PROB
+    rates = cfg.ANNUAL_HPV_CLEARANCE_PROB
+    rate  = rates["young"] if p.age < 30 else rates["middle"]
     if rate <= 0:
         return entry_day + 999 * 365
     years = random.expovariate(rate)

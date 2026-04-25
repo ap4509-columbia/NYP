@@ -850,6 +850,7 @@ class SimulationRunner:
         for source_name, source_cfg in cfg.ARRIVAL_SOURCES.items():
             n = _poisson(source_cfg["daily_rate"])
             age_range = source_cfg.get("age_range")
+            age_weights = source_cfg.get("age_weights")
 
             for _ in range(n):
                 # Route: outpatient (80%) vs ER drop-in (20%)
@@ -863,7 +864,8 @@ class SimulationRunner:
                     ptype = "outpatient"
 
                 p = sample_patient(self._pid, day, dest, ptype,
-                                   age_range=age_range)
+                                   age_range=age_range,
+                                   age_weights=age_weights)
                 self._pid += 1
 
                 # Route to intake queue: outpatients first, ER last
@@ -1244,6 +1246,31 @@ class SimulationRunner:
                 if p.hpv_positive:
                     p.hpv_positive = False
 
+            elif event_type == "disease_mortality_lung":
+                # Competing-risk death from screen-detected lung cancer.
+                # Scheduled at lung treatment completion; fires only if the
+                # patient hasn't already exited via Gompertz mortality or
+                # attrition (guarded by the p.active check above).
+                p.exit_system(day, "mortality_lung_cancer")
+                record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                if day >= self._warmup_day:
+                    self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
+                    self.metrics["exits_by_source"]["mortality_lung_cancer"] += 1
+                self._flush_buffer.append(p)
+                self._pool_removals.add(id(p))
+
+            elif event_type == "disease_mortality_cervical":
+                # Competing-risk death from post-CIN2/3 LEEP follow-up.
+                # Very small effect (multiplier 1.2 on Gompertz a) — included
+                # for narrative completeness and to mirror the lung mechanism.
+                p.exit_system(day, "mortality_cervical_cancer")
+                record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                if day >= self._warmup_day:
+                    self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
+                    self.metrics["exits_by_source"]["mortality_cervical_cancer"] += 1
+                self._flush_buffer.append(p)
+                self._pool_removals.add(id(p))
+
         # Batch-purge exited patients from the pool every 30 days
         # (single O(n) filter pass instead of per-event O(n) remove)
         if day % 30 == 0 and self._pool_removals:
@@ -1290,7 +1317,7 @@ class SimulationRunner:
 
         # HPV clearance (only for HPV-positive patients)
         if p.hpv_positive:
-            clear_day = draw_hpv_clearance_day(entry_day)
+            clear_day = draw_hpv_clearance_day(p, entry_day)
             p.scheduled_hpv_clear_day = clear_day
             if clear_day < n_days and clear_day < min(death_day, att_day):
                 self._queues.schedule_life_event(p, "hpv_clearance", clear_day)
@@ -1615,6 +1642,18 @@ class SimulationRunner:
             if queue_wait > 0 and day >= self._warmup_day:
                 self.metrics["wait_times"][step].append(queue_wait)
 
+            # Schedule disease-specific mortality as a competing risk for
+            # CIN2/3 treated patients. Gompertz draw with a×1.2 multiplier,
+            # starting from current age. Whichever of Gompertz or disease
+            # death fires first wins (p.active guard in _process_life_events).
+            mult = cfg.CIN2_CIN3_MORTALITY_MULTIPLIER
+            if mult and mult > 1.0:
+                disease_death_day = draw_death_day(p, day, extra_multiplier=mult)
+                if disease_death_day < self.n_days and disease_death_day > day:
+                    self._queues.schedule_life_event(
+                        p, "disease_mortality_cervical", disease_death_day
+                    )
+
             # Post-treatment surveillance: schedule first follow-up per ASCCP guidelines
             # (co-test at 6 months, then per POST_TREATMENT_SURVEILLANCE_CERVICAL schedule)
             first_interval = self._get_post_treatment_interval("cervical", 0)
@@ -1901,6 +1940,19 @@ class SimulationRunner:
             return
 
         if disposition == "lung_treated":
+            # Schedule disease-specific mortality as a competing risk.
+            # Exponential(LUNG_MALIGNANT_ANNUAL_HAZARD) — whichever fires
+            # first between Gompertz mortality and disease mortality wins.
+            hazard = cfg.LUNG_MALIGNANT_ANNUAL_HAZARD
+            if hazard > 0:
+                disease_years = random.expovariate(hazard)
+                disease_death_day = day + int(disease_years * 365)
+                if disease_death_day < self.n_days:
+                    self._queues.schedule_life_event(
+                        p, "disease_mortality_lung", disease_death_day
+                    )
+                    p.log(day, f"LUNG: disease-mortality event scheduled day {disease_death_day}")
+
             # Schedule post-treatment surveillance per NCCN guidelines
             first_interval = self._get_post_treatment_interval("lung", 0)
             surv_due = day + first_interval
