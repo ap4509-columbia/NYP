@@ -316,16 +316,16 @@ CIN1_PERSISTENCE_PROB_PER_VISIT   = 0.53  # calculated: 1 - 0.40 - 0.07; Source:
 # abnormal primary results enter these queues.
 CAPACITIES = {
     # Primary screening slots
-    "cytology":    4,     # PLACEHOLDER — replace with NYP lab throughput
-    "hpv_alone":   4,     # PLACEHOLDER — replace with NYP lab throughput
-    "co_test":     4,     # PLACEHOLDER — HPV + cytology combo; replace with NYP lab throughput
-    "ldct":        4,     # PLACEHOLDER — replace with NYP radiology capacity
+    "cytology":    2,     # PLACEHOLDER — replace with NYP lab throughput
+    "hpv_alone":   2,     # PLACEHOLDER — replace with NYP lab throughput
+    "co_test":     2,     # PLACEHOLDER — HPV + cytology combo; replace with NYP lab throughput
+    "ldct":        2,     # PLACEHOLDER — replace with NYP radiology capacity
     # Secondary / diagnostic slots
-    "colposcopy":  4,     # PLACEHOLDER — replace with NYP GYN procedure data
-    "lung_biopsy": 4,     # PLACEHOLDER — replace with NYP IR capacity
+    "colposcopy":  2,     # PLACEHOLDER — replace with NYP GYN procedure data
+    "lung_biopsy": 2,     # PLACEHOLDER — replace with NYP IR capacity
     # Treatment slots
-    "leep":        4,     # PLACEHOLDER — replace with NYP OR scheduling data
-    "cone_biopsy": 4,     # PLACEHOLDER — replace with NYP OR scheduling data
+    "leep":        2,     # PLACEHOLDER — replace with NYP OR scheduling data
+    "cone_biopsy": 2,     # PLACEHOLDER — replace with NYP OR scheduling data
 }
 
 # ── Scenario Analysis ────────────────────────────────────────────────────────
