@@ -194,10 +194,42 @@ def sample_patient(
     if prior_abnormal_pap and random.random() < 0.30:
         prior_cin = random.choice(["CIN1", "CIN2"])
 
-    return _build_patient(patient_id, day_created, patient_type, destination,
-                          age, race, ethnicity, insurance, smoker, pack_years,
-                          years_since_quit, bmi, has_cervix, hpv_positive,
-                          hpv_vaccinated, prior_abnormal_pap, prior_cin)
+    p = _build_patient(patient_id, day_created, patient_type, destination,
+                       age, race, ethnicity, insurance, smoker, pack_years,
+                       years_since_quit, bmi, has_cervix, hpv_positive,
+                       hpv_vaccinated, prior_abnormal_pap, prior_cin)
+    _draw_ghost_states(p)
+    return p
+
+
+def _draw_ghost_states(p: Patient) -> None:
+    """Assign each patient a latent ('ghost') cervical and lung disease state.
+
+    The ghost is drawn from the same probability tables the sim uses for
+    screening results. It represents what a screening would discover if the
+    patient were screened today. Mortality events are scheduled conditional
+    on these ghost states; screening + treatment is the only way to cancel
+    them.
+
+    Eligibility-conditional:
+      • Cervical ghost only for patients with has_cervix (matches USPSTF
+        eligibility) — the most clinically informative test for the patient's
+        age stratum is used (cytology for 21–29, co_test for 30+).
+      • Lung ghost only for patients who are/were smokers with sufficient
+        pack-years (the lung-eligibility population).
+    """
+    if p.has_cervix:
+        stratum = get_cervical_age_stratum(p.age)
+        ghost_test = "cytology" if stratum == "young" else "co_test"
+        p.true_cervical_state = draw_cervical_result(p, ghost_test)
+
+    is_eligible_smoker = (
+        p.pack_years >= cfg.ELIGIBILITY["lung"]["min_pack_years"]
+        and (p.smoker or p.years_since_quit
+             <= cfg.ELIGIBILITY["lung"]["max_years_since_quit"])
+    )
+    if is_eligible_smoker:
+        p.true_lung_state = draw_lung_rads_result()
 
 
 def _build_patient(patient_id, day_created, patient_type, destination,
@@ -728,7 +760,11 @@ def run_screening_step(
     p.log(current_day, f"SCREEN {cancer} via {test}")
 
     if cancer == "cervical":
-        result                        = draw_cervical_result(p, test)
+        # Reveal the patient's latent ("ghost") cervical state — set ONCE at
+        # patient creation in _draw_ghost_states. No fresh random draw at
+        # screening time. Treatment / HPV-clearance can reset the ghost to
+        # NORMAL in between visits; this read picks up the current value.
+        result                        = p.true_cervical_state or "NORMAL"
         p.cervical_result             = result
         p.last_cervical_screen_day    = current_day
         p.last_cervical_screening_test = test   # persist for deterministic interval check
@@ -737,7 +773,9 @@ def run_screening_step(
         # Lung requires referral + scheduling before the scan can happen
         if not run_lung_pre_ldct(p, current_day, metrics):
             return None  # patient was lost before scan
-        result                 = draw_lung_rads_result()
+        # Same as cervical — reveal the latent lung ghost rather than a
+        # fresh draw. Treatment resets the ghost to RADS_1.
+        result                 = p.true_lung_state or "RADS_1"
         p.lung_result          = result
         p.last_lung_screen_day = current_day
         if metrics is not None:

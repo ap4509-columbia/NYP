@@ -362,6 +362,29 @@ FOLLOWUP_DELAY_DAYS = {
     "lung_treatment":    21,    # malignancy confirmed → treatment start; PLACEHOLDER
 }
 
+# ── Latent Cancer Mortality (ghost-state hazard durations) ───────────────────
+# Days from patient entry to scheduled cancer-mortality event, conditional
+# on the patient's latent ("ghost") screening result. The event fires only
+# if treatment has not completed (cancellation flag) by that day.
+#
+# Values are PLACEHOLDERS — calibrate against published 5-yr survival data
+# for treated vs untreated cervical and lung cancer. Order-of-magnitude
+# anchors: untreated CIN3 progresses to invasive cancer in ~30% of cases over
+# 5–10 yrs; untreated stage III/IV NSCLC 5-yr survival ~5–15%.
+#
+# A ghost state not listed below carries no excess mortality (only Gompertz
+# baseline applies). NORMAL / HPV_NEGATIVE / RADS_0–2 fall into this group.
+CANCER_HAZARD_DAYS_BY_STATE = {
+    # Cervical (cytology-based)
+    "ASC-H":         365 * 12,    # high-grade precursor; long latency
+    "HSIL":          365 * 8,     # high-grade lesion; ~30% progress to invasive in 5–10 yrs
+    "HPV_POSITIVE":  365 * 20,    # low independent hazard; mostly clears or regresses
+    # Lung (Lung-RADS)
+    "RADS_4A":       365 * 4,     # suspicious; ~10–20% malignancy if untreated
+    "RADS_4B_4X":    365 * 2,     # very suspicious; high mortality untreated
+    # ASCUS / LSIL / RADS_3 / RADS_0–2 / NORMAL → no excess mortality (omitted)
+}
+
 # =============================================================================
 # POPULATION MODEL
 # =============================================================================

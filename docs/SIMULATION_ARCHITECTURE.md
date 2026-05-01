@@ -130,6 +130,44 @@ Source: CDC/BRFSS 2018
 
 `generate_established_population(n, start_pid, entry_day)` creates the initial `INITIAL_POOL_SIZE` (15,000) patient cohort. All patients are assigned a non-ER provider destination via `_sample_established_destination()` (redistributes ER weight across PCP/GYN/Specialist proportionally), flagged `is_established=True`.
 
+### Latent ("Ghost") Disease State
+
+**Function:** `_draw_ghost_states(p)` — called once at the end of `sample_patient()` for every patient.
+
+**Intuition.** Real cancer biology is "the patient has the disease in their body whether or not they ever get screened." We model this with a single per-patient latent state, drawn once at entry, that represents the underlying truth of what's actually happening in their cervix and lungs. Screening visits *reveal* this state; they do not generate fresh random results.
+
+This decoupling matters because it ties cancer mortality to the underlying disease (set at entry), not to whether the patient happened to get an unlucky random screening draw. Without it, a patient with HSIL "biology" could get NORMAL Pap results forever and never trigger follow-up — yet still die of cervical cancer because the cancer death is scheduled separately. With the ghost coupling, a patient with HSIL biology *always* shows HSIL on Pap, *always* gets referred, and the only thing that varies between scenarios is whether they actually reach treatment in time.
+
+**The two ghost fields:**
+
+| Field | Set when | Drawn from | Possible values |
+|---|---|---|---|
+| `p.true_cervical_state` | At `sample_patient` if `p.has_cervix` is True | `draw_cervical_result(p, "co_test")` (uses cytology probability table; applies all entry-time risk multipliers — HPV+, prior CIN — exactly the same as the screening function) | NORMAL, ASCUS, LSIL, ASC-H, HSIL |
+| `p.true_lung_state` | At `sample_patient` if patient is lung-eligible (≥20 pack-years AND smoker-or-recent-quitter) | `draw_lung_rads_result()` (Lung-RADS distribution) | RADS_0, RADS_1, RADS_2, RADS_3, RADS_4A, RADS_4B_4X |
+
+The ghost is **drawn from the same probability tables and uses the same risk adjustments** as the screening test — it's just moved from "every screening visit" to "patient creation." All entry-time multipliers (HPV+ → 1.5×, prior CIN2/3 → 1.8×, etc.) still apply because we route the ghost draw through the same `draw_cervical_result` function. The only conceptual change is that the patient's underlying disease is sampled once and stays there.
+
+**Equivalence to the alternative "draw cancer at screening" approach.** A natural alternative model would be: skip the ghost and let `draw_cervical_result` fire at every screening visit (the original sim's behavior). Under that approach, a patient's "cancer status" only exists in the moments they're actually being screened — there's no underlying truth between visits. That works for patients who *do* get screened, but it has two structural problems for the questions this simulation is built to answer:
+
+1. **It can't ascribe cancer mortality to never-screened patients.** Patients who LTFU at intake, age out before their first eligible visit, or otherwise never make it to the screening step have no cancer status to fire mortality from. In real biology those patients absolutely can have undiagnosed cancer and die from it; the screening-at-visit model simply doesn't see them.
+2. **It makes cross-scenario comparison incoherent.** If "cancer probability" only exists at screening time, then a high-capacity scenario (more screenings happen) literally generates more opportunities to draw a cancer result than a low-capacity scenario does. Mortality risk would scale with screening frequency, which is the opposite of what's true clinically — screening frequency reveals existing disease, it doesn't *create* it.
+
+The ghost-state approach solves both. By drawing the latent state once at patient creation (with the *same* probability tables and *same* patient-attribute risk multipliers), every patient — screened or not, eligible or not, capacity-served or LTFU'd — has a well-defined underlying disease status. Cancer mortality is grounded in that underlying status, not in screening activity. This is what makes the model fair across scenarios and across cohorts (patients vs. non-patients, screened vs. never-screened, capacity-served vs. LTFU'd).
+
+Mathematically, for the *fully-served, perfectly-compliant* slice of the population, the two approaches are equivalent — both produce the same marginal probability of an abnormal result on a given screening (the population probability tables, with patient-attribute multipliers). They diverge once you ask about anyone who isn't fully served. The ghost approach extends the same statistical model to the whole eligible population uniformly, so we can compare cancer outcomes across operational scenarios without the screening-rate / cancer-rate confound.
+
+**State changes during the sim.** After entry, the ghost is mutated only by these events:
+
+| Event | Where | Mutation |
+|---|---|---|
+| Cervical treatment completes (LEEP / cone consumed) | `runner._cervical_followup_step` | `p.true_cervical_state = "NORMAL"`; `p.cancer_death_cancelled_cervical = True` |
+| Lung treatment completes | `runner._lung_result_routing` | `p.true_lung_state = "RADS_1"`; `p.cancer_death_cancelled_lung = True` |
+| HPV clearance event fires (immune system clears hrHPV) | `runner._process_life_events`, `event_type == "hpv_clearance"` | If ghost is in {ASCUS, LSIL, ASC-H, HSIL, HPV_POSITIVE}: `true_cervical_state = "NORMAL"`; `cancer_death_cancelled_cervical = True` |
+
+Smoking cessation does NOT regress the lung ghost (existing tumors don't reverse when you quit). `prior_cin` updates after colposcopy do NOT modify the ghost (treatment will reset it anyway).
+
+**Cancellation flags.** Two boolean fields on the patient — `cancer_death_cancelled_cervical` and `cancer_death_cancelled_lung` — get flipped to True when treatment or HPV clearance regresses the ghost. The flag is checked at fire time inside the cancer-death event handler; if True, the death event no-ops. This is a soft cancellation — the event stays in the queue but is skipped on fire.
+
 ---
 
 ## 2. Life Event Scheduling
@@ -208,7 +246,50 @@ years ~ Exponential(rate = ANNUAL_HPV_CLEARANCE_PROB = 0.30)
 day = entry_day + int(years × 365)
 ```
 
-Suppressed if after death or attrition day. When the event fires: `p.hpv_positive` is set to False.
+Suppressed if after death or attrition day. When the event fires:
+- `p.hpv_positive` is set to False.
+- **If the patient's `true_cervical_state` is in {ASCUS, LSIL, ASC-H, HSIL, HPV_POSITIVE}**, the ghost regresses to NORMAL and the cervical cancer-death event (if scheduled) is cancelled via `p.cancer_death_cancelled_cervical = True`. This models real biology: HPV-driven lesions regress when the immune system clears the underlying virus.
+
+### Cancer Mortality — Static Hazard Conditional on Ghost State
+
+**Two new event types** (added in `runner._schedule_life_events`): `cancer_death_cervical` and `cancer_death_lung`.
+
+**Intuition.** A patient with abnormal latent disease (HSIL, RADS-4B, etc.) is biologically on track to die from that disease at some point in the future, *unless treatment intervenes*. We model this as a single scheduled event per cancer type, scheduled at patient entry, deterministic in timing once the ghost is drawn. Treatment cancels via the cancellation flag; HPV clearance can also cancel cervical cancer.
+
+**Scheduling logic.** After Gompertz mortality and attrition are scheduled, look up the patient's ghost state in `cfg.CANCER_HAZARD_DAYS_BY_STATE`:
+
+| Ghost state | Hazard duration (days) | Years |
+|---|---|---|
+| ASC-H | 365 × 12 | 12 |
+| HSIL | 365 × 8 | 8 |
+| HPV_POSITIVE | 365 × 20 | 20 |
+| RADS_4A | 365 × 4 | 4 |
+| RADS_4B_4X | 365 × 2 | 2 |
+| All other states (NORMAL, RADS_0/1/2/3, ASCUS, LSIL) | — | No event scheduled |
+
+If the ghost has an entry, `cancer_day = entry_day + hazard_days`. The event is scheduled **only if** `cancer_day < min(death_day, att_day)` — i.e., only if the cancer would actually fire before Gompertz mortality or attrition (competing risks; if the patient was going to die or leave first anyway, scheduling the cancer event would just be silently skipped).
+
+Values are PLACEHOLDER — calibration anchors are published 5-yr survival rates for treated vs. untreated CIN3 (~30% progression to invasive cancer over 5–10 yrs) and stage III/IV NSCLC (~5–15% 5-yr survival).
+
+**Fire-time logic** (`_process_life_events`):
+
+```python
+elif event_type in ("cancer_death_cervical", "cancer_death_lung"):
+    if not p.active:           # standard guard — skip if already exited
+        continue
+    if p.cancer_death_cancelled_<cancer>:   # treatment / HPV clearance
+        continue
+    p.exit_system(day, "mortality_cervical_cancer" or "mortality_lung_cancer")
+    record_exit(metrics, "mortality")
+    metrics["exits_by_source"]["mortality_cervical_cancer" or "mortality_lung_cancer"] += 1
+```
+
+This produces three distinct sub-source counts in `exits_by_source`:
+- `mortality` = Gompertz baseline deaths only
+- `mortality_cervical_cancer` = cervical cancer deaths
+- `mortality_lung_cancer` = lung cancer deaths
+
+The broad `exits_by_reason["mortality"]` bucket is the sum of all three.
 
 ---
 
@@ -381,6 +462,23 @@ Lung: always LDCT.
 
 ### Cervical Result Draws
 
+**Important architectural note.** `draw_cervical_result(p, test)` is called in **two distinct places** in the model:
+
+1. **Once at patient creation** (in `_draw_ghost_states`, called by `sample_patient`) — populates the patient's latent `true_cervical_state`. This is the *only* place fresh randomness is introduced.
+2. **Never at screening time** — screening visits READ from `p.true_cervical_state` and report it as the result. No second random draw, no additional probability evaluation.
+
+Concretely, in `model.run_screening_step` and the one-year-repeat cytology branch in `runner._cervical_followup_step`, the result is set as:
+
+```python
+result = p.true_cervical_state or "NORMAL"
+```
+
+regardless of which test modality (`co_test` / `cytology` / `hpv_alone`) was assigned for that visit. The test modality still determines turnaround days and slot consumption (`CAPACITIES`), just not what gets revealed.
+
+**Why this design.** It guarantees that screening cannot disagree with the patient's underlying biology — a HSIL ghost reliably shows HSIL on every screening until treatment or HPV clearance regresses the ghost. This is what couples capacity / cotesting scenarios to cancer mortality outcomes: if a patient with abnormal biology can't reach treatment in time, they die of cancer; if they do, the death is cancelled.
+
+Below is the probability table that drives the *one* ghost draw at patient entry. (Same call signature, same multipliers — just moved upstream.)
+
 `draw_cervical_result(p, test)` — multinomial draw from age-stratified probability tables.
 
 **Co-test** uses `middle_cytology` probabilities (returns both HPV and cytology; cytology result drives routing).
@@ -425,6 +523,14 @@ Applied via `_adjust_probs()`: multiply selected result categories by the factor
 Multiple adjustments stack: an HPV+ patient with prior CIN3 gets both the 1.5× and 1.8× adjustments (applied sequentially, each re-normalizing).
 
 ### Lung Result Draws
+
+**Same pattern as cervical** — `draw_lung_rads_result()` is called once at `_draw_ghost_states` to populate `p.true_lung_state`. Lung screening visits read the ghost:
+
+```python
+result = p.true_lung_state or "RADS_1"
+```
+
+This applies to all three lung screening sites: primary LDCT in `model.run_screening_step`, repeat LDCT in `runner._lung_repeat_ldct_step`, and post-treatment surveillance in `runner._lung_post_treatment_surveillance_step`. The "or RADS_1" fallback handles non-eligible patients who somehow flow through (defensive).
 
 `draw_lung_rads_result()` — multinomial from `LUNG_RADS_PROBS`:
 
@@ -503,8 +609,10 @@ Note: Result routing happens **after lab turnaround delay** (e.g., `TURNAROUND_D
 When HPV+ is triaged to 1-year repeat:
 1. Scheduled 365 days out
 2. On due day: consume a cytology slot, force cytology (not HPV-alone)
-3. Draw new cervical result
+3. **Read `p.true_cervical_state` as the result** (no fresh draw; ghost-coupling)
 4. Re-route the new result: normal → done; abnormal → colposcopy
+
+If HPV clearance fired between scheduling and the repeat visit, the ghost was regressed to NORMAL and the repeat will return NORMAL. If treatment somehow happened (rare on the low-risk path), same.
 
 ### Colposcopy
 
@@ -535,6 +643,11 @@ From `TREATMENT_ASSIGNMENT`:
 
 LEEP scheduling delay: `FOLLOWUP_DELAY_DAYS["leep"] = 14` days.
 Cone biopsy scheduling delay: `FOLLOWUP_DELAY_DAYS["cone_biopsy"] = 21` days.
+
+**Treatment-completion side effects** (when LEEP / cone slot is consumed in `_cervical_followup_step`):
+- `p.cancer_death_cancelled_cervical = True` — cancels any pending cervical-cancer-death event
+- `p.true_cervical_state = "NORMAL"` — ghost is reset; subsequent cervical screenings return NORMAL until a future event (none in current model) re-introduces disease
+- Schedules post-treatment surveillance per ASCCP (next section)
 
 After LEEP/cone biopsy: post-treatment surveillance is scheduled per ASCCP guidelines.
 
@@ -575,14 +688,22 @@ Sources: Pinsky et al. 2015 (NLST/Lung-RADS); McKee et al. 2015; ACR Lung-RADS v
 If benign: `p.lung_biopsy_result = "benign"`, return to annual surveillance.
 If malignant: `p.lung_biopsy_result = "malignant"`, proceed to treatment slot competition.
 
+**Treatment-completion side effects** (when lung treatment is given in `_lung_result_routing`):
+- `p.cancer_death_cancelled_lung = True` — cancels any pending lung-cancer-death event
+- `p.true_lung_state = "RADS_1"` — ghost is reset; subsequent LDCT scans return RADS_1
+- Schedules post-treatment surveillance per NCCN
+- A small post-treatment residual hazard (`disease_mortality_lung`, scheduled separately with `LUNG_MALIGNANT_ANNUAL_HAZARD`) still fires for treated patients
+
 Scheduling delays: `FOLLOWUP_DELAY_DAYS["lung_biopsy"] = 21` days, `FOLLOWUP_DELAY_DAYS["lung_treatment"] = 21` days.
 
 ### Repeat LDCT Processing
 
 `_lung_repeat_ldct_step(p, day, referral_day, scheduled_delay)`:
 1. Consume an LDCT slot (overflow → retry next day)
-2. Draw new Lung-RADS result
+2. **Read `p.true_lung_state` as the result** (no fresh draw; ghost-coupling)
 3. Re-route: may escalate to biopsy (RADS 4A/4B) or schedule another repeat
+
+If the patient was treated between repeats, the ghost is RADS_1 → repeat returns RADS_1 → routine annual loop. If untreated, ghost still reflects original disease → repeat reveals it again → may escalate to biopsy (giving a "second chance" for capacity-limited patients to reach treatment in time).
 
 ---
 
@@ -699,22 +820,30 @@ All life events are **pre-drawn at patient entry** and fire on their scheduled d
 
 | Event | Guard | Action |
 |---|---|---|
-| `mortality` | `p.active` | `p.exit_system(day, "mortality")`, `record_exit(metrics, "mortality")`, increment `mortality_count`, add to flush buffer + pool removals |
+| `mortality` | `p.active` | `p.exit_system(day, "mortality")`, `record_exit(metrics, "mortality")`, increment `mortality_count` and `exits_by_source["mortality"]`, add to flush buffer + pool removals |
 | `attrition` | `p.active` | `p.exit_system(day, f"attrition:{subtype}")`, `record_exit(metrics, "attrition")`, increment `exits_by_source[subtype]`, add to flush buffer + pool removals |
+| `cancer_death_cervical` | `p.active` AND `not p.cancer_death_cancelled_cervical` | `p.exit_system(day, "mortality_cervical_cancer")`, `record_exit(metrics, "mortality")`, increment `exits_by_source["mortality_cervical_cancer"]`, add to flush buffer + pool removals |
+| `cancer_death_lung` | `p.active` AND `not p.cancer_death_cancelled_lung` | `p.exit_system(day, "mortality_lung_cancer")`, `record_exit(metrics, "mortality")`, increment `exits_by_source["mortality_lung_cancer"]`, add to flush buffer + pool removals |
 | `smoking_cessation` | `p.smoker` | `p.pack_years += years_smoked_since_entry`, `p.smoker = False`, `p.years_since_quit = 0.0` |
-| `hpv_clearance` | `p.hpv_positive` | `p.hpv_positive = False` |
+| `hpv_clearance` | `p.hpv_positive` | `p.hpv_positive = False`. **If** `p.true_cervical_state ∈ {ASCUS, LSIL, ASC-H, HSIL, HPV_POSITIVE}`: regress ghost to NORMAL and set `p.cancer_death_cancelled_cervical = True` (cancels pending cervical-cancer-death event) |
+| `disease_mortality_cervical` | `p.active` | Pre-existing small post-treatment cervical hazard (1.2× Gompertz multiplier). Increments `exits_by_source["mortality_cervical_cancer"]` (same bucket as new latent-cancer pathway). |
+| `disease_mortality_lung` | `p.active` | Pre-existing post-treatment lung hazard scheduled at lung-treatment completion. Increments `exits_by_source["mortality_lung_cancer"]`. |
 
 Age is updated arithmetically before processing: `p.age = p.age_at_entry + (day - p.simulation_entry_day) // 365`.
 
 ### Attribute Evolution
 
-| Attribute | How It Changes | Eligibility Impact |
+| Attribute | How It Changes | Eligibility / Mortality Impact |
 |---|---|---|
 | `age` | Arithmetic: `age_at_entry + (day - simulation_entry_day) // 365` | Cervical ends at 65; lung starts at 50, ends at 80 |
 | `pack_years` | +accumulated years while `smoker=True` (added at cessation event) | Crosses 20 pk-yr lung threshold mid-simulation |
-| `smoker` | Pre-drawn cessation day from Exponential(0.05) | Former smokers enter 15-yr quit window for lung eligibility |
+| `smoker` | Pre-drawn cessation day from Exponential(0.05) | Former smokers enter 15-yr quit window for lung eligibility. Note: cessation does NOT reset `true_lung_state` — existing tumors do not regress when a patient quits |
 | `years_since_quit` | Computed dynamically from cessation day | Closes lung eligibility after 15 years |
-| `hpv_positive` | Pre-drawn clearance day from Exponential(0.30) | Lowers abnormal cervical result risk (removes multiplier) |
+| `hpv_positive` | Pre-drawn clearance day from Exponential(0.30) | Flag flip is also the trigger for regressing `true_cervical_state` to NORMAL (and cancelling pending cervical-cancer-death event) for HPV-driven ghosts |
+| `true_cervical_state` | Set at `sample_patient`. Mutated by: cervical treatment completion (→ NORMAL); HPV clearance event (→ NORMAL if HPV-driven) | What every cervical screening reveals; drives cervical-cancer-death scheduling at entry |
+| `true_lung_state` | Set at `sample_patient`. Mutated by: lung treatment completion (→ RADS_1) | What every LDCT reveals; drives lung-cancer-death scheduling at entry |
+| `cancer_death_cancelled_cervical` | False at entry. Set True by cervical treatment OR HPV clearance | Soft cancellation flag; checked at cancer-death event fire time |
+| `cancer_death_cancelled_lung` | False at entry. Set True by lung treatment | Soft cancellation flag; checked at cancer-death event fire time |
 
 ### Batch Pool Purge
 

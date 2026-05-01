@@ -1209,9 +1209,17 @@ class SimulationRunner:
         in _pool_removals and batch-purged from the pool periodically (every
         30 days) to avoid O(n) list.remove() on every single event.
         """
+        # Cancer-death events use an "always-count" rule: they fire (tally as
+        # a cancer death) even for patients who already left the pool via
+        # LTFU / attrition / ineligibility. Biologically those patients still
+        # die of their disease in real life — the hospital just lost contact.
+        # Treatment / HPV-clearance still cancels them via the cancellation
+        # flag, which is checked inside each cancer handler.
+        _CANCER_EVENT_TYPES = ("cancer_death_cervical", "cancer_death_lung")
+
         for p, event_type in self._queues.get_due_life_events(day):
-            if not p.active:
-                continue  # already exited via an earlier event
+            if not p.active and event_type not in _CANCER_EVENT_TYPES:
+                continue  # non-cancer events skip silently for inactive patients
 
             # Update age to current day (arithmetic, not a draw)
             p.age = p.age_at_entry + (day - p.simulation_entry_day) // 365
@@ -1245,6 +1253,14 @@ class SimulationRunner:
             elif event_type == "hpv_clearance":
                 if p.hpv_positive:
                     p.hpv_positive = False
+                # Regress an HPV-driven ghost lesion: when hrHPV is cleared by
+                # the immune system, ASCUS / LSIL / ASC-H / HSIL / HPV_POSITIVE
+                # ghosts are biologically expected to regress. Reset to NORMAL
+                # and cancel any pending cancer-mortality event.
+                if p.true_cervical_state in ("ASCUS", "LSIL", "ASC-H", "HSIL", "HPV_POSITIVE"):
+                    p.true_cervical_state = "NORMAL"
+                    p.cancer_death_cancelled_cervical = True
+                    p.log(day, "HPV CLEARANCE → cervical ghost regressed to NORMAL; cancer event cancelled")
 
             elif event_type == "disease_mortality_lung":
                 # Competing-risk death from screen-detected lung cancer.
@@ -1270,6 +1286,37 @@ class SimulationRunner:
                     self.metrics["exits_by_source"]["mortality_cervical_cancer"] += 1
                 self._flush_buffer.append(p)
                 self._pool_removals.add(id(p))
+
+            elif event_type == "cancer_death_cervical":
+                # Latent-cancer death — fires if the patient never reached
+                # cervical treatment in time. Cancelled by treatment completion
+                # OR HPV clearance via p.cancer_death_cancelled_cervical.
+                # Always-count rule: tally even for already-exited patients;
+                # only call exit_system if they're still in the pool (otherwise
+                # their exit_reason was already set by their previous exit).
+                if p.cancer_death_cancelled_cervical:
+                    continue
+                if day >= self._warmup_day:
+                    self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
+                    self.metrics["exits_by_source"]["mortality_cervical_cancer"] += 1
+                if p.active:
+                    p.exit_system(day, "mortality_cervical_cancer")
+                    record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                    self._flush_buffer.append(p)
+                    self._pool_removals.add(id(p))
+
+            elif event_type == "cancer_death_lung":
+                # Same always-count rule as cancer_death_cervical.
+                if p.cancer_death_cancelled_lung:
+                    continue
+                if day >= self._warmup_day:
+                    self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
+                    self.metrics["exits_by_source"]["mortality_lung_cancer"] += 1
+                if p.active:
+                    p.exit_system(day, "mortality_lung_cancer")
+                    record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                    self._flush_buffer.append(p)
+                    self._pool_removals.add(id(p))
 
         # Batch-purge exited patients from the pool every 30 days
         # (single O(n) filter pass instead of per-event O(n) remove)
@@ -1321,6 +1368,25 @@ class SimulationRunner:
             p.scheduled_hpv_clear_day = clear_day
             if clear_day < n_days and clear_day < min(death_day, att_day):
                 self._queues.schedule_life_event(p, "hpv_clearance", clear_day)
+
+        # Latent-cancer mortality — schedule cancer-death events conditional
+        # on the patient's ghost (true_*_state) drawn at sample_patient time.
+        # Only abnormal states listed in CANCER_HAZARD_DAYS_BY_STATE are
+        # scheduled; treatment completion sets cancer_death_cancelled_* so
+        # the event no-ops at fire time.
+        cervix_state = p.true_cervical_state
+        cervix_hazard = cfg.CANCER_HAZARD_DAYS_BY_STATE.get(cervix_state) if cervix_state else None
+        if cervix_hazard is not None:
+            cancer_day = entry_day + cervix_hazard
+            if cancer_day < n_days and cancer_day < min(death_day, att_day):
+                self._queues.schedule_life_event(p, "cancer_death_cervical", cancer_day)
+
+        lung_state = p.true_lung_state
+        lung_hazard = cfg.CANCER_HAZARD_DAYS_BY_STATE.get(lung_state) if lung_state else None
+        if lung_hazard is not None:
+            cancer_day = entry_day + lung_hazard
+            if cancer_day < n_days and cancer_day < min(death_day, att_day):
+                self._queues.schedule_life_event(p, "cancer_death_lung", cancer_day)
 
     def _reschedule_established(self, p: Patient, day: int) -> None:
         """
@@ -1550,9 +1616,10 @@ class SimulationRunner:
                 return
             self._day_secondary_supply += 1
 
-            # Force cytology — HPV-alone is not appropriate for the 1-year follow-up
+            # Force cytology — HPV-alone is not appropriate for the 1-year follow-up.
+            # Reveal ghost rather than fresh draw (Option A coupling).
             test                           = "cytology"
-            result                         = draw_cervical_result(p, test)
+            result                         = p.true_cervical_state or "NORMAL"
             p.cervical_result              = result
             p.last_cervical_screen_day     = day
             p.last_cervical_screening_test = test
@@ -1653,6 +1720,11 @@ class SimulationRunner:
                     self._queues.schedule_life_event(
                         p, "disease_mortality_cervical", disease_death_day
                     )
+
+            # Cancel any pending latent-cancer death event and clear the
+            # patient's true cervical state (LEEP/cone resolves the lesion).
+            p.cancer_death_cancelled_cervical = True
+            p.true_cervical_state = "NORMAL"
 
             # Post-treatment surveillance: schedule first follow-up per ASCCP guidelines
             # (co-test at 6 months, then per POST_TREATMENT_SURVEILLANCE_CERVICAL schedule)
@@ -1891,7 +1963,9 @@ class SimulationRunner:
             return
 
         visit_number += 1
-        result = draw_lung_rads_result()
+        # Reveal ghost (Option A). Treatment already reset true_lung_state to
+        # RADS_1, so post-treatment surveillance scans typically read RADS_1.
+        result = p.true_lung_state or "RADS_1"
         p.lung_result = result
         p.last_lung_screen_day = day
         p.log(day, f"LUNG POST-TREATMENT surveillance visit {visit_number} → {result}")
@@ -1952,6 +2026,11 @@ class SimulationRunner:
                         p, "disease_mortality_lung", disease_death_day
                     )
                     p.log(day, f"LUNG: disease-mortality event scheduled day {disease_death_day}")
+
+            # Cancel any pending latent-cancer death event and clear the
+            # patient's true lung state — lung treatment completed.
+            p.cancer_death_cancelled_lung = True
+            p.true_lung_state = "RADS_1"
 
             # Schedule post-treatment surveillance per NCCN guidelines
             first_interval = self._get_post_treatment_interval("lung", 0)
@@ -2055,7 +2134,9 @@ class SimulationRunner:
             )
             return
 
-        result                 = draw_lung_rads_result()
+        # Reveal ghost (Option A) — repeat LDCT just reads the latent state
+        # rather than re-rolling Lung-RADS.
+        result                 = p.true_lung_state or "RADS_1"
         p.lung_result          = result
         p.last_lung_screen_day = day
         p.log(day, f"LUNG REPEAT LDCT → {result}")

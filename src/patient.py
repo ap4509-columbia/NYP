@@ -104,6 +104,17 @@ class Patient:
     scheduled_cessation_day: Optional[int] = None  # Exponential draw (smokers only)
     scheduled_hpv_clear_day: Optional[int] = None  # Exponential draw (HPV+ only)
 
+    # ── Latent (ghost) cancer state ──────────────────────────────────────────
+    # Drawn ONCE at patient sampling from the same probability tables as the
+    # screening tests — represents the patient's underlying disease state,
+    # observable only through screening. Used to schedule cancer-mortality
+    # events for patients whose ghost is abnormal. Treatment completion sets
+    # the corresponding _cancelled flag so the death event no-ops when fired.
+    true_cervical_state: Optional[str] = None  # NORMAL | ASCUS | LSIL | ASC-H | HSIL | HPV_NEGATIVE | HPV_POSITIVE
+    true_lung_state:     Optional[str] = None  # RADS_0 | RADS_1 | RADS_2 | RADS_3 | RADS_4A | RADS_4B_4X
+    cancer_death_cancelled_cervical: bool = False
+    cancer_death_cancelled_lung:     bool = False
+
     # ── Exit state ────────────────────────────────────────────────────────────
     exit_day:    Optional[int] = None
     exit_reason: Optional[str] = None

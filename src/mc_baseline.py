@@ -96,6 +96,9 @@ def _run_one_baseline(seed: int) -> Dict[str, Any]:
             "final_lung_malignancy_confirmed": int(metrics.get("lung_malignancy_confirmed", 0)),
             "final_lung_treatment_given": int(metrics.get("lung_treatment_given", 0)),
             "final_exits_by_reason":      _as_flat_dict(metrics.get("exits_by_reason", {})),
+            # Sub-source breakdown — splits "mortality" into Gompertz baseline,
+            # mortality_cervical_cancer, mortality_lung_cancer, etc.
+            "final_exits_by_source":      _as_flat_dict(metrics.get("exits_by_source", {})),
         }
     finally:
         for ext in ("", "-shm", "-wal"):
@@ -283,7 +286,7 @@ def _extract_metrics_for_seed(seed_result: Dict[str, Any]) -> pd.DataFrame:
     final_dict_keys = [
         "final_n_screened", "final_cervical_results", "final_colposcopy_results",
         "final_n_treatment", "final_lung_rads_distribution",
-        "final_exits_by_reason",
+        "final_exits_by_reason", "final_exits_by_source",
     ]
     for key in final_dict_keys:
         d = seed_result.get(key) or {}
