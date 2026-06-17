@@ -103,15 +103,28 @@ class Patient:
     attrition_subtype:       Optional[str] = None  # relocation | insurance_loss | provider_switch
     scheduled_cessation_day: Optional[int] = None  # Exponential draw (smokers only)
     scheduled_hpv_clear_day: Optional[int] = None  # Exponential draw (HPV+ only)
+    scheduled_smoking_init_day: Optional[int] = None  # piecewise hazard (non-smokers only)
+    smoking_start_day:       Optional[int] = None  # set when smoking_initiation fires; used to accumulate pack-years
 
     # ── Latent (ghost) cancer state ──────────────────────────────────────────
     # Drawn ONCE at patient sampling from the same probability tables as the
-    # screening tests — represents the patient's underlying disease state,
-    # observable only through screening. Used to schedule cancer-mortality
-    # events for patients whose ghost is abnormal. Treatment completion sets
-    # the corresponding _cancelled flag so the death event no-ops when fired.
+    # screening tests — represents what a screening test would reveal about
+    # the patient's underlying disease state. Mirrors the current
+    # cervical_cancer_stage / lung_cancer_stage during progression so that
+    # screening still reads from a single source.
     true_cervical_state: Optional[str] = None  # NORMAL | ASCUS | LSIL | ASC-H | HSIL | HPV_NEGATIVE | HPV_POSITIVE
     true_lung_state:     Optional[str] = None  # RADS_0 | RADS_1 | RADS_2 | RADS_3 | RADS_4A | RADS_4B_4X
+
+    # ── Cancer disease stage (the disease itself, separate from the screen) ──
+    # The CANCER is the entity being tracked here. It has its own stage that
+    # progresses over time via scheduled progression events (CIN1 → CIN2 → CIN3
+    # → invasive; RADS_3 → RADS_4A → RADS_4B → invasive). Stage = None means
+    # the patient has no cancer of that type. When stage reaches "invasive"
+    # untreated, a cancer-death event is scheduled.
+    # Cancellation flags are set when treatment / HPV-clearance regress the
+    # cancer back to None — they gate the cancer-death event handler.
+    cervical_cancer_stage: Optional[str] = None  # None | CIN1 | CIN2 | CIN3 | invasive
+    lung_cancer_stage:     Optional[str] = None  # None | RADS_3 | RADS_4A | RADS_4B | invasive
     cancer_death_cancelled_cervical: bool = False
     cancer_death_cancelled_lung:     bool = False
 

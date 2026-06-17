@@ -95,6 +95,124 @@ def _poisson(lam: float) -> int:
     return max(0, round(random.gauss(lam, math.sqrt(lam))))
 
 
+def _hazard_for_age(table: dict, age: int) -> float:
+    """Look up an annual hazard from a piecewise table keyed by (lo, hi) age bands."""
+    for (lo, hi), rate in table.items():
+        if lo <= age <= hi:
+            return rate
+    return 0.0
+
+
+def _draw_smoking_init_day(p: "Patient", entry_day: int) -> Optional[int]:
+    """Draw the day an adult-onset smoking initiation event fires.
+
+    Given the patient has already passed the lifetime Bernoulli gate (will
+    initiate), pick an initiation age from the piecewise hazard table by
+    sampling each future age year with its band's hazard. Returns None if
+    no draw lands within the patient's plausible adult-life horizon.
+
+    See parameters.py:ADULT_SMOKING_INITIATION_HAZARDS_BY_AGE for sources.
+    """
+    table = cfg.ADULT_SMOKING_INITIATION_HAZARDS_BY_AGE
+    ages = []
+    weights = []
+    for (lo, hi), rate in table.items():
+        for age in range(max(p.age, lo), hi + 1):
+            ages.append(age)
+            weights.append(rate)
+    if not ages or sum(weights) == 0:
+        return None
+    init_age = random.choices(ages, weights=weights, k=1)[0]
+    years_until = max(0, init_age - p.age)
+    # Random fractional day within the chosen year
+    return entry_day + int(years_until * 365 + random.random() * 365)
+
+
+def _draw_hpv_reacquisition_day(p: "Patient", from_day: int) -> Optional[int]:
+    """Draw the day an HPV reacquisition event fires, given current age.
+
+    Uses age-stratified annual hazard from a piecewise table. The patient must
+    be past clearance (hpv_positive=False) at the time of scheduling; this
+    helper just picks a day. Returns None if no reacquisition would land
+    within the simulated horizon at a meaningful rate.
+
+    See parameters.py:ANNUAL_HPV_REACQUISITION_PROB for sources.
+    """
+    rate = _hazard_for_age(cfg.ANNUAL_HPV_REACQUISITION_PROB, p.age)
+    if rate <= 0:
+        return None
+    years_to_reacq = random.expovariate(rate)
+    return from_day + int(years_to_reacq * 365)
+
+
+# Stage transition tables — current stage → key into the progression-prob and
+# mean-years tables. "invasive" is terminal and has no further transition.
+_CERVICAL_NEXT_STAGE = {
+    "CIN1": ("CIN2", "CIN1_to_CIN2"),
+    "CIN2": ("CIN3", "CIN2_to_CIN3"),
+    "CIN3": ("invasive", "CIN3_to_invasive"),
+}
+_LUNG_NEXT_STAGE = {
+    "RADS_3":  ("RADS_4A",  "RADS_3_to_RADS_4A"),
+    "RADS_4A": ("RADS_4B",  "RADS_4A_to_RADS_4B"),
+    "RADS_4B": ("invasive", "RADS_4B_to_invasive"),
+}
+
+
+def _schedule_cervical_progression(
+    queues, p: "Patient", current_day: int, n_days: int,
+    death_day: int, att_day: int,
+) -> None:
+    """Look at the patient's current cervical cancer stage and schedule the
+    next event in the trajectory. Either a progression (Bernoulli + Exponential
+    timing) or, if already at "invasive", the cancer-death event.
+
+    Suppresses scheduling if the event would fire after Gompertz death or
+    attrition — competing-risks framing identical to other life events.
+    """
+    stage = p.cervical_cancer_stage
+    if stage is None:
+        return
+    if stage == "invasive":
+        years = random.expovariate(1.0 / cfg.INVASIVE_CERVICAL_TO_DEATH_MEAN_YEARS)
+        day = current_day + int(years * 365)
+        if day < n_days and day < min(death_day, att_day):
+            queues.schedule_life_event(p, "cancer_death_cervical", day)
+        return
+    _, key = _CERVICAL_NEXT_STAGE[stage]
+    if random.random() >= cfg.CERVICAL_PROGRESSION_PROB[key]:
+        return  # Bernoulli fails — cancer stalls at current stage
+    mean_years = cfg.CERVICAL_PROGRESSION_MEAN_YEARS[key]
+    years = random.expovariate(1.0 / mean_years)
+    day = current_day + int(years * 365)
+    if day < n_days and day < min(death_day, att_day):
+        queues.schedule_life_event(p, "cancer_progression_cervical", day)
+
+
+def _schedule_lung_progression(
+    queues, p: "Patient", current_day: int, n_days: int,
+    death_day: int, att_day: int,
+) -> None:
+    """Same as _schedule_cervical_progression but for the lung trajectory."""
+    stage = p.lung_cancer_stage
+    if stage is None:
+        return
+    if stage == "invasive":
+        years = random.expovariate(1.0 / cfg.INVASIVE_LUNG_TO_DEATH_MEAN_YEARS)
+        day = current_day + int(years * 365)
+        if day < n_days and day < min(death_day, att_day):
+            queues.schedule_life_event(p, "cancer_death_lung", day)
+        return
+    _, key = _LUNG_NEXT_STAGE[stage]
+    if random.random() >= cfg.LUNG_PROGRESSION_PROB[key]:
+        return
+    mean_years = cfg.LUNG_PROGRESSION_MEAN_YEARS[key]
+    years = random.expovariate(1.0 / mean_years)
+    day = current_day + int(years * 365)
+    if day < n_days and day < min(death_day, att_day):
+        queues.schedule_life_event(p, "cancer_progression_lung", day)
+
+
 # =============================================================================
 # Patient Queue Manager
 # =============================================================================
@@ -868,6 +986,18 @@ class SimulationRunner:
                                    age_weights=age_weights)
                 self._pid += 1
 
+                # Insurance gate: uninsured patients never enter the pool.
+                # They are rejected at intake and exit immediately with
+                # reason "uninsured", which is recorded for analysis but
+                # not routed through screening / scheduling.
+                if p.insurance == "Uninsured":
+                    p.exit_system(day, "uninsured")
+                    record_exit(self.metrics, "uninsured", patient=p, current_day=day)
+                    self.metrics["rejected_uninsured"] = (
+                        self.metrics.get("rejected_uninsured", 0) + 1
+                    )
+                    continue
+
                 # Route to intake queue: outpatients first, ER last
                 if arrival_type == "er":
                     self._queues.intake_er.append((p, dest))
@@ -1175,6 +1305,21 @@ class SimulationRunner:
         )
         self._pid += len(pool)
 
+        # Insurance gate: uninsured patients never enter the established
+        # cohort. They are exited immediately on day 0 (warmup) with reason
+        # "uninsured" and excluded from scheduling. record_exit silently
+        # drops warmup events from the analysis metrics, so this is a
+        # bookkeeping-only side effect — but we count rejections separately
+        # via metrics["rejected_uninsured"] for analysis access.
+        uninsured = [p for p in pool if p.insurance == "Uninsured"]
+        for p in uninsured:
+            p.exit_system(0, "uninsured")
+            record_exit(self.metrics, "uninsured", patient=p, current_day=0)
+        self.metrics["rejected_uninsured"] = (
+            self.metrics.get("rejected_uninsured", 0) + len(uninsured)
+        )
+        pool = [p for p in pool if p.insurance != "Uninsured"]
+
         warmup = max(1, cfg.WARMUP_DAYS)
         _ctx = {"cancer": "all", "step": "provider_screening"}
         for i, p in enumerate(pool):
@@ -1253,14 +1398,106 @@ class SimulationRunner:
             elif event_type == "hpv_clearance":
                 if p.hpv_positive:
                     p.hpv_positive = False
-                # Regress an HPV-driven ghost lesion: when hrHPV is cleared by
-                # the immune system, ASCUS / LSIL / ASC-H / HSIL / HPV_POSITIVE
-                # ghosts are biologically expected to regress. Reset to NORMAL
-                # and cancel any pending cancer-mortality event.
-                if p.true_cervical_state in ("ASCUS", "LSIL", "ASC-H", "HSIL", "HPV_POSITIVE"):
+                # Regress an HPV-driven cervical cancer: when hrHPV is cleared,
+                # pre-invasive lesions (CIN1/2/3) regress. Invasive disease
+                # has progressed past HPV-dependence and is NOT cleared here.
+                if p.cervical_cancer_stage in ("CIN1", "CIN2", "CIN3"):
+                    p.cervical_cancer_stage = None
                     p.true_cervical_state = "NORMAL"
                     p.cancer_death_cancelled_cervical = True
-                    p.log(day, "HPV CLEARANCE → cervical ghost regressed to NORMAL; cancer event cancelled")
+                    p.log(day, "HPV CLEARANCE → cervical cancer regressed to none; pending events cancelled")
+                # Schedule potential HPV reacquisition (sexually active women).
+                # See parameters.py:ANNUAL_HPV_REACQUISITION_PROB for sources.
+                reacq_day = _draw_hpv_reacquisition_day(p, day)
+                if reacq_day is not None and reacq_day < self.n_days:
+                    self._queues.schedule_life_event(p, "hpv_reacquisition", reacq_day)
+
+            elif event_type == "smoking_initiation":
+                # Adult-onset smoking. Flip status and record the start day
+                # so we can compute accumulated pack-years later. Schedule
+                # a lung-ghost re-evaluation when this patient has plausibly
+                # crossed the 20 pack-year USPSTF eligibility threshold.
+                if not p.smoker:
+                    p.smoker = True
+                    p.smoking_start_day = day
+                    p.years_since_quit = 0.0
+                    p.log(day, "SMOKING INITIATION — patient began smoking as adult")
+                    reeval_day = day + int(cfg.SMOKING_TO_LUNG_REEVAL_YEARS * 365)
+                    if reeval_day < self.n_days:
+                        self._queues.schedule_life_event(p, "ghost_lung_reeval", reeval_day)
+
+            elif event_type == "ghost_lung_reeval":
+                # Re-check lung eligibility now that some pack-years have
+                # accumulated, and draw a lung ghost if it would arise. Only
+                # adopts a ghost if the patient is now lung-eligible and didn't
+                # already have a lung ghost from entry.
+                if p.smoker and p.smoking_start_day is not None:
+                    years_smoked = (day - p.smoking_start_day) / 365.0
+                    # Assume 1 pack/day average accumulation
+                    p.pack_years = max(p.pack_years, years_smoked)
+                eligibility = cfg.ELIGIBILITY["lung"]
+                lung_eligible = (
+                    eligibility["age_min"] <= p.age <= eligibility["age_max"]
+                    and p.pack_years >= eligibility["min_pack_years"]
+                    and (p.smoker or p.years_since_quit <= eligibility["max_years_since_quit"])
+                )
+                if lung_eligible and not p.true_lung_state:
+                    from model import initial_lung_cancer_stage
+                    new_ghost = draw_lung_rads_result()
+                    p.true_lung_state = new_ghost
+                    p.lung_cancer_stage = initial_lung_cancer_stage(new_ghost)
+                    if p.lung_cancer_stage is not None:
+                        # Reset cancellation; new disease arc
+                        p.cancer_death_cancelled_lung = False
+                        _schedule_lung_progression(
+                            self._queues, p, day, self.n_days,
+                            p.scheduled_death_day if p.scheduled_death_day is not None else self.n_days,
+                            p.scheduled_attrition_day if p.scheduled_attrition_day is not None else self.n_days,
+                        )
+                        p.log(day, f"LUNG GHOST RE-EVAL → {new_ghost} (stage={p.lung_cancer_stage}); progression scheduled")
+                    else:
+                        p.log(day, f"LUNG GHOST RE-EVAL → {new_ghost} (no cancer)")
+
+            elif event_type == "hpv_reacquisition":
+                # Reacquired hrHPV after a prior clearance. Flip status and
+                # schedule a cervical ghost re-evaluation after the lesion-
+                # development latency. See HPV_TO_LESION_LATENT_YEARS source.
+                p.hpv_positive = True
+                p.log(day, "HPV REACQUISITION — patient re-acquired hrHPV")
+                reeval_day = day + int(cfg.HPV_TO_LESION_LATENT_YEARS * 365)
+                if reeval_day < self.n_days:
+                    self._queues.schedule_life_event(p, "ghost_cervical_reeval", reeval_day)
+
+            elif event_type == "ghost_cervical_reeval":
+                # Re-draw cervical ghost using current attributes. Adopt the
+                # new ghost only if it implies a more severe cancer stage —
+                # no spontaneous regression from this event (clearance and
+                # treatment handle regression).
+                if p.has_cervix:
+                    from model import (
+                        draw_cervical_result, get_cervical_age_stratum,
+                        initial_cervical_cancer_stage,
+                    )
+                    stratum = get_cervical_age_stratum(p.age)
+                    ghost_test = "cytology" if stratum == "young" else "co_test"
+                    new_ghost = draw_cervical_result(p, ghost_test)
+                    new_stage = initial_cervical_cancer_stage(new_ghost)
+                    stage_sev = {None: 0, "CIN1": 1, "CIN2": 2, "CIN3": 3, "invasive": 4}
+                    old_sev = stage_sev.get(p.cervical_cancer_stage, 0)
+                    new_sev = stage_sev.get(new_stage, 0)
+                    if new_sev > old_sev and new_stage is not None:
+                        old_stage = p.cervical_cancer_stage
+                        p.cervical_cancer_stage = new_stage
+                        p.true_cervical_state = new_ghost
+                        # New disease arc — reset cancellation flag and start
+                        # progression chain from the new stage.
+                        p.cancer_death_cancelled_cervical = False
+                        _schedule_cervical_progression(
+                            self._queues, p, day, self.n_days,
+                            p.scheduled_death_day if p.scheduled_death_day is not None else self.n_days,
+                            p.scheduled_attrition_day if p.scheduled_attrition_day is not None else self.n_days,
+                        )
+                        p.log(day, f"CERVICAL GHOST RE-EVAL: {old_stage} → {new_stage}; progression re-scheduled")
 
             elif event_type == "disease_mortality_lung":
                 # Competing-risk death from screen-detected lung cancer.
@@ -1318,6 +1555,43 @@ class SimulationRunner:
                     self._flush_buffer.append(p)
                     self._pool_removals.add(id(p))
 
+            elif event_type == "cancer_progression_cervical":
+                # Cervical cancer advances one stage. Cancelled-cancer flag
+                # acts as the universal "this disease is treated/cleared" gate.
+                if p.cancer_death_cancelled_cervical:
+                    continue
+                from model import cervical_stage_to_screening_label
+                next_stage, _ = _CERVICAL_NEXT_STAGE.get(
+                    p.cervical_cancer_stage, (None, None))
+                if next_stage is None:
+                    continue
+                p.cervical_cancer_stage = next_stage
+                p.true_cervical_state = cervical_stage_to_screening_label(next_stage)
+                p.log(day, f"CERVICAL PROGRESSION → {next_stage}")
+                _schedule_cervical_progression(
+                    self._queues, p, day, self.n_days,
+                    p.scheduled_death_day if p.scheduled_death_day is not None else self.n_days,
+                    p.scheduled_attrition_day if p.scheduled_attrition_day is not None else self.n_days,
+                )
+
+            elif event_type == "cancer_progression_lung":
+                # Lung cancer advances one stage.
+                if p.cancer_death_cancelled_lung:
+                    continue
+                from model import lung_stage_to_screening_label
+                next_stage, _ = _LUNG_NEXT_STAGE.get(
+                    p.lung_cancer_stage, (None, None))
+                if next_stage is None:
+                    continue
+                p.lung_cancer_stage = next_stage
+                p.true_lung_state = lung_stage_to_screening_label(next_stage)
+                p.log(day, f"LUNG PROGRESSION → {next_stage}")
+                _schedule_lung_progression(
+                    self._queues, p, day, self.n_days,
+                    p.scheduled_death_day if p.scheduled_death_day is not None else self.n_days,
+                    p.scheduled_attrition_day if p.scheduled_attrition_day is not None else self.n_days,
+                )
+
         # Batch-purge exited patients from the pool every 30 days
         # (single O(n) filter pass instead of per-event O(n) remove)
         if day % 30 == 0 and self._pool_removals:
@@ -1369,24 +1643,33 @@ class SimulationRunner:
             if clear_day < n_days and clear_day < min(death_day, att_day):
                 self._queues.schedule_life_event(p, "hpv_clearance", clear_day)
 
-        # Latent-cancer mortality — schedule cancer-death events conditional
-        # on the patient's ghost (true_*_state) drawn at sample_patient time.
-        # Only abnormal states listed in CANCER_HAZARD_DAYS_BY_STATE are
-        # scheduled; treatment completion sets cancer_death_cancelled_* so
-        # the event no-ops at fire time.
-        cervix_state = p.true_cervical_state
-        cervix_hazard = cfg.CANCER_HAZARD_DAYS_BY_STATE.get(cervix_state) if cervix_state else None
-        if cervix_hazard is not None:
-            cancer_day = entry_day + cervix_hazard
-            if cancer_day < n_days and cancer_day < min(death_day, att_day):
-                self._queues.schedule_life_event(p, "cancer_death_cervical", cancer_day)
+        # Adult-onset smoking initiation (non-smokers only).
+        # Lifetime Bernoulli gate: did this patient ever start smoking as an
+        # adult? If yes, draw the initiation age from a piecewise hazard.
+        # See parameters.py: ADULT_SMOKING_INITIATION_* for sources.
+        if (not p.smoker and p.pack_years == 0
+                and random.random() < cfg.ADULT_SMOKING_INITIATION_PROB):
+            init_day = _draw_smoking_init_day(p, entry_day)
+            if init_day is not None:
+                p.scheduled_smoking_init_day = init_day
+                if init_day < n_days and init_day < min(death_day, att_day):
+                    self._queues.schedule_life_event(p, "smoking_initiation", init_day)
 
-        lung_state = p.true_lung_state
-        lung_hazard = cfg.CANCER_HAZARD_DAYS_BY_STATE.get(lung_state) if lung_state else None
-        if lung_hazard is not None:
-            cancer_day = entry_day + lung_hazard
-            if cancer_day < n_days and cancer_day < min(death_day, att_day):
-                self._queues.schedule_life_event(p, "cancer_death_lung", cancer_day)
+        # Cancer progression scheduling. Rather than a single direct cancer-
+        # death event, the patient's cancer (if any) walks through a staged
+        # trajectory (CIN1 → CIN2 → CIN3 → invasive; RADS_3 → RADS_4A → RADS_4B
+        # → invasive). At each transition we draw Bernoulli(progression_prob);
+        # if it succeeds, time-to-next is drawn Exponentially. The cancer-
+        # death event fires only after the cancer reaches "invasive".
+        # See parameters.py:CERVICAL_PROGRESSION_* / LUNG_PROGRESSION_* for sources.
+        if p.cervical_cancer_stage is not None:
+            _schedule_cervical_progression(
+                self._queues, p, entry_day, n_days, death_day, att_day
+            )
+        if p.lung_cancer_stage is not None:
+            _schedule_lung_progression(
+                self._queues, p, entry_day, n_days, death_day, att_day
+            )
 
     def _reschedule_established(self, p: Patient, day: int) -> None:
         """
@@ -1722,8 +2005,11 @@ class SimulationRunner:
                     )
 
             # Cancel any pending latent-cancer death event and clear the
-            # patient's true cervical state (LEEP/cone resolves the lesion).
+            # patient's cervical disease (LEEP/cone resolves the lesion).
+            # Resets BOTH the disease stage (cervical_cancer_stage) and the
+            # ghost / screening label so future screens read NORMAL.
             p.cancer_death_cancelled_cervical = True
+            p.cervical_cancer_stage = None
             p.true_cervical_state = "NORMAL"
 
             # Post-treatment surveillance: schedule first follow-up per ASCCP guidelines
@@ -2028,8 +2314,9 @@ class SimulationRunner:
                     p.log(day, f"LUNG: disease-mortality event scheduled day {disease_death_day}")
 
             # Cancel any pending latent-cancer death event and clear the
-            # patient's true lung state — lung treatment completed.
+            # patient's lung disease — treatment completed.
             p.cancer_death_cancelled_lung = True
+            p.lung_cancer_stage = None
             p.true_lung_state = "RADS_1"
 
             # Schedule post-treatment surveillance per NCCN guidelines

@@ -362,29 +362,6 @@ FOLLOWUP_DELAY_DAYS = {
     "lung_treatment":    21,    # malignancy confirmed → treatment start; PLACEHOLDER
 }
 
-# ── Latent Cancer Mortality (ghost-state hazard durations) ───────────────────
-# Days from patient entry to scheduled cancer-mortality event, conditional
-# on the patient's latent ("ghost") screening result. The event fires only
-# if treatment has not completed (cancellation flag) by that day.
-#
-# Values are PLACEHOLDERS — calibrate against published 5-yr survival data
-# for treated vs untreated cervical and lung cancer. Order-of-magnitude
-# anchors: untreated CIN3 progresses to invasive cancer in ~30% of cases over
-# 5–10 yrs; untreated stage III/IV NSCLC 5-yr survival ~5–15%.
-#
-# A ghost state not listed below carries no excess mortality (only Gompertz
-# baseline applies). NORMAL / HPV_NEGATIVE / RADS_0–2 fall into this group.
-CANCER_HAZARD_DAYS_BY_STATE = {
-    # Cervical (cytology-based)
-    "ASC-H":         365 * 12,    # high-grade precursor; long latency
-    "HSIL":          365 * 8,     # high-grade lesion; ~30% progress to invasive in 5–10 yrs
-    "HPV_POSITIVE":  365 * 20,    # low independent hazard; mostly clears or regresses
-    # Lung (Lung-RADS)
-    "RADS_4A":       365 * 4,     # suspicious; ~10–20% malignancy if untreated
-    "RADS_4B_4X":    365 * 2,     # very suspicious; high mortality untreated
-    # ASCUS / LSIL / RADS_3 / RADS_0–2 / NORMAL → no excess mortality (omitted)
-}
-
 # =============================================================================
 # POPULATION MODEL
 # =============================================================================
@@ -546,6 +523,147 @@ ANNUAL_HPV_CLEARANCE_PROB = {
     "young":  0.35,   # ages 21–29 — blended transient + early-persistent
     "middle": 0.12,   # ages 30+   — persistent infections, 10–15%/year
 }
+
+# ── Adult-onset smoking initiation ────────────────────────────────────────────
+# Captures non-smoker → smoker transitions for women 21+ at entry. Although
+# ~95% of adult smokers initiate before 21 (CDC), adult-onset initiation is
+# non-zero and matters for lung-cancer-risk development mid-simulation.
+#
+# Source: CDC NHIS Tobacco Use; SAMHSA NSDUH National Findings — past-year
+#         smoking initiation rates among adult women, stratified by age band.
+#         https://www.samhsa.gov/data/nsduh
+#         CDC MMWR "Tobacco Product Use Among Adults"
+#
+# Modeling:
+#   1. At patient entry, for each non-smoker, draw Bernoulli(ADULT_SMOKING_INITIATION_PROB)
+#      to determine if she ever initiates as an adult.
+#   2. If yes, draw the initiation age from the piecewise hazard table below
+#      (peak in early 20s, sharp drop-off by 30, near zero past 35).
+ADULT_SMOKING_INITIATION_PROB = 0.03    # ~3% lifetime adult-onset probability among never-smokers
+
+# Piecewise annual hazard by age band, conditional on never having smoked.
+# Source: SAMHSA NSDUH 2018–2022, past-year initiation by age (women 21+).
+ADULT_SMOKING_INITIATION_HAZARDS_BY_AGE = {
+    (21, 25): 0.010,    # ~1.0%/yr — peak adult-onset
+    (26, 35): 0.003,    # ~0.3%/yr — tail
+    (36, 99): 0.0005,   # ~0.05%/yr — rare
+}
+
+# ── HPV reacquisition after clearance ─────────────────────────────────────────
+# The existing HPV clearance event sets hpv_positive=False, but the simulation
+# currently does not model reacquisition. Sexually active women regularly
+# reacquire HPV after clearing prior infections — without this, cleared women
+# are permanently "safe" from cervical disease, which is biologically wrong.
+#
+# Source: Trottier et al. 2010 Cancer Epidemiology Biomarkers Prev;
+#         Insinga et al. 2007 Cancer Epidemiology Biomarkers Prev;
+#         Castle et al. 2007 J Infect Dis.
+#         Age-dependent reacquisition rates among HPV-cleared women.
+#
+# Modeling:
+#   1. When an HPV clearance event fires, draw the next reacquisition day
+#      from an Exponential with the age-appropriate annual rate.
+#   2. When the reacquisition event fires, set hpv_positive=True and schedule
+#      a cervical ghost re-evaluation HPV_TO_LESION_LATENT_YEARS later, since
+#      lesion development takes time after new HPV exposure.
+ANNUAL_HPV_REACQUISITION_PROB = {
+    (21, 29): 0.03,    # 3%/yr — sexually active 20s
+    (30, 39): 0.02,    # 2%/yr — 30s
+    (40, 49): 0.01,    # 1%/yr — 40s
+    (50, 99): 0.005,   # <1%/yr — post-50
+}
+
+# Latent period from new HPV exposure to a detectable cervical lesion.
+# Source: Schiffman et al. 2007 Lancet — HPV natural history; persistent
+#         hrHPV infections typically take 1–3 years to progress to CIN2+.
+HPV_TO_LESION_LATENT_YEARS = 2.0
+
+# When a smoking-initiation event fires, the lung ghost cannot be drawn
+# immediately because the patient hasn't accumulated enough pack-years yet
+# to meet USPSTF lung eligibility (≥20 pack-years). We schedule a deferred
+# lung-ghost re-evaluation at this many years after initiation, by which
+# time a typical pack-a-day smoker has crossed the threshold.
+# Source: USPSTF 2021 lung screening eligibility criteria.
+SMOKING_TO_LUNG_REEVAL_YEARS = 20.0
+
+# ── Cancer progression (untreated natural history) ────────────────────────────
+# We model cancer as a separate, staged disease whose state evolves over time
+# in the patient's body. A patient may have a cervical cancer (cervical_cancer
+# _stage ∈ {None, CIN1, CIN2, CIN3, "invasive"}) and/or a lung cancer
+# (lung_cancer_stage ∈ {None, RADS_3, RADS_4A, RADS_4B, "invasive"}). At each
+# possible transition, a Bernoulli probability decides whether progression EVER
+# happens (regression / persistence absorbs the rest), and the time-to-progress
+# is drawn from an Exponential with the literature-anchored mean.
+#
+# Once cancer reaches "invasive" stage and is untreated, the cancer-mortality
+# event is scheduled INVASIVE_*_TO_DEATH_MEAN_YEARS out.
+#
+# Treatment (LEEP / cone / lung tx) resets cancer_stage to None and cancels
+# all pending progression events.
+# HPV clearance resets HPV-driven cervical cancer (CIN1/2/3 only — not invasive)
+# back to None.
+
+# ── Cervical progression ──────────────────────────────────────────────────────
+# Sources:
+#   Östör AG, 1993. Natural history of cervical intraepithelial neoplasia: a
+#     critical review. Int J Gynecol Pathol 12(2):186–192.
+#     [CIN1: 57% regress, 11–22% progress to CIN3 over follow-up]
+#     [CIN2: 43% regress, 22% progress to CIN3]
+#     [CIN3: 32% regress, ~12–30% progress to invasive]
+#   McCredie MR et al., 2008. Natural history of cervical neoplasia and risk
+#     of invasive cancer in women with CIN3. Lancet Oncol 9(5):425–434.
+#     [CIN3 → invasive cancer 30.1% at 30 years]
+#   Insinga RP et al., 2007. Incidence, duration, and reappearance of type-
+#     specific cervical HPV infections. Cancer Epidemiol Biomarkers Prev
+#     16(4):709–715.
+CERVICAL_PROGRESSION_PROB = {
+    # P(transition ever occurs | patient at this stage, untreated)
+    "CIN1_to_CIN2":     0.20,   # Östör meta-analysis; Insinga LSIL→HSIL rates
+    "CIN2_to_CIN3":     0.25,   # Östör — CIN2 → CIN3 ~22% over 5 yr
+    "CIN3_to_invasive": 0.30,   # McCredie 2008 — 30.1% over 30 yr
+}
+CERVICAL_PROGRESSION_MEAN_YEARS = {
+    # Mean time-to-progression (Exponential), among patients who progress.
+    "CIN1_to_CIN2":     5.0,    # Östör — typical CIN1→CIN2 timeline 3–7 yr
+    "CIN2_to_CIN3":     5.0,    # Östör
+    "CIN3_to_invasive": 10.0,   # McCredie — 30-yr horizon implies ~10 yr
+                                #            mean conditional on progressing
+}
+# Invasive cervical cancer → mortality (untreated).
+# Source: SEER Cancer Statistics Review — untreated invasive cervical cancer
+#         5-yr survival drops sharply with stage; mean time to mortality
+#         for untreated disease ~5 yr (combining stage-I and stage-IV ranges).
+INVASIVE_CERVICAL_TO_DEATH_MEAN_YEARS = 5.0
+
+# ── Lung progression ──────────────────────────────────────────────────────────
+# Note: Lung-RADS is a radiographic classification, not a tumor-stage system,
+# but in this simulation we use RADS categories as a proxy for nodule-evolution
+# stages because malignancy risk scales monotonically with RADS category.
+#
+# Sources:
+#   Henschke CI et al., 2006. Survival of patients with stage I lung cancer
+#     detected on CT screening. NEJM 355:1763–1771.
+#   National Comprehensive Cancer Network. NCCN Lung Cancer Screening
+#     Guidelines v3.2024.
+#   Pinsky PF et al., 2015. Performance of Lung-RADS in the National Lung
+#     Screening Trial. Annals of Internal Medicine 162(7):485–491.
+#   McKee BJ et al., 2015. Performance of ACR Lung-RADS in a clinical CT
+#     lung screening program. J Am Coll Radiol 12(3):273–276.
+LUNG_PROGRESSION_PROB = {
+    "RADS_3_to_RADS_4A":   0.10,   # NCCN follow-up data: ~10% of RADS_3 progress
+    "RADS_4A_to_RADS_4B":  0.20,   # Pinsky 2015 — RADS_4A growth/malignancy
+    "RADS_4B_to_invasive": 0.50,   # McKee 2015 — RADS_4B ~35% biopsy-confirmed
+                                   #              malignancy; remainder progress
+}
+LUNG_PROGRESSION_MEAN_YEARS = {
+    "RADS_3_to_RADS_4A":   1.0,    # NCCN: typical RADS_3 → 4A within 1 yr
+    "RADS_4A_to_RADS_4B":  0.5,    # Suspicious nodules grow quickly
+    "RADS_4B_to_invasive": 1.0,    # Henschke 2006 — biopsy turnaround
+}
+# Invasive lung cancer → mortality (untreated).
+# Source: SEER Cancer Statistics Review — untreated stage IV NSCLC median
+#         survival ~6 months; all-stage untreated ~1–2 yr.
+INVASIVE_LUNG_TO_DEATH_MEAN_YEARS = 1.5
 
 # ── Exit sources (non-clinical churn) ─────────────────────────────────────────
 # Mirrors ARRIVAL_SOURCES: each exit source has its own annual rate.

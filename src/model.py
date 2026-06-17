@@ -222,6 +222,7 @@ def _draw_ghost_states(p: Patient) -> None:
         stratum = get_cervical_age_stratum(p.age)
         ghost_test = "cytology" if stratum == "young" else "co_test"
         p.true_cervical_state = draw_cervical_result(p, ghost_test)
+        p.cervical_cancer_stage = initial_cervical_cancer_stage(p.true_cervical_state)
 
     is_eligible_smoker = (
         p.pack_years >= cfg.ELIGIBILITY["lung"]["min_pack_years"]
@@ -230,6 +231,67 @@ def _draw_ghost_states(p: Patient) -> None:
     )
     if is_eligible_smoker:
         p.true_lung_state = draw_lung_rads_result()
+        p.lung_cancer_stage = initial_lung_cancer_stage(p.true_lung_state)
+
+
+# Ghost screening label → initial cancer stage. These mappings translate the
+# probabilistic screening category the ghost draws (which has cytology /
+# Lung-RADS vocabulary) into a clinical disease-stage vocabulary the cancer-
+# progression model operates on.
+#
+# Cervical mapping rationale (Östör 1993; Insinga 2007):
+#   • NORMAL / HPV_NEGATIVE → no cancer
+#   • ASCUS / LSIL / HPV_POSITIVE → CIN1 (low-grade precursor)
+#   • ASC-H → CIN2 (intermediate; ASC-H ≈ "cannot exclude HSIL")
+#   • HSIL → CIN3 (high-grade precursor; biologically closest to CIN3)
+def initial_cervical_cancer_stage(ghost: Optional[str]) -> Optional[str]:
+    return {
+        "NORMAL":       None,
+        "HPV_NEGATIVE": None,
+        "HPV_POSITIVE": "CIN1",
+        "ASCUS":        "CIN1",
+        "LSIL":         "CIN1",
+        "ASC-H":        "CIN2",
+        "HSIL":         "CIN3",
+    }.get(ghost)
+
+
+# Lung-RADS → initial cancer stage. RADS_0/1/2 are not disease; RADS_3 and
+# 4A/4B are progressively higher-risk nodules. We mirror RADS categories as
+# cancer stages because Lung-RADS scales monotonically with malignancy risk.
+def initial_lung_cancer_stage(ghost: Optional[str]) -> Optional[str]:
+    return {
+        "RADS_0":     None,
+        "RADS_1":     None,
+        "RADS_2":     None,
+        "RADS_3":     "RADS_3",
+        "RADS_4A":    "RADS_4A",
+        "RADS_4B_4X": "RADS_4B",
+    }.get(ghost)
+
+
+# Inverse: cancer stage → cytology label that screening would reveal.
+# Used by the progression handlers to keep the ghost label in sync with the
+# evolving cancer stage so that screening sites continue to read from the
+# patient's ghost without modification.
+def cervical_stage_to_screening_label(stage: Optional[str]) -> str:
+    return {
+        None:        "NORMAL",
+        "CIN1":      "LSIL",
+        "CIN2":      "ASC-H",
+        "CIN3":      "HSIL",
+        "invasive":  "HSIL",   # invasive disease still presents as HSIL on Pap
+    }.get(stage, "NORMAL")
+
+
+def lung_stage_to_screening_label(stage: Optional[str]) -> str:
+    return {
+        None:        "RADS_1",
+        "RADS_3":    "RADS_3",
+        "RADS_4A":   "RADS_4A",
+        "RADS_4B":   "RADS_4B_4X",
+        "invasive":  "RADS_4B_4X",   # invasive disease still presents radiographically
+    }.get(stage, "RADS_1")
 
 
 def _build_patient(patient_id, day_created, patient_type, destination,
