@@ -19,3 +19,7 @@ spring-2026/notebooks/*.png
 # Monte Carlo simulation output data (large CSVs, regenerable)
 src/mc_baseline_data/
 src/mc_scenario_data/
+
+# Legacy notebooks path (pre-reorg). Scenario visualizations now write to
+# spring-2026/notebooks/Scenario Visualizations/ per src/scenarios.py.
+/notebooks/

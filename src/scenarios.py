@@ -10,7 +10,7 @@
 #
 # When run, a scenario produces:
 #   • src/mc_scenario_data/<name>_n<N>_start<K>.csv   (same schema as baseline)
-#   • notebooks/Scenario Visualizations/<name>/00..23_*.png
+#   • spring-2026/notebooks/Scenario Visualizations/<name>/00..23_*.png
 #
 # The baseline pipeline (mc_baseline + mc_base_viz) is untouched — scenarios
 # reuse the same renderers 1:1 and write to a separate folder tree so
@@ -167,7 +167,7 @@ def apply_scenario(scenario: ScenarioConfig):
 
 def _scenario_viz_dir(name: str) -> Path:
     here = Path(__file__).resolve().parent.parent
-    return here / "notebooks" / "Scenario Visualizations" / name
+    return here / "spring-2026" / "notebooks" / "Scenario Visualizations" / name
 
 
 def get_scenario(name: str) -> ScenarioConfig:
