@@ -998,6 +998,14 @@ class SimulationRunner:
                     )
                     continue
 
+                # Schedule biological life events at ARRIVAL, not at
+                # establishment. Otherwise patients who LTFU from the intake
+                # queue before ever being screened would never have their
+                # cancer progression or mortality tracked at all, undercounting
+                # cancer deaths in high-LTFU baseline scenarios and biasing
+                # every between-scenario mortality comparison.
+                self._schedule_life_events(p, entry_day=day)
+
                 # Route to intake queue: outpatients first, ER last
                 if arrival_type == "er":
                     self._queues.intake_er.append((p, dest))
@@ -1242,9 +1250,11 @@ class SimulationRunner:
             and not p.is_established
             and p.active
         ):
-            p.age_at_entry         = p.age
-            p.is_established       = True
-            p.simulation_entry_day = day
+            # Note: age_at_entry, simulation_entry_day, and life events were
+            # all set at arrival in _generate_arrivals (see comment there).
+            # Do NOT re-stamp them here — that would offset the biological
+            # age reference and re-schedule life events, both bugs.
+            p.is_established = True
 
             # ER patients who join the established pool must be reassigned
             # to a non-ER regular provider — ER is for unplanned visits only.
@@ -1254,9 +1264,6 @@ class SimulationRunner:
                 p.patient_type = "outpatient"
 
             self._established_pool.append(p)
-
-            # Schedule independent life events for the new established patient
-            self._schedule_life_events(p, entry_day=day)
 
             # Book the full ADVANCE_SCHEDULE_YEARS window in the follow-up queue.
             _ctx = {"cancer": "all", "step": "provider_screening"}
@@ -1354,29 +1361,76 @@ class SimulationRunner:
         in _pool_removals and batch-purged from the pool periodically (every
         30 days) to avoid O(n) list.remove() on every single event.
         """
-        # Cancer-death events use an "always-count" rule: they fire (tally as
-        # a cancer death) even for patients who already left the pool via
-        # LTFU / attrition / ineligibility. Biologically those patients still
-        # die of their disease in real life — the hospital just lost contact.
-        # Treatment / HPV-clearance still cancels them via the cancellation
-        # flag, which is checked inside each cancer handler.
-        _CANCER_EVENT_TYPES = ("cancer_death_cervical", "cancer_death_lung")
+        # BIOLOGICAL event bypass: these events fire regardless of whether the
+        # patient is still in the pool. Biology continues after LTFU / attrition
+        # — a patient's cancer keeps progressing, they keep aging, HPV clears
+        # and reacquires, smoking starts, and they eventually die of untreated
+        # invasive disease. Only truly-clinical events (mortality accounting,
+        # attrition record) should silence for inactive patients.
+        #
+        # Without progression and ghost-reeval bypass, LTFU'd patients' cancer
+        # chains freeze at whatever stage they were at when they exited, so
+        # cancer_death never gets scheduled — breaking the always-count intent
+        # and making baseline scenarios undercount cancer deaths relative to
+        # high-retention scenarios.
+        #
+        # Treatment / HPV-clearance still cancels progression + cancer_death
+        # via p.cancer_death_cancelled_{cancer} flags, checked inside each
+        # handler.
+        _BIOLOGICAL_EVENT_TYPES = (
+            "mortality",  # Gompertz all-cause. Fires regardless of pool status:
+                          # every generated person has a drawn death day and
+                          # that death is a biological fact independent of
+                          # whether they became an active NYP patient. Without
+                          # this, LTFU'd patients' natural deaths were silenced,
+                          # making total mortality retention-dependent and
+                          # creating the artifact that screening "reveals"
+                          # deaths.
+            "cancer_death_cervical", "cancer_death_lung",
+            "cancer_progression_cervical", "cancer_progression_lung",
+            "ghost_cervical_reeval", "ghost_lung_reeval",
+            "hpv_clearance", "hpv_reacquisition",
+            "smoking_initiation", "smoking_cessation",
+            "disease_mortality_cervical", "disease_mortality_lung",
+        )
+        _MORTALITY_EVENT_TYPES = (
+            "mortality",
+            "cancer_death_cervical", "cancer_death_lung",
+            "disease_mortality_cervical", "disease_mortality_lung",
+        )
 
         for p, event_type in self._queues.get_due_life_events(day):
-            if not p.active and event_type not in _CANCER_EVENT_TYPES:
-                continue  # non-cancer events skip silently for inactive patients
+            if not p.active and event_type not in _BIOLOGICAL_EVENT_TYPES:
+                continue  # non-biological events skip silently for inactive patients
+
+            # A person dies exactly once. If a prior mortality event already
+            # fired (any of Gompertz, cancer_death, disease_mortality), any
+            # further mortality events for this patient are silenced. Non-
+            # mortality biological events (progression, ghost re-evals, HPV
+            # cycles, smoking) can also be silenced once biologically dead —
+            # a dead person's biology no longer evolves.
+            if p.biologically_dead:
+                continue
 
             # Update age to current day (arithmetic, not a draw)
             p.age = p.age_at_entry + (day - p.simulation_entry_day) // 365
 
             if event_type == "mortality":
-                p.exit_system(day, "mortality")
-                record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                # Gompertz all-cause death. Under the always-count paradigm
+                # (see _BIOLOGICAL_EVENT_TYPES), this fires for LTFU'd patients
+                # too. Counter increments unconditionally; pool bookkeeping
+                # (exit_system, flush, removal) only runs if the patient is
+                # still active — an already-exited patient does not need to
+                # re-exit.
+                p.biologically_dead = True
                 if day >= self._warmup_day:
                     self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
                     self.metrics["exits_by_source"]["mortality"] += 1
-                self._flush_buffer.append(p)
-                self._pool_removals.add(id(p))
+                if p.active:
+                    p.exit_system(day, "mortality")
+                    record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                    self._flush_buffer.append(p)
+                    self._pool_removals.add(id(p))
 
             elif event_type == "attrition":
                 subtype = p.attrition_subtype or "attrition"
@@ -1500,29 +1554,39 @@ class SimulationRunner:
                         p.log(day, f"CERVICAL GHOST RE-EVAL: {old_stage} → {new_stage}; progression re-scheduled")
 
             elif event_type == "disease_mortality_lung":
-                # Competing-risk death from screen-detected lung cancer.
-                # Scheduled at lung treatment completion; fires only if the
-                # patient hasn't already exited via Gompertz mortality or
-                # attrition (guarded by the p.active check above).
-                p.exit_system(day, "mortality_lung_cancer")
-                record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                # Post-TREATMENT competing-risk death from screen-detected
+                # lung cancer. Counted under a distinct source
+                # ("mortality_lung_posttx") so that between-scenario
+                # comparisons on cancer-specific mortality can separate
+                # UNTREATED cancer deaths (cancer_death_* handler, reduced by
+                # interventions) from POST-TREATMENT deaths (this handler,
+                # INCREASED by interventions because more patients get
+                # treated). Conflating them into a single counter hides the
+                # intervention effect on preventable cancer mortality.
+                p.biologically_dead = True
                 if day >= self._warmup_day:
                     self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
-                    self.metrics["exits_by_source"]["mortality_lung_cancer"] += 1
-                self._flush_buffer.append(p)
-                self._pool_removals.add(id(p))
+                    self.metrics["exits_by_source"]["mortality_lung_posttx"] += 1
+                if p.active:
+                    p.exit_system(day, "mortality_lung_posttx")
+                    record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                    self._flush_buffer.append(p)
+                    self._pool_removals.add(id(p))
 
             elif event_type == "disease_mortality_cervical":
-                # Competing-risk death from post-CIN2/3 LEEP follow-up.
-                # Very small effect (multiplier 1.2 on Gompertz a) — included
-                # for narrative completeness and to mirror the lung mechanism.
-                p.exit_system(day, "mortality_cervical_cancer")
-                record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                # Post-TREATMENT competing-risk death (Gompertz x 1.2 uplift
+                # after CIN2/3 LEEP). Same rationale as disease_mortality_lung:
+                # kept in a distinct counter so untreated vs. post-treatment
+                # deaths can be reported separately.
+                p.biologically_dead = True
                 if day >= self._warmup_day:
                     self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
-                    self.metrics["exits_by_source"]["mortality_cervical_cancer"] += 1
-                self._flush_buffer.append(p)
-                self._pool_removals.add(id(p))
+                    self.metrics["exits_by_source"]["mortality_cervical_posttx"] += 1
+                if p.active:
+                    p.exit_system(day, "mortality_cervical_posttx")
+                    record_exit(self.metrics, "mortality", patient=p, current_day=day)
+                    self._flush_buffer.append(p)
+                    self._pool_removals.add(id(p))
 
             elif event_type == "cancer_death_cervical":
                 # Latent-cancer death — fires if the patient never reached
@@ -1533,6 +1597,7 @@ class SimulationRunner:
                 # their exit_reason was already set by their previous exit).
                 if p.cancer_death_cancelled_cervical:
                     continue
+                p.biologically_dead = True
                 if day >= self._warmup_day:
                     self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
                     self.metrics["exits_by_source"]["mortality_cervical_cancer"] += 1
@@ -1546,6 +1611,7 @@ class SimulationRunner:
                 # Same always-count rule as cancer_death_cervical.
                 if p.cancer_death_cancelled_lung:
                     continue
+                p.biologically_dead = True
                 if day >= self._warmup_day:
                     self.metrics["mortality_count"] = self.metrics.get("mortality_count", 0) + 1
                     self.metrics["exits_by_source"]["mortality_lung_cancer"] += 1

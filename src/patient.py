@@ -128,6 +128,15 @@ class Patient:
     cancer_death_cancelled_cervical: bool = False
     cancer_death_cancelled_lung:     bool = False
 
+    # Biological death flag. Set by the FIRST mortality-family event that
+    # fires for the patient (Gompertz mortality, cancer_death_*, or
+    # disease_mortality_*). Subsequent mortality events check this flag and
+    # skip. Prevents a single biological person from being counted as dead
+    # twice when they have multiple mortality events scheduled — e.g. a
+    # patient with cancer_death at year 30 and Gompertz at year 40 must
+    # die exactly once (at year 30) rather than being tallied twice.
+    biologically_dead: bool = False
+
     # ── Exit state ────────────────────────────────────────────────────────────
     exit_day:    Optional[int] = None
     exit_reason: Optional[str] = None
